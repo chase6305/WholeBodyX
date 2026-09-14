@@ -1,0 +1,96 @@
+{
+  "python": "3.11.15",
+  "numpy": "2.3.5",
+  "threads": {
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1"
+  },
+  "warmup": 5,
+  "iterations": 200,
+  "results": [
+    {
+      "run": 0,
+      "mode": "UncachedWBC",
+      "changing_jacobian": false,
+      "p50_us": 80.81342093646526,
+      "p95_us": 88.14790053293108
+    },
+    {
+      "run": 0,
+      "mode": "KinematicWBC",
+      "changing_jacobian": false,
+      "p50_us": 57.10800178349018,
+      "p95_us": 61.292690224945545
+    },
+    {
+      "run": 0,
+      "mode": "UncachedWBC",
+      "changing_jacobian": true,
+      "p50_us": 224.385061301291,
+      "p95_us": 241.9370925053954
+    },
+    {
+      "run": 0,
+      "mode": "KinematicWBC",
+      "changing_jacobian": true,
+      "p50_us": 223.43790624290705,
+      "p95_us": 242.84346727654338
+    },
+    {
+      "run": 1,
+      "mode": "KinematicWBC",
+      "changing_jacobian": false,
+      "p50_us": 55.941054597496986,
+      "p95_us": 60.04315800964831
+    },
+    {
+      "run": 1,
+      "mode": "UncachedWBC",
+      "changing_jacobian": false,
+      "p50_us": 78.01293395459652,
+      "p95_us": 95.99246550351374
+    },
+    {
+      "run": 1,
+      "mode": "KinematicWBC",
+      "changing_jacobian": true,
+      "p50_us": 215.45856725424528,
+      "p95_us": 226.83971328660843
+    },
+    {
+      "run": 1,
+      "mode": "UncachedWBC",
+      "changing_jacobian": true,
+      "p50_us": 214.80710711330175,
+      "p95_us": 219.42360326647758
+    },
+    {
+      "run": 2,
+      "mode": "UncachedWBC",
+      "changing_jacobian": false,
+      "p50_us": 79.35042958706617,
+      "p95_us": 82.74789433926344
+    },
+    {
+      "run": 2,
+      "mode": "KinematicWBC",
+      "changing_jacobian": false,
+      "p50_us": 56.19693547487259,
+      "p95_us": 60.652173124253736
+    },
+    {
+      "run": 2,
+      "mode": "UncachedWBC",
+      "changing_jacobian": true,
+      "p50_us": 215.8039715141058,
+      "p95_us": 230.2785636857152
+    },
+    {
+      "run": 2,
+      "mode": "KinematicWBC",
+      "changing_jacobian": true,
+      "p50_us": 217.37255156040192,
+      "p95_us": 232.48294601216912
+    }
+  ]
+}

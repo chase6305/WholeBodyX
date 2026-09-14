@@ -1,0 +1,27 @@
+{
+  "Before": {
+    "demo_sha256": "eea69a71f197f7862162ecc5c00727a6d8b01542c12d2a67c356543301efe7a7",
+    "steps": 3200,
+    "rmse_mm": 11.616105499687553,
+    "max_force_step_n": 17.24182249230222,
+    "force_step_rms_n": 1.4992489718356774,
+    "max_contact_violation": 0.0,
+    "recoveries": 0
+  },
+  "Continuous reference": {
+    "demo_sha256": "e7620d317ef4f3b6f0ad0dfb0c58d058caea01e890e812ea5a163f234109a083",
+    "steps": 3200,
+    "rmse_mm": 9.96767744527423,
+    "max_force_step_n": 12.948091240491806,
+    "force_step_rms_n": 1.1095969798410001,
+    "max_contact_violation": 0.0,
+    "recoveries": 0
+  },
+  "scenario": {
+    "amplitude_m": 0.05,
+    "push_force_n": 3.0,
+    "push_duration_s": 0.2,
+    "simulation_seconds": 16.0,
+    "dt_s": 0.005
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "WBC": {
+    "samples": 3200,
+    "duration_s": 16.0000000000011,
+    "sample_interval_min_s": 0.004999999999999893,
+    "sample_interval_max_s": 0.005000000000000782,
+    "com_rmse_mm": 6.825356945406667,
+    "max_com_error_mm": 13.281093790240917,
+    "min_normal_force_n": 216.24694181772145,
+    "max_foot_drift_um": 1.352881908144429,
+    "max_force_step_n": 3.6603776160266364,
+    "force_step_rms_n": 0.24425090643224065
+  },
+  "MPC + WBC": {
+    "samples": 3200,
+    "duration_s": 16.0000000000011,
+    "sample_interval_min_s": 0.004999999999999893,
+    "sample_interval_max_s": 0.005000000000000782,
+    "com_rmse_mm": 9.96767744527423,
+    "max_com_error_mm": 18.976217886920523,
+    "min_normal_force_n": 236.05658942433712,
+    "max_foot_drift_um": 0.9245606385563374,
+    "max_force_step_n": 12.948091240491806,
+    "force_step_rms_n": 1.1095969798410001
+  }
+}

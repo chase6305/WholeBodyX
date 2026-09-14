@@ -1,0 +1,168 @@
+{
+  "steps": 400,
+  "warmup_steps_excluded": 5,
+  "results": [
+    {
+      "run": 0,
+      "scenario": "tracking",
+      "mode": "before",
+      "p50_us": 164.69089314341545,
+      "p95_us": 362.9461396485567,
+      "max_difference": null,
+      "mean_iterations": 27.375
+    },
+    {
+      "run": 0,
+      "scenario": "tracking",
+      "mode": "after",
+      "p50_us": 164.82197679579258,
+      "p95_us": 362.2234566137193,
+      "max_difference": 0.0,
+      "mean_iterations": 27.375
+    },
+    {
+      "run": 0,
+      "scenario": "coordination",
+      "mode": "before",
+      "p50_us": 416.72796942293644,
+      "p95_us": 475.33540055155737,
+      "max_difference": null,
+      "mean_iterations": 25.5625
+    },
+    {
+      "run": 0,
+      "scenario": "coordination",
+      "mode": "after",
+      "p50_us": 398.1129266321659,
+      "p95_us": 451.48327481001616,
+      "max_difference": 6.137139407780268e-11,
+      "mean_iterations": 25.5625
+    },
+    {
+      "run": 0,
+      "scenario": "cartesian_circle",
+      "mode": "before",
+      "p50_us": 479.69818115234375,
+      "p95_us": 556.5812811255455,
+      "max_difference": null,
+      "mean_iterations": 25.25
+    },
+    {
+      "run": 0,
+      "scenario": "cartesian_circle",
+      "mode": "after",
+      "p50_us": 461.41399070620537,
+      "p95_us": 557.1739282459021,
+      "max_difference": 2.7755575615628914e-17,
+      "mean_iterations": 25.25
+    },
+    {
+      "run": 1,
+      "scenario": "tracking",
+      "mode": "after",
+      "p50_us": 167.74702817201614,
+      "p95_us": 377.6233177632093,
+      "max_difference": null,
+      "mean_iterations": 27.375
+    },
+    {
+      "run": 1,
+      "scenario": "tracking",
+      "mode": "before",
+      "p50_us": 245.54505944252014,
+      "p95_us": 526.2919701635838,
+      "max_difference": 0.0,
+      "mean_iterations": 27.375
+    },
+    {
+      "run": 1,
+      "scenario": "coordination",
+      "mode": "after",
+      "p50_us": 413.9430820941925,
+      "p95_us": 523.105007596314,
+      "max_difference": null,
+      "mean_iterations": 25.5625
+    },
+    {
+      "run": 1,
+      "scenario": "coordination",
+      "mode": "before",
+      "p50_us": 431.576045230031,
+      "p95_us": 453.7483211606741,
+      "max_difference": 6.137139407780268e-11,
+      "mean_iterations": 25.5625
+    },
+    {
+      "run": 1,
+      "scenario": "cartesian_circle",
+      "mode": "after",
+      "p50_us": 471.1518995463848,
+      "p95_us": 501.5032598748803,
+      "max_difference": null,
+      "mean_iterations": 25.25
+    },
+    {
+      "run": 1,
+      "scenario": "cartesian_circle",
+      "mode": "before",
+      "p50_us": 479.5878194272518,
+      "p95_us": 488.76707442104816,
+      "max_difference": 2.7755575615628914e-17,
+      "mean_iterations": 25.25
+    },
+    {
+      "run": 2,
+      "scenario": "tracking",
+      "mode": "before",
+      "p50_us": 165.63409008085728,
+      "p95_us": 359.73002668470144,
+      "max_difference": null,
+      "mean_iterations": 27.375
+    },
+    {
+      "run": 2,
+      "scenario": "tracking",
+      "mode": "after",
+      "p50_us": 165.81406816840172,
+      "p95_us": 360.8329454436898,
+      "max_difference": 0.0,
+      "mean_iterations": 27.375
+    },
+    {
+      "run": 2,
+      "scenario": "coordination",
+      "mode": "before",
+      "p50_us": 418.9230967313051,
+      "p95_us": 429.12529315799475,
+      "max_difference": null,
+      "mean_iterations": 25.5625
+    },
+    {
+      "run": 2,
+      "scenario": "coordination",
+      "mode": "after",
+      "p50_us": 394.77692916989326,
+      "p95_us": 402.38811634480953,
+      "max_difference": 6.137139407780268e-11,
+      "mean_iterations": 25.5625
+    },
+    {
+      "run": 2,
+      "scenario": "cartesian_circle",
+      "mode": "before",
+      "p50_us": 483.99600200355053,
+      "p95_us": 552.007392980158,
+      "max_difference": null,
+      "mean_iterations": 25.25
+    },
+    {
+      "run": 2,
+      "scenario": "cartesian_circle",
+      "mode": "after",
+      "p50_us": 457.00487680733204,
+      "p95_us": 465.3659416362643,
+      "max_difference": 2.7755575615628914e-17,
+      "mean_iterations": 25.25
+    }
+  ]
+}

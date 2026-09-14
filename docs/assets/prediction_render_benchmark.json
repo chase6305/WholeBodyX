@@ -1,0 +1,8 @@
+{
+  "scope": "Two-arm unchanged-plan geometry preparation; lightweight handles, no Viser or network timing",
+  "repeats": 5,
+  "calls_per_repeat": 1000,
+  "threads": 1,
+  "before_median_us": 6.992449052631855,
+  "after_median_us": 3.2240389846265316
+}

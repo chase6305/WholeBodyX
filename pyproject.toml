@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling>=1.26,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wholebodyx"
+version = "0.1.0"
+description = "Composable C++ and Python robot control"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24,<3", "scipy>=1.10,<2", "osqp>=1.0,<2"]
+
+[project.scripts]
+wholebodyx = "wholebodyx.cli:main"
+
+[project.optional-dependencies]
+urdf = ["pin>=3,<4", "cmeel-urdfdom>=4,<5", "cmeel-tinyxml2>=10,<11"]
+viz = ["viser>=1.1,<2"]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "build>=1,<2", "scikit-build-core>=0.10,<1", "pybind11>=3,<4"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["python/wholebodyx"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]

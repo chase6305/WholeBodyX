@@ -1,0 +1,50 @@
+{
+  "scope": "warm start construction only",
+  "threads": 1,
+  "repeats": 5,
+  "calls_per_repeat": 2000,
+  "results": [
+    {
+      "joints": 6,
+      "horizon": 15,
+      "offset": 0,
+      "before_us": 1.3968164566904306,
+      "after_us": 0.6324355490505695
+    },
+    {
+      "joints": 6,
+      "horizon": 15,
+      "offset": 1,
+      "before_us": 1.4047365402802825,
+      "after_us": 0.6221755174919963
+    },
+    {
+      "joints": 6,
+      "horizon": 15,
+      "offset": 15,
+      "before_us": 1.410602475516498,
+      "after_us": 0.6598574109375477
+    },
+    {
+      "joints": 14,
+      "horizon": 30,
+      "offset": 0,
+      "before_us": 1.4728904934599996,
+      "after_us": 0.6883464520797133
+    },
+    {
+      "joints": 14,
+      "horizon": 30,
+      "offset": 1,
+      "before_us": 1.458378043025732,
+      "after_us": 0.7039664778858423
+    },
+    {
+      "joints": 14,
+      "horizon": 30,
+      "offset": 30,
+      "before_us": 1.5236925100907683,
+      "after_us": 0.77892339322716
+    }
+  ]
+}

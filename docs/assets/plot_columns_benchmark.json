@@ -1,0 +1,17 @@
+{
+  "scope": "plot columns only",
+  "repeats": 5,
+  "calls_per_repeat": 1000,
+  "results": [
+    {
+      "history_rows": 1,
+      "before_median_us": 1.8458750564604998,
+      "after_median_us": 2.4753971956670284
+    },
+    {
+      "history_rows": 300,
+      "before_median_us": 39.79551396332681,
+      "after_median_us": 26.296667056158185
+    }
+  ]
+}

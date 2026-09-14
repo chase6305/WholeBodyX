@@ -1,0 +1,98 @@
+{
+  "date": "2026-09-05",
+  "protocol": "Fixed measured q=v=0, changing goal 0.3+0.01*sin(k), 5 warmup solves, 50 timed solves per case. State timestamps fixed at zero; this is not a closed-loop benchmark.",
+  "environment": {
+    "python": "3.11.15",
+    "numpy": "2.3.5",
+    "python_osqp": "1.1.3",
+    "platform": "Linux-6.8.0-106-generic-x86_64-with-glibc2.35",
+    "blas_threads": {
+      "OPENBLAS_NUM_THREADS": "1",
+      "OMP_NUM_THREADS": "1"
+    }
+  },
+  "before": [
+    {
+      "backend": "python",
+      "joints": 6,
+      "horizon": 15,
+      "p50_ms": 0.9437029948458076,
+      "p95_ms": 1.0229596984572709
+    },
+    {
+      "backend": "python",
+      "joints": 14,
+      "horizon": 30,
+      "p50_ms": 15.164560521952808,
+      "p95_ms": 17.47852077241987
+    },
+    {
+      "backend": "native",
+      "joints": 6,
+      "horizon": 15,
+      "p50_ms": 0.5966629832983017,
+      "p95_ms": 0.6547930417582393
+    },
+    {
+      "backend": "native",
+      "joints": 14,
+      "horizon": 30,
+      "p50_ms": 17.106384970247746,
+      "p95_ms": 19.485973217524588
+    }
+  ],
+  "after": [
+    {
+      "backend": "python",
+      "joints": 6,
+      "horizon": 15,
+      "iterations": 50,
+      "initialization_ms": 0.7459810003638268,
+      "first_solve_ms": 1.316053094342351,
+      "p50_ms": 0.36524550523608923,
+      "p95_ms": 0.3794410149566829,
+      "max_ms": 0.38697710260748863,
+      "mean_solver_iterations": 119.5,
+      "max_constraint_violation": 8.407031737434068e-09
+    },
+    {
+      "backend": "python",
+      "joints": 14,
+      "horizon": 30,
+      "iterations": 50,
+      "initialization_ms": 10.207320796325803,
+      "first_solve_ms": 7.4425688944756985,
+      "p50_ms": 2.874919446185231,
+      "p95_ms": 3.878444910515099,
+      "max_ms": 4.184704972431064,
+      "mean_solver_iterations": 166.0,
+      "max_constraint_violation": 1.7933548979165437e-08
+    },
+    {
+      "backend": "native",
+      "joints": 6,
+      "horizon": 15,
+      "iterations": 50,
+      "initialization_ms": 0.6847928743809462,
+      "first_solve_ms": 0.7945760153234005,
+      "p50_ms": 0.3514940617606044,
+      "p95_ms": 0.3667796030640602,
+      "max_ms": 0.3943319898098707,
+      "mean_solver_iterations": 119.5,
+      "max_constraint_violation": 8.407031015789102e-09
+    },
+    {
+      "backend": "native",
+      "joints": 14,
+      "horizon": 30,
+      "iterations": 50,
+      "initialization_ms": 6.6153311636298895,
+      "first_solve_ms": 13.901647878810763,
+      "p50_ms": 2.0701789762824774,
+      "p95_ms": 3.949541866313665,
+      "max_ms": 4.316478967666626,
+      "mean_solver_iterations": 95.5,
+      "max_constraint_violation": 1.460483534110324e-08
+    }
+  ]
+}

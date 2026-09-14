@@ -1,0 +1,138 @@
+{
+  "python": "3.11.15",
+  "numpy": "2.3.5",
+  "threads": {
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1"
+  },
+  "steps": 400,
+  "warmup_steps_excluded": 5,
+  "results": [
+    {
+      "run": 0,
+      "scenario": "tracking",
+      "mode": "before",
+      "p50_us": 165.7919492572546,
+      "p95_us": 367.5063606351614
+    },
+    {
+      "run": 0,
+      "scenario": "tracking",
+      "mode": "after",
+      "p50_us": 166.65388830006123,
+      "p95_us": 366.94423761218786
+    },
+    {
+      "run": 0,
+      "scenario": "coordination",
+      "mode": "before",
+      "p50_us": 476.8779035657644,
+      "p95_us": 499.27637446671724
+    },
+    {
+      "run": 0,
+      "scenario": "coordination",
+      "mode": "after",
+      "p50_us": 421.49494402110577,
+      "p95_us": 446.0236988961696
+    },
+    {
+      "run": 0,
+      "scenario": "cartesian_circle",
+      "mode": "before",
+      "p50_us": 539.5470652729273,
+      "p95_us": 572.7436626330018
+    },
+    {
+      "run": 0,
+      "scenario": "cartesian_circle",
+      "mode": "after",
+      "p50_us": 483.9410539716482,
+      "p95_us": 506.7060701549053
+    },
+    {
+      "run": 1,
+      "scenario": "tracking",
+      "mode": "after",
+      "p50_us": 164.790078997612,
+      "p95_us": 365.7482098788023
+    },
+    {
+      "run": 1,
+      "scenario": "tracking",
+      "mode": "before",
+      "p50_us": 164.48996029794216,
+      "p95_us": 359.74388010799885
+    },
+    {
+      "run": 1,
+      "scenario": "coordination",
+      "mode": "after",
+      "p50_us": 421.07398621737957,
+      "p95_us": 440.69937430322165
+    },
+    {
+      "run": 1,
+      "scenario": "coordination",
+      "mode": "before",
+      "p50_us": 471.5491086244583,
+      "p95_us": 490.09227659553284
+    },
+    {
+      "run": 1,
+      "scenario": "cartesian_circle",
+      "mode": "after",
+      "p50_us": 480.6050565093756,
+      "p95_us": 504.37229219824076
+    },
+    {
+      "run": 1,
+      "scenario": "cartesian_circle",
+      "mode": "before",
+      "p50_us": 534.4359669834375,
+      "p95_us": 542.9529817774892
+    },
+    {
+      "run": 2,
+      "scenario": "tracking",
+      "mode": "before",
+      "p50_us": 163.94886188209057,
+      "p95_us": 355.79034592956305
+    },
+    {
+      "run": 2,
+      "scenario": "tracking",
+      "mode": "after",
+      "p50_us": 163.8089306652546,
+      "p95_us": 355.51260225474834
+    },
+    {
+      "run": 2,
+      "scenario": "coordination",
+      "mode": "before",
+      "p50_us": 468.15210953354836,
+      "p95_us": 479.5609274879098
+    },
+    {
+      "run": 2,
+      "scenario": "coordination",
+      "mode": "after",
+      "p50_us": 416.5549762547016,
+      "p95_us": 428.0990222468972
+    },
+    {
+      "run": 2,
+      "scenario": "cartesian_circle",
+      "mode": "before",
+      "p50_us": 532.1330390870571,
+      "p95_us": 543.4461170807481
+    },
+    {
+      "run": 2,
+      "scenario": "cartesian_circle",
+      "mode": "after",
+      "p50_us": 480.185030028224,
+      "p95_us": 496.9956120476126
+    }
+  ]
+}

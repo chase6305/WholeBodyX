@@ -1,0 +1,31 @@
+{
+  "python": "3.11.15",
+  "numpy": "2.3.5",
+  "platform": "Linux-6.8.0-106-generic-x86_64-with-glibc2.35",
+  "threads": {
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1"
+  },
+  "trajectory_points": 16,
+  "arms": 2,
+  "repeats": 5,
+  "calls_per_repeat": 200,
+  "results": {
+    "scalar_prediction": {
+      "min_mean_us": 886.9635895825922,
+      "median_mean_us": 893.2095498312265
+    },
+    "batch_prediction": {
+      "min_mean_us": 10.77195513062179,
+      "median_mean_us": 10.971884476020932
+    },
+    "scalar_jacobian": {
+      "min_mean_us": 7.849859539419413,
+      "median_mean_us": 7.889830740168692
+    },
+    "batch_jacobian": {
+      "min_mean_us": 5.535209784284234,
+      "median_mean_us": 5.546179600059986
+    }
+  }
+}

@@ -1,0 +1,139 @@
+{
+  "python": "3.11.15",
+  "numpy": "2.3.5",
+  "platform": "Linux-6.8.0-106-generic-x86_64-with-glibc2.35",
+  "threads": {
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1"
+  },
+  "steps": 400,
+  "warmup_steps_excluded": 5,
+  "results": [
+    {
+      "run": 0,
+      "scenario": "tracking",
+      "mode": "full_pose",
+      "p50_us": 322.0229409635067,
+      "p95_us": 583.6422787979245
+    },
+    {
+      "run": 0,
+      "scenario": "tracking",
+      "mode": "position_only",
+      "p50_us": 262.94984854757786,
+      "p95_us": 467.79834665358067
+    },
+    {
+      "run": 0,
+      "scenario": "coordination",
+      "mode": "full_pose",
+      "p50_us": 658.2608912140131,
+      "p95_us": 675.3395311534405
+    },
+    {
+      "run": 0,
+      "scenario": "coordination",
+      "mode": "position_only",
+      "p50_us": 598.7081676721573,
+      "p95_us": 618.313648737967
+    },
+    {
+      "run": 0,
+      "scenario": "cartesian_circle",
+      "mode": "full_pose",
+      "p50_us": 719.7379600256681,
+      "p95_us": 749.4934601709247
+    },
+    {
+      "run": 0,
+      "scenario": "cartesian_circle",
+      "mode": "position_only",
+      "p50_us": 668.9520087093115,
+      "p95_us": 678.8939470425248
+    },
+    {
+      "run": 1,
+      "scenario": "tracking",
+      "mode": "position_only",
+      "p50_us": 264.46301490068436,
+      "p95_us": 468.7939304858446
+    },
+    {
+      "run": 1,
+      "scenario": "tracking",
+      "mode": "full_pose",
+      "p50_us": 318.7961410731077,
+      "p95_us": 523.5550925135612
+    },
+    {
+      "run": 1,
+      "scenario": "coordination",
+      "mode": "position_only",
+      "p50_us": 605.5010017007589,
+      "p95_us": 618.5762817040086
+    },
+    {
+      "run": 1,
+      "scenario": "coordination",
+      "mode": "full_pose",
+      "p50_us": 662.8199480473995,
+      "p95_us": 677.1614076569676
+    },
+    {
+      "run": 1,
+      "scenario": "cartesian_circle",
+      "mode": "position_only",
+      "p50_us": 672.0779929310083,
+      "p95_us": 694.5113418623804
+    },
+    {
+      "run": 1,
+      "scenario": "cartesian_circle",
+      "mode": "full_pose",
+      "p50_us": 727.3319642990828,
+      "p95_us": 749.6165344491601
+    },
+    {
+      "run": 2,
+      "scenario": "tracking",
+      "mode": "full_pose",
+      "p50_us": 317.67389737069607,
+      "p95_us": 518.7060916796327
+    },
+    {
+      "run": 2,
+      "scenario": "tracking",
+      "mode": "position_only",
+      "p50_us": 263.06998915970325,
+      "p95_us": 462.3499698936939
+    },
+    {
+      "run": 2,
+      "scenario": "coordination",
+      "mode": "full_pose",
+      "p50_us": 652.3299962282181,
+      "p95_us": 670.9795910865068
+    },
+    {
+      "run": 2,
+      "scenario": "coordination",
+      "mode": "position_only",
+      "p50_us": 601.4830432832241,
+      "p95_us": 619.4023182615638
+    },
+    {
+      "run": 2,
+      "scenario": "cartesian_circle",
+      "mode": "full_pose",
+      "p50_us": 713.1060119718313,
+      "p95_us": 731.1035180464387
+    },
+    {
+      "run": 2,
+      "scenario": "cartesian_circle",
+      "mode": "position_only",
+      "p50_us": 658.4320217370987,
+      "p95_us": 738.4773809462786
+    }
+  ]
+}

@@ -1,0 +1,129 @@
+{
+  "python": "3.11.15",
+  "numpy": "2.3.5",
+  "threads": 1,
+  "steps": 250,
+  "repeats": 5,
+  "results": [
+    {
+      "repeat": 0,
+      "scenario": "tracking",
+      "mode": "before",
+      "total_ms": 118.38199896737933
+    },
+    {
+      "repeat": 0,
+      "scenario": "tracking",
+      "mode": "after",
+      "total_ms": 114.28131209686399
+    },
+    {
+      "repeat": 0,
+      "scenario": "cartesian_circle",
+      "mode": "before",
+      "total_ms": 244.66740200296044
+    },
+    {
+      "repeat": 0,
+      "scenario": "cartesian_circle",
+      "mode": "after",
+      "total_ms": 232.47371800243855
+    },
+    {
+      "repeat": 1,
+      "scenario": "tracking",
+      "mode": "after",
+      "total_ms": 111.42800818197429
+    },
+    {
+      "repeat": 1,
+      "scenario": "tracking",
+      "mode": "before",
+      "total_ms": 110.6333660427481
+    },
+    {
+      "repeat": 1,
+      "scenario": "cartesian_circle",
+      "mode": "after",
+      "total_ms": 226.63933807052672
+    },
+    {
+      "repeat": 1,
+      "scenario": "cartesian_circle",
+      "mode": "before",
+      "total_ms": 229.28284108638763
+    },
+    {
+      "repeat": 2,
+      "scenario": "tracking",
+      "mode": "before",
+      "total_ms": 110.93106190674007
+    },
+    {
+      "repeat": 2,
+      "scenario": "tracking",
+      "mode": "after",
+      "total_ms": 108.51798811927438
+    },
+    {
+      "repeat": 2,
+      "scenario": "cartesian_circle",
+      "mode": "before",
+      "total_ms": 230.17215100117028
+    },
+    {
+      "repeat": 2,
+      "scenario": "cartesian_circle",
+      "mode": "after",
+      "total_ms": 227.69733890891075
+    },
+    {
+      "repeat": 3,
+      "scenario": "tracking",
+      "mode": "after",
+      "total_ms": 108.24000788852572
+    },
+    {
+      "repeat": 3,
+      "scenario": "tracking",
+      "mode": "before",
+      "total_ms": 111.6143420804292
+    },
+    {
+      "repeat": 3,
+      "scenario": "cartesian_circle",
+      "mode": "after",
+      "total_ms": 229.48876000009477
+    },
+    {
+      "repeat": 3,
+      "scenario": "cartesian_circle",
+      "mode": "before",
+      "total_ms": 230.45019782148302
+    },
+    {
+      "repeat": 4,
+      "scenario": "tracking",
+      "mode": "before",
+      "total_ms": 111.56850308179855
+    },
+    {
+      "repeat": 4,
+      "scenario": "tracking",
+      "mode": "after",
+      "total_ms": 108.89003286138177
+    },
+    {
+      "repeat": 4,
+      "scenario": "cartesian_circle",
+      "mode": "before",
+      "total_ms": 228.775299154222
+    },
+    {
+      "repeat": 4,
+      "scenario": "cartesian_circle",
+      "mode": "after",
+      "total_ms": 227.71306708455086
+    }
+  ]
+}

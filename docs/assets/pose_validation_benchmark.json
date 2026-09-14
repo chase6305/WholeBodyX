@@ -1,0 +1,138 @@
+{
+  "python": "3.11.15",
+  "numpy": "2.3.5",
+  "threads": {
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1"
+  },
+  "steps": 400,
+  "warmup_steps_excluded": 5,
+  "results": [
+    {
+      "run": 0,
+      "scenario": "tracking",
+      "mode": "before",
+      "p50_us": 196.78287208080292,
+      "p95_us": 391.43930189311504
+    },
+    {
+      "run": 0,
+      "scenario": "tracking",
+      "mode": "after",
+      "p50_us": 165.7339744269848,
+      "p95_us": 366.13768897950644
+    },
+    {
+      "run": 0,
+      "scenario": "coordination",
+      "mode": "before",
+      "p50_us": 609.6269935369492,
+      "p95_us": 652.4302763864395
+    },
+    {
+      "run": 0,
+      "scenario": "coordination",
+      "mode": "after",
+      "p50_us": 471.77495434880257,
+      "p95_us": 499.7183801606296
+    },
+    {
+      "run": 0,
+      "scenario": "cartesian_circle",
+      "mode": "before",
+      "p50_us": 666.565028950572,
+      "p95_us": 701.4906732365487
+    },
+    {
+      "run": 0,
+      "scenario": "cartesian_circle",
+      "mode": "after",
+      "p50_us": 538.3619572967291,
+      "p95_us": 577.8672173619269
+    },
+    {
+      "run": 1,
+      "scenario": "tracking",
+      "mode": "after",
+      "p50_us": 164.1621347516775,
+      "p95_us": 364.11699838936323
+    },
+    {
+      "run": 1,
+      "scenario": "tracking",
+      "mode": "before",
+      "p50_us": 194.489024579525,
+      "p95_us": 393.67503486573696
+    },
+    {
+      "run": 1,
+      "scenario": "coordination",
+      "mode": "after",
+      "p50_us": 471.603823825717,
+      "p95_us": 509.55186598002894
+    },
+    {
+      "run": 1,
+      "scenario": "coordination",
+      "mode": "before",
+      "p50_us": 602.2420711815357,
+      "p95_us": 630.3975591436026
+    },
+    {
+      "run": 1,
+      "scenario": "cartesian_circle",
+      "mode": "after",
+      "p50_us": 533.432001248002,
+      "p95_us": 560.1956741884351
+    },
+    {
+      "run": 1,
+      "scenario": "cartesian_circle",
+      "mode": "before",
+      "p50_us": 668.1170780211687,
+      "p95_us": 699.6848387643693
+    },
+    {
+      "run": 2,
+      "scenario": "tracking",
+      "mode": "before",
+      "p50_us": 194.0689980983734,
+      "p95_us": 388.69262207299465
+    },
+    {
+      "run": 2,
+      "scenario": "tracking",
+      "mode": "after",
+      "p50_us": 165.86482524871826,
+      "p95_us": 365.29204808175564
+    },
+    {
+      "run": 2,
+      "scenario": "coordination",
+      "mode": "before",
+      "p50_us": 599.1470534354448,
+      "p95_us": 615.6658986583351
+    },
+    {
+      "run": 2,
+      "scenario": "coordination",
+      "mode": "after",
+      "p50_us": 467.4058873206377,
+      "p95_us": 475.3354238346219
+    },
+    {
+      "run": 2,
+      "scenario": "cartesian_circle",
+      "mode": "before",
+      "p50_us": 661.7950275540352,
+      "p95_us": 673.0520399287343
+    },
+    {
+      "run": 2,
+      "scenario": "cartesian_circle",
+      "mode": "after",
+      "p50_us": 534.1030191630125,
+      "p95_us": 548.259261995554
+    }
+  ]
+}

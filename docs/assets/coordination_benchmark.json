@@ -1,0 +1,61 @@
+{
+  "python": "3.11.15",
+  "numpy": "2.3.5",
+  "platform": "Linux-6.8.0-106-generic-x86_64-with-glibc2.35",
+  "threads": {
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1"
+  },
+  "steps": 400,
+  "warmup_steps_excluded": 5,
+  "results": [
+    {
+      "run": 0,
+      "mode": "repeated",
+      "p50_us": 732.355983927846,
+      "p95_us": 767.758674919605,
+      "max_violation": 4.6265288128344295e-09,
+      "final_error_m": 3.484718391946451e-05
+    },
+    {
+      "run": 0,
+      "mode": "shared",
+      "p50_us": 652.0838942378759,
+      "p95_us": 677.7754751965402,
+      "max_violation": 4.6265288128344295e-09,
+      "final_error_m": 3.484718391946451e-05
+    },
+    {
+      "run": 1,
+      "mode": "shared",
+      "p50_us": 645.2610250562429,
+      "p95_us": 658.6743053048849,
+      "max_violation": 4.6265288128344295e-09,
+      "final_error_m": 3.484718391946451e-05
+    },
+    {
+      "run": 1,
+      "mode": "repeated",
+      "p50_us": 731.1040535569191,
+      "p95_us": 751.3584103435278,
+      "max_violation": 4.6265288128344295e-09,
+      "final_error_m": 3.484718391946451e-05
+    },
+    {
+      "run": 2,
+      "mode": "repeated",
+      "p50_us": 728.5377942025661,
+      "p95_us": 801.4752762392161,
+      "max_violation": 4.6265288128344295e-09,
+      "final_error_m": 3.484718391946451e-05
+    },
+    {
+      "run": 2,
+      "mode": "shared",
+      "p50_us": 649.299006909132,
+      "p95_us": 664.5469460636377,
+      "max_violation": 4.6265288128344295e-09,
+      "final_error_m": 3.484718391946451e-05
+    }
+  ]
+}

@@ -1,0 +1,76 @@
+{
+  "steps": 1600,
+  "repeats": 3,
+  "results": {
+    "current": [
+      {
+        "wall_s": 1.3310358950402588,
+        "mean_step_ms": 0.8310884168895427,
+        "p95_step_ms": 0.9185465984046459,
+        "p99_step_ms": 0.9505974291823804,
+        "solver_setups": 1,
+        "max_contact_error_m": 6.309089390075664e-07,
+        "max_dynamics_residual": 5.684341886080801e-13
+      },
+      {
+        "wall_s": 1.3374821720644832,
+        "mean_step_ms": 0.8351117663551122,
+        "p95_step_ms": 0.9286140324547887,
+        "p99_step_ms": 0.9927255823276937,
+        "solver_setups": 1,
+        "max_contact_error_m": 6.309089390075664e-07,
+        "max_dynamics_residual": 5.684341886080801e-13
+      },
+      {
+        "wall_s": 1.345232711173594,
+        "mean_step_ms": 0.8399538813682739,
+        "p95_step_ms": 0.925084261689335,
+        "p99_step_ms": 0.9543171222321689,
+        "solver_setups": 1,
+        "max_contact_error_m": 6.309089390075664e-07,
+        "max_dynamics_residual": 5.684341886080801e-13
+      }
+    ],
+    "reference": [
+      {
+        "wall_s": 1.612817543093115,
+        "mean_step_ms": 1.0071531089488417,
+        "p95_step_ms": 1.0689413989894092,
+        "p99_step_ms": 1.080656514968723,
+        "solver_setups": 1600,
+        "max_contact_error_m": 6.309089390623663e-07,
+        "max_dynamics_residual": 5.684341886080801e-13
+      },
+      {
+        "wall_s": 1.603022828930989,
+        "mean_step_ms": 1.0010365011112299,
+        "p95_step_ms": 1.060285628773272,
+        "p99_step_ms": 1.0711517021991313,
+        "solver_setups": 1600,
+        "max_contact_error_m": 6.309089390623663e-07,
+        "max_dynamics_residual": 5.684341886080801e-13
+      },
+      {
+        "wall_s": 1.6300259770359844,
+        "mean_step_ms": 1.0178987857943866,
+        "p95_step_ms": 1.0878893663175404,
+        "p99_step_ms": 1.131586052943021,
+        "solver_setups": 1600,
+        "max_contact_error_m": 6.309089390623663e-07,
+        "max_dynamics_residual": 5.684341886080801e-13
+      }
+    ]
+  },
+  "max_torque_difference_nm": 7.558398351648066e-13,
+  "max_configuration_difference": 3.647869360095049e-15,
+  "median_speedup": 1.2058609653118855,
+  "source_sha256": {
+    "python/wholebodyx/dynamics.py": "2962b2200952b5207703e0edf26f29105242f28633053b9a308848a8c3b1456a",
+    "examples/python/h1_dynamics_wbc.py": "eea69a71f197f7862162ecc5c00727a6d8b01542c12d2a67c356543301efe7a7",
+    "python/wholebodyx/centroidal.py": "2dabc9d4aef982044d74a0564b157361d218019b5f2a7e319eabf52766fa5afe",
+    "python/wholebodyx/qp.py": "f5cc13051c1b25e7518dd1cd803d2842c46f50a6eae71714638615e17e859bbe",
+    "python/wholebodyx/contact.py": "bbf47da11e607c8a2da031c79b522a9e2352b8b69ce8bd4bcfc1873590e00200"
+  },
+  "reference_dynamics_sha256": "f8642d5fb7988890798c7fe0a21d4103de26f13f94c37c6bcd44241b1de68060",
+  "scenario": "Default WBC shift, amplitude 0.035 m, no external force; reference is pre-optimization dynamics.py snapshot."
+}

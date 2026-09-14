@@ -1,0 +1,172 @@
+{
+  "threads": {
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1"
+  },
+  "steps": 400,
+  "warmup_steps_excluded": 5,
+  "results": [
+    {
+      "run": 0,
+      "scenario": "tracking",
+      "mode": "FullReferenceSession",
+      "step_p50_us": 262.36800476908684,
+      "step_p95_us": 475.71188770234585,
+      "prediction_p50_us": 136.44900172948837,
+      "prediction_p95_us": 160.04398930817842
+    },
+    {
+      "run": 0,
+      "scenario": "tracking",
+      "mode": "TrackingSession",
+      "step_p50_us": 194.03803162276745,
+      "step_p95_us": 388.3593715727329,
+      "prediction_p50_us": 4.798872396349907,
+      "prediction_p95_us": 19.29935533553362
+    },
+    {
+      "run": 0,
+      "scenario": "mpc_retargeting",
+      "mode": "FullReferenceSession",
+      "step_p50_us": 267.29702949523926,
+      "step_p95_us": 479.2050924152136,
+      "prediction_p50_us": 141.6490413248539,
+      "prediction_p95_us": 160.8169637620449
+    },
+    {
+      "run": 0,
+      "scenario": "mpc_retargeting",
+      "mode": "TrackingSession",
+      "step_p50_us": 200.9610179811716,
+      "step_p95_us": 430.11992238461914,
+      "prediction_p50_us": 8.326023817062378,
+      "prediction_p95_us": 23.183110170066357
+    },
+    {
+      "run": 0,
+      "scenario": "disturbance_recovery",
+      "mode": "FullReferenceSession",
+      "step_p50_us": 266.18409901857376,
+      "step_p95_us": 475.1130472868681,
+      "prediction_p50_us": 138.29185627400875,
+      "prediction_p95_us": 157.7222952619195
+    },
+    {
+      "run": 0,
+      "scenario": "disturbance_recovery",
+      "mode": "TrackingSession",
+      "step_p50_us": 197.33398221433163,
+      "step_p95_us": 405.9149883687496,
+      "prediction_p50_us": 4.8389192670583725,
+      "prediction_p95_us": 19.460124894976616
+    },
+    {
+      "run": 1,
+      "scenario": "tracking",
+      "mode": "TrackingSession",
+      "step_p50_us": 193.7581691890955,
+      "step_p95_us": 394.05990391969675,
+      "prediction_p50_us": 4.748813807964325,
+      "prediction_p95_us": 19.119679927825928
+    },
+    {
+      "run": 1,
+      "scenario": "tracking",
+      "mode": "FullReferenceSession",
+      "step_p50_us": 265.86512103676796,
+      "step_p95_us": 479.77317590266466,
+      "prediction_p50_us": 138.8629898428917,
+      "prediction_p95_us": 159.86429061740634
+    },
+    {
+      "run": 1,
+      "scenario": "mpc_retargeting",
+      "mode": "TrackingSession",
+      "step_p50_us": 200.77102817595005,
+      "step_p95_us": 413.33443950861675,
+      "prediction_p50_us": 8.255010470747948,
+      "prediction_p95_us": 23.016263730823994
+    },
+    {
+      "run": 1,
+      "scenario": "mpc_retargeting",
+      "mode": "FullReferenceSession",
+      "step_p50_us": 270.8439715206623,
+      "step_p95_us": 487.1687619015571,
+      "prediction_p50_us": 142.659991979599,
+      "prediction_p95_us": 163.67395874112844
+    },
+    {
+      "run": 1,
+      "scenario": "disturbance_recovery",
+      "mode": "TrackingSession",
+      "step_p50_us": 195.01987844705582,
+      "step_p95_us": 398.85903242975456,
+      "prediction_p50_us": 4.789093509316444,
+      "prediction_p95_us": 19.23227682709694
+    },
+    {
+      "run": 1,
+      "scenario": "disturbance_recovery",
+      "mode": "FullReferenceSession",
+      "step_p50_us": 265.9950405359268,
+      "step_p95_us": 475.51626339554787,
+      "prediction_p50_us": 138.36286962032318,
+      "prediction_p95_us": 157.50920865684745
+    },
+    {
+      "run": 2,
+      "scenario": "tracking",
+      "mode": "FullReferenceSession",
+      "step_p50_us": 263.3391413837671,
+      "step_p95_us": 469.7383381426334,
+      "prediction_p50_us": 138.02200555801392,
+      "prediction_p95_us": 156.54845628887415
+    },
+    {
+      "run": 2,
+      "scenario": "tracking",
+      "mode": "TrackingSession",
+      "step_p50_us": 196.01196981966496,
+      "step_p95_us": 405.2917240187526,
+      "prediction_p50_us": 4.82914038002491,
+      "prediction_p95_us": 19.357074052095413
+    },
+    {
+      "run": 2,
+      "scenario": "mpc_retargeting",
+      "mode": "FullReferenceSession",
+      "step_p50_us": 271.1548004299402,
+      "step_p95_us": 498.92854876816216,
+      "prediction_p50_us": 143.26092787086964,
+      "prediction_p95_us": 165.34733586013317
+    },
+    {
+      "run": 2,
+      "scenario": "mpc_retargeting",
+      "mode": "TrackingSession",
+      "step_p50_us": 197.94609397649765,
+      "step_p95_us": 406.39336220920063,
+      "prediction_p50_us": 8.236151188611984,
+      "prediction_p95_us": 22.90266565978527
+    },
+    {
+      "run": 2,
+      "scenario": "disturbance_recovery",
+      "mode": "FullReferenceSession",
+      "step_p50_us": 264.16080072522163,
+      "step_p95_us": 476.4678655192256,
+      "prediction_p50_us": 138.48207890987396,
+      "prediction_p95_us": 158.77441037446258
+    },
+    {
+      "run": 2,
+      "scenario": "disturbance_recovery",
+      "mode": "TrackingSession",
+      "step_p50_us": 195.1300073415041,
+      "step_p95_us": 401.8779145553708,
+      "prediction_p50_us": 4.839850589632988,
+      "prediction_p95_us": 19.39712092280388
+    }
+  ]
+}

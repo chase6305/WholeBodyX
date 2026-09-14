@@ -1,0 +1,21 @@
+{
+  "operation": "lookup",
+  "python": "3.11.15",
+  "pinocchio": "3.9.0",
+  "repetitions": 5,
+  "calls_per_repeat": 500,
+  "results": [
+    {
+      "auxiliary_frames": 10,
+      "model_frames": 24,
+      "before_median_us": 9.55029996111989,
+      "after_median_us": 9.000177960842848
+    },
+    {
+      "auxiliary_frames": 1000,
+      "model_frames": 2004,
+      "before_median_us": 15.363323967903852,
+      "after_median_us": 9.033421985805035
+    }
+  ]
+}

@@ -1,0 +1,156 @@
+{
+  "python": "3.11.15",
+  "numpy": "2.3.5",
+  "threads": {
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1"
+  },
+  "steps": 400,
+  "warmup_steps_excluded": 5,
+  "results": [
+    {
+      "run": 0,
+      "scenario": "tracking",
+      "mode": "before",
+      "max_difference": null,
+      "p50_us": 165.65294936299324,
+      "p95_us": 368.9312841743231
+    },
+    {
+      "run": 0,
+      "scenario": "tracking",
+      "mode": "after",
+      "max_difference": 0.0,
+      "p50_us": 143.9829356968403,
+      "p95_us": 333.152012899518
+    },
+    {
+      "run": 0,
+      "scenario": "coordination",
+      "mode": "before",
+      "max_difference": null,
+      "p50_us": 394.6269862353802,
+      "p95_us": 419.236090965569
+    },
+    {
+      "run": 0,
+      "scenario": "coordination",
+      "mode": "after",
+      "max_difference": 0.0,
+      "p50_us": 340.21399915218353,
+      "p95_us": 381.57869130373
+    },
+    {
+      "run": 0,
+      "scenario": "cartesian_circle",
+      "mode": "before",
+      "max_difference": null,
+      "p50_us": 457.98695646226406,
+      "p95_us": 499.28610678762163
+    },
+    {
+      "run": 0,
+      "scenario": "cartesian_circle",
+      "mode": "after",
+      "max_difference": 3.240741008880832e-12,
+      "p50_us": 408.86388160288334,
+      "p95_us": 428.4362774342298
+    },
+    {
+      "run": 1,
+      "scenario": "tracking",
+      "mode": "after",
+      "max_difference": null,
+      "p50_us": 145.364785566926,
+      "p95_us": 341.654010117054
+    },
+    {
+      "run": 1,
+      "scenario": "tracking",
+      "mode": "before",
+      "max_difference": 0.0,
+      "p50_us": 164.86295498907566,
+      "p95_us": 365.28634373098606
+    },
+    {
+      "run": 1,
+      "scenario": "coordination",
+      "mode": "after",
+      "max_difference": null,
+      "p50_us": 342.4379974603653,
+      "p95_us": 359.2986380681395
+    },
+    {
+      "run": 1,
+      "scenario": "coordination",
+      "mode": "before",
+      "max_difference": 0.0,
+      "p50_us": 394.206028431654,
+      "p95_us": 410.9709756448865
+    },
+    {
+      "run": 1,
+      "scenario": "cartesian_circle",
+      "mode": "after",
+      "max_difference": null,
+      "p50_us": 408.49391371011734,
+      "p95_us": 427.2905644029379
+    },
+    {
+      "run": 1,
+      "scenario": "cartesian_circle",
+      "mode": "before",
+      "max_difference": 3.240741008880832e-12,
+      "p50_us": 457.40604400634766,
+      "p95_us": 485.0562894716859
+    },
+    {
+      "run": 2,
+      "scenario": "tracking",
+      "mode": "before",
+      "max_difference": null,
+      "p50_us": 164.3509604036808,
+      "p95_us": 364.5568620413542
+    },
+    {
+      "run": 2,
+      "scenario": "tracking",
+      "mode": "after",
+      "max_difference": 0.0,
+      "p50_us": 144.46303248405457,
+      "p95_us": 332.18632452189917
+    },
+    {
+      "run": 2,
+      "scenario": "coordination",
+      "mode": "before",
+      "max_difference": null,
+      "p50_us": 392.79297925531864,
+      "p95_us": 409.95930321514606
+    },
+    {
+      "run": 2,
+      "scenario": "coordination",
+      "mode": "after",
+      "max_difference": 0.0,
+      "p50_us": 338.010024279356,
+      "p95_us": 354.0812758728862
+    },
+    {
+      "run": 2,
+      "scenario": "cartesian_circle",
+      "mode": "before",
+      "max_difference": null,
+      "p50_us": 454.06888239085674,
+      "p95_us": 470.48784326761955
+    },
+    {
+      "run": 2,
+      "scenario": "cartesian_circle",
+      "mode": "after",
+      "max_difference": 3.240741008880832e-12,
+      "p50_us": 403.86500768363476,
+      "p95_us": 413.46761863678694
+    }
+  ]
+}

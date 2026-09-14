@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+project(WholeBodyXConsumer LANGUAGES CXX)
+find_package(WholeBodyX CONFIG REQUIRED)
+add_executable(consumer consumer.cpp)
+target_link_libraries(consumer PRIVATE wholebodyx::wholebodyx)

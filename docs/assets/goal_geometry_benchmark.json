@@ -1,0 +1,18 @@
+{
+  "scope": "two-arm goal geometry only; lightweight handles, no Viser or network",
+  "threads": 1,
+  "repeats": 5,
+  "calls_per_repeat": 1000,
+  "results": [
+    {
+      "scenario": "tracking",
+      "before_us": 17.113877926021814,
+      "after_us": 0.2872839104384184
+    },
+    {
+      "scenario": "cartesian_circle",
+      "before_us": 17.029118025675416,
+      "after_us": 0.1980250235646963
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+    "version": "0.5",
+    "requires": [
+        "osqp/0.6.3#b849671453619f22041edf759c93144d%1705183388.43",
+        "eigen/3.4.0#a95b834c9459d8b8cb6dba6426ca0409%1782832372.36"
+    ],
+    "build_requires": [],
+    "python_requires": [],
+    "config_requires": []
+}

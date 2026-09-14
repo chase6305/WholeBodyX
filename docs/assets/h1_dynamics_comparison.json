@@ -1,0 +1,18 @@
+{
+  "WBC": {
+    "samples": 3200,
+    "duration_s": 16.0000000000011,
+    "com_rmse_mm": 6.825356945406667,
+    "max_com_error_mm": 13.281093790240917,
+    "min_normal_force_n": 216.24694181772145,
+    "max_foot_drift_um": 1.352881908144429
+  },
+  "MPC + WBC": {
+    "samples": 3200,
+    "duration_s": 16.0000000000011,
+    "com_rmse_mm": 11.616105499687553,
+    "max_com_error_mm": 21.94697706108284,
+    "min_normal_force_n": 237.57789151564248,
+    "max_foot_drift_um": 0.7377126330949929
+  }
+}

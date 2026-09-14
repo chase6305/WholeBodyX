@@ -1,0 +1,23 @@
+{
+  "threads": 1,
+  "repeats": 5,
+  "calls_per_repeat": 50,
+  "results": [
+    {
+      "joints": 6,
+      "horizon": 15,
+      "assembly_before_median_us": 40.41910171508789,
+      "assembly_after_median_us": 40.07465671747923,
+      "residual_before_median_us": 1.44194345921278,
+      "residual_after_median_us": 1.6920221969485283
+    },
+    {
+      "joints": 14,
+      "horizon": 30,
+      "assembly_before_median_us": 1480.585802346468,
+      "assembly_after_median_us": 219.22828163951635,
+      "residual_before_median_us": 23.0657821521163,
+      "residual_after_median_us": 3.9204396307468414
+    }
+  ]
+}

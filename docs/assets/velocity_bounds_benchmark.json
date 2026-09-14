@@ -1,0 +1,19 @@
+{
+  "scope": "velocity_bounds with acceleration; no-acceleration path unchanged",
+  "repeats": 5,
+  "calls_per_repeat": 3000,
+  "results": [
+    {
+      "joints": 6,
+      "acceleration": true,
+      "before_median_us": 3.0209973144034548,
+      "after_median_us": 2.7757243563731513
+    },
+    {
+      "joints": 50,
+      "acceleration": true,
+      "before_median_us": 3.1265979632735252,
+      "after_median_us": 2.8682133803764978
+    }
+  ]
+}

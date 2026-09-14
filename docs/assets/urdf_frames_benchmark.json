@@ -1,0 +1,20 @@
+{
+  "python": "3.11.15",
+  "pinocchio": "3.9.0",
+  "repetitions": 5,
+  "calls_per_repeat": 500,
+  "results": [
+    {
+      "auxiliary_frames": 10,
+      "model_frames": 24,
+      "before_median_us": 9.964311961084604,
+      "after_median_us": 9.448598138988018
+    },
+    {
+      "auxiliary_frames": 1000,
+      "model_frames": 2004,
+      "before_median_us": 24.1836360655725,
+      "after_median_us": 14.324021991342306
+    }
+  ]
+}

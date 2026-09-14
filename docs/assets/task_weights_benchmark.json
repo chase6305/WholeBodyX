@@ -1,0 +1,31 @@
+{
+  "scope": "complete LinearTask construction",
+  "repeats": 5,
+  "calls_per_repeat": 2000,
+  "results": [
+    {
+      "rows": 6,
+      "weight": "scalar",
+      "before_median_us": 6.812763516791165,
+      "after_median_us": 4.331554053351283
+    },
+    {
+      "rows": 6,
+      "weight": "vector",
+      "before_median_us": 6.2056430615484715,
+      "after_median_us": 7.808148977346718
+    },
+    {
+      "rows": 50,
+      "weight": "scalar",
+      "before_median_us": 8.718811441212893,
+      "after_median_us": 5.668869474902749
+    },
+    {
+      "rows": 50,
+      "weight": "vector",
+      "before_median_us": 7.0312764728441834,
+      "after_median_us": 6.705256993882358
+    }
+  ]
+}

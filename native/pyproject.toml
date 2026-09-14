@@ -1,0 +1,21 @@
+# Used by scripts/build_native.py, which stages the C++ source beside this file.
+[build-system]
+requires = ["scikit-build-core>=0.10,<1", "pybind11>=3,<4"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "wholebodyx-native"
+version = "0.1.0"
+description = "Optional C++ WBC and MPC kernels for WholeBodyX"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24,<3"]
+
+[tool.scikit-build]
+wheel.packages = []
+install.components = ["python"]
+
+[tool.scikit-build.cmake.define]
+WBX_BUILD_PYTHON = "ON"
+WBX_BUILD_EXAMPLES = "OFF"
+BUILD_TESTING = "OFF"
+BUILD_SHARED_LIBS = "OFF"
