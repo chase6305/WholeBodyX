@@ -247,7 +247,7 @@ class ContactWBC:
                 tolerance = 1e-8 if attempt == 0 else 1e-9
                 self._solver.setup(P=self._p_pattern, q=problem.gradient * scale,
                                    A=self._a_pattern, l=problem.lower * row_scale, u=problem.upper * row_scale,
-                                   eps_abs=tolerance, eps_rel=tolerance, max_iter=30000, polishing=True, verbose=False, adaptive_rho_interval=50)
+                                   eps_abs=tolerance, eps_rel=tolerance, max_iter=30000, polishing=True, verbose=False, adaptive_rho_interval=200)
                 self.solver_setups += 1
             else:
                 self._solver.update(Px=scaled_hessian[self._p_pattern.indices, self._p_columns],

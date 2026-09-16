@@ -1,0 +1,15 @@
+{
+  "controller": "mpc",
+  "status": "passed",
+  "checks": [
+    "load",
+    "single_step",
+    "continuous_loop",
+    "pause",
+    "stop_at_boundary",
+    "side_push",
+    "reset",
+    "step_after_reset"
+  ],
+  "browser_exceptions": []
+}

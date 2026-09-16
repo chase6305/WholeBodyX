@@ -1,0 +1,31 @@
+{
+  "status": "passed",
+  "controller": "mpc",
+  "push_force_n": 3.0,
+  "requested_seconds": 300.0,
+  "amplitude": 0.05,
+  "source_sha256": {
+    "python/wholebodyx/dynamics.py": "2de8aebc46d83ed0d217ce5b2e604829b73e3dcb45fa16dc1644d19004886d28",
+    "examples/python/h1_dynamics_wbc.py": "e7620d317ef4f3b6f0ad0dfb0c58d058caea01e890e812ea5a163f234109a083",
+    "python/wholebodyx/centroidal.py": "2dabc9d4aef982044d74a0564b157361d218019b5f2a7e319eabf52766fa5afe",
+    "python/wholebodyx/qp.py": "f5cc13051c1b25e7518dd1cd803d2842c46f50a6eae71714638615e17e859bbe",
+    "python/wholebodyx/contact.py": "bbf47da11e607c8a2da031c79b522a9e2352b8b69ce8bd4bcfc1873590e00200"
+  },
+  "steps": 60000,
+  "min_force_n": 236.05659003447437,
+  "max_com_error_m": 0.018976217885547198,
+  "max_contact_position_error_m": 9.245606389490421e-07,
+  "max_forward_contact_violation": 0.0,
+  "max_constraint_violation": 8.294580400747265e-06,
+  "max_forward_dynamics_residual": 2.0463630789890885e-12,
+  "max_quaternion_norm_error": 2.220446049250313e-16,
+  "max_wbc_ms": 29.302415903657675,
+  "initial_peak_rss_kib": 119940,
+  "simulation_s": 299.9999999997997,
+  "wall_s": 122.10726152965799,
+  "mpc_continuity_fallbacks": 0,
+  "solver_setups": 1,
+  "solver_recoveries": 0,
+  "mpc_replans": 3000,
+  "peak_rss_kib": 121732
+}
