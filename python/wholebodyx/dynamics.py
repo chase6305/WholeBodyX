@@ -107,7 +107,7 @@ class FloatingBaseDynamics:
 
 
 class ContactWBC:
-    """Acceleration/torque/local-sole-wrench QP; no dynamic MPC yet."""
+    """Acceleration/torque/local-sole-wrench QP for prescribed contacts."""
     def __init__(self, dynamics, initial, friction=.6):
         if not np.isfinite(friction) or friction <= 0:
             raise ValueError("friction must be positive")
@@ -244,9 +244,10 @@ class ContactWBC:
                 self._p_pattern.data[:] = scaled_hessian[self._p_pattern.indices, self._p_columns]
                 self._a_pattern.data[:] = scaled_constraint[self._a_pattern.indices, self._a_columns]
                 self._solver = osqp.OSQP()
+                tolerance = 1e-8 if attempt == 0 else 1e-9
                 self._solver.setup(P=self._p_pattern, q=problem.gradient * scale,
                                    A=self._a_pattern, l=problem.lower * row_scale, u=problem.upper * row_scale,
-                                   eps_abs=1e-9, eps_rel=1e-9, max_iter=30000, polishing=True, verbose=False, adaptive_rho_interval=50)
+                                   eps_abs=tolerance, eps_rel=tolerance, max_iter=30000, polishing=True, verbose=False, adaptive_rho_interval=50)
                 self.solver_setups += 1
             else:
                 self._solver.update(Px=scaled_hessian[self._p_pattern.indices, self._p_columns],
@@ -264,20 +265,26 @@ class ContactWBC:
                 if result.x is None or np.shape(result.x) != (n,) or not np.isfinite(result.x).all():
                     self._solver, self.previous = None, None
                     raise RuntimeError("dynamics WBC returned an invalid solution")
-                break
+                physical = result.x * scale
+                violation = float(max(np.max(problem.lower - problem.constraint @ physical),
+                                      np.max(problem.constraint @ physical - problem.upper), 0.))
+                if violation <= 1e-5:
+                    break
+                # Scaled solver tolerances are not physical acceptance bounds.
+                # Refine once in a fresh workspace, retaining the same absolute
+                # limits; reject the step if the tighter solve still fails.
+                self._solver, self.previous = None, None
+                if attempt == 0:
+                    self.solver_recoveries += 1
+                    continue
+                raise RuntimeError(f"dynamics WBC constraint violation: {violation}")
             self._solver, self.previous = None, None
             if attempt == 0 and result.info.status_val in (2, 7):
                 self.solver_recoveries += 1
                 continue
             raise RuntimeError(f"dynamics WBC failed: {result.info.status}")
-        result.x *= scale
-        violation = float(max(np.max(problem.lower - problem.constraint @ result.x),
-                              np.max(problem.constraint @ result.x - problem.upper), 0.))
-        if violation > 1e-5:
-            self._solver, self.previous = None, None
-            raise RuntimeError(f"dynamics WBC constraint violation: {violation}")
-        self.previous = result.x.copy()
-        acceleration, torque, wrench = np.split(result.x, [nv, nv + na])
+        self.previous = physical.copy()
+        acceleration, torque, wrench = np.split(physical, [nv, nv + na])
         return dict(acceleration=acceleration, torque=torque, wrench=wrench,
                     contact_rhs=contact_rhs, terms=terms, violation=violation, iterations=result.info.iter,
                     dynamics_residual=float(np.max(np.abs(mass @ acceleration + bias - r.selection @ torque - jac.T @ wrench))),

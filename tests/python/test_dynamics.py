@@ -330,3 +330,38 @@ def test_mpc_shift_push_tracking_and_support_force_smoothness(demo_module):
     assert max(r["forward_contact_violation"] for r in rows) <= 1e-5
     assert max(r["forward_dynamics_residual"] for r in rows) <= 1e-5
     assert demo.mpc_continuity_fallbacks == 0
+
+
+def test_physical_constraint_error_refines_once(demo_module, monkeypatch):
+    from types import SimpleNamespace
+    demo = demo_module.DynamicsDemo()
+    demo.step()
+    solver = demo.controller._solver
+    monkeypatch.setattr(solver, 'solve', lambda **kwargs: SimpleNamespace(
+        info=SimpleNamespace(status_val=1, status='solved', iter=1), x=np.zeros(56)))
+    row = demo.step()
+    assert demo.controller.solver_recoveries == 1
+    assert demo.controller.solver_setups == 2
+    assert demo.controller._solver.settings.eps_abs == 1e-9
+    assert row['constraint_violation'] <= 1e-5
+    assert row['forward_contact_violation'] <= 1e-5
+
+
+def test_physical_constraint_error_never_relaxes_acceptance(demo_module, monkeypatch):
+    from types import SimpleNamespace
+    import wholebodyx.dynamics as dynamics
+    tolerances = []
+    def setup(**kwargs):
+        tolerances.append((kwargs['eps_abs'], kwargs['eps_rel']))
+    monkeypatch.setattr(dynamics.osqp, 'OSQP', lambda: SimpleNamespace(
+        setup=setup, update=lambda **kw: None, update_settings=lambda **kw: None,
+        warm_start=lambda **kw: None, solve=lambda **kw: SimpleNamespace(
+            info=SimpleNamespace(status_val=1, status='solved', iter=1), x=np.zeros(56))))
+    demo = demo_module.DynamicsDemo()
+    with pytest.raises(RuntimeError, match='constraint violation'):
+        demo.step()
+    assert tolerances == [(1e-8, 1e-8), (1e-9, 1e-9)]
+    assert demo.controller.solver_recoveries == 1
+    assert demo.controller._solver is None
+    assert demo.controller.previous is None
+    assert demo.state.stamp == 0.
