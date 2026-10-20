@@ -21,9 +21,33 @@ def array(value, ndim, name):
 
 
 def positive(value, name):
+    value = float(value)
     if not np.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be positive and finite")
-    return float(value)
+    return value
+
+
+def _braking_speed(distance, acceleration, dt):
+    """Largest velocity whose discrete maximum-braking rollout fits distance.
+
+    A velocity command is integrated for dt before the next slew-limited
+    command. For k positive intervals, travel is
+    dt * (k * velocity - acceleration * dt * k * (k - 1) / 2).
+    Continuous sqrt(2*a*distance) bounds omit that first held interval.
+    """
+    distance = np.maximum(distance, 0.)
+    with np.errstate(over="ignore", under="ignore", divide="ignore", invalid="ignore"):
+        slew = acceleration * dt
+        root = np.sqrt(2.) * (np.sqrt(distance) / np.sqrt(acceleration)) / dt
+        count = np.maximum(1., np.ceil(np.hypot(.5, root) - .5))
+        speed = (distance / count) / dt + .5 * (count - 1.) * slew
+        # At enormous interval counts the discrete correction is below float
+        # resolution. Keep extreme finite inputs from producing inf/inf NaNs.
+        continuous = np.sqrt(2.) * np.sqrt(distance) * np.sqrt(acceleration)
+        speed = np.where(np.isfinite(count), speed, continuous)
+        speed = np.where(count == 1., distance / dt, speed)
+        speed = np.where(slew == 0., 0., speed)
+        return np.minimum(speed, distance / dt)
 
 
 @dataclass(frozen=True)
@@ -37,8 +61,10 @@ class RobotState:
         object.__setattr__(self, "v", array(self.v, 1, "v"))
         if self.q.size == 0 or self.q.shape != self.v.shape:
             raise ValueError("fixed-base q and v must have equal, nonzero dimensions")
-        if not np.isfinite(self.stamp) or self.stamp < 0:
+        stamp = float(self.stamp)
+        if not np.isfinite(stamp) or self.stamp < 0:
             raise ValueError("stamp must be finite and nonnegative")
+        object.__setattr__(self, "stamp", stamp)
 
 
 @dataclass(frozen=True)
@@ -74,6 +100,29 @@ class JointLimits:
             slew = self.acceleration * dt
             np.maximum(lo, state.v - slew, out=lo)
             np.minimum(hi, state.v + slew, out=hi)
+            # This upper bound on stopping travel avoids square roots for
+            # joints comfortably inside their limits. Only nearby joints need
+            # the exact discrete envelope.
+            with np.errstate(over="ignore", under="ignore", divide="ignore"):
+                travel = self.velocity * (self.velocity / self.acceleration + dt)
+            below = state.q - self.lower
+            above = self.upper - state.q
+            near_lower = (lo < 0) & (below < travel)
+            near_upper = (hi > 0) & (above < travel)
+            if np.any(near_lower):
+                lo[near_lower] = np.maximum(lo[near_lower], -_braking_speed(
+                    below[near_lower], self.acceleration[near_lower], dt))
+            if np.any(near_upper):
+                hi[near_upper] = np.minimum(hi[near_upper], _braking_speed(
+                    above[near_upper], self.acceleration[near_upper], dt))
+            # At the braking boundary the interval can collapse to one value.
+            # Subtracting joint positions can invert it by a few roundoff ULPs.
+            inverted = lo > hi
+            if np.any(inverted):
+                scale = np.maximum(np.maximum(np.abs(self.lower), np.abs(self.upper)), np.abs(state.q))
+                close = inverted & np.isfinite(lo) & np.isfinite(hi) & (lo - hi <= (16 * np.finfo(float).eps * scale) / dt)
+                midpoint = .5 * lo[close] + .5 * hi[close]
+                lo[close] = hi[close] = midpoint
         return lo, hi
 
 
@@ -114,6 +163,8 @@ class VelocityCommand:
     valid_until: float
 
     def __post_init__(self):
+        object.__setattr__(self, "stamp", float(self.stamp))
+        object.__setattr__(self, "valid_until", float(self.valid_until))
         object.__setattr__(self, "velocity", array(self.velocity, 1, "velocity"))
         if not self.velocity.size or not np.isfinite([self.stamp, self.valid_until]).all():
             raise ValueError("invalid command")

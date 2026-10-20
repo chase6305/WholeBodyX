@@ -124,6 +124,41 @@ def test_clock_rollback_requires_reset_even_after_clock_catches_up():
     assert runtime.update(at(0), [.3], .02).success
 
 
+@pytest.mark.parametrize("exception_type", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_failed_planner_reset_discards_old_reference_and_requires_fresh_solve(exception_type):
+    planner = HoldPlanner()
+    runtime = MPCReferenceManager(planner, bounds(), replan_period=1.)
+    runtime.update(at(0), [.3], .02)
+    failure = exception_type("planner reset failed")
+    def fail_reset():
+        raise failure
+    planner.reset = fail_reset
+    with pytest.raises(exception_type, match="planner reset failed") as caught:
+        runtime.reset()
+    assert caught.value is failure
+    assert runtime.plan is None
+    result = runtime.update(at(.02), [.3], .02)
+    assert result.replanned
+    np.testing.assert_allclose(planner.calls, [0., .02])
+
+
+def test_failed_planner_reset_preserves_clock_rollback_latch():
+    planner = HoldPlanner()
+    runtime = MPCReferenceManager(planner, bounds())
+    runtime.update(at(1), [.3], .02)
+    assert runtime.update(at(.9), [.3], .02).reason == "clock_rollback"
+    reset = planner.reset
+    def fail_reset():
+        raise RuntimeError("planner reset failed")
+    planner.reset = fail_reset
+    with pytest.raises(RuntimeError):
+        runtime.reset()
+    assert runtime.update(at(2), [.3], .02).reason == "clock_rollback"
+    planner.reset = reset
+    runtime.reset()
+    assert runtime.update(at(0), [.3], .02).success
+
+
 def test_manager_owns_adapter_plan_snapshot():
     source = JointPlan([[0], [0], [0]], [[0], [0]], 0, .1)
     runtime = MPCReferenceManager(SimpleNamespace(solve=lambda *args: solved(source)), bounds())
@@ -132,6 +167,17 @@ def test_manager_owns_adapter_plan_snapshot():
     source.positions[:] = 9
     result = runtime.update(at(.02), [.3], .02)
     np.testing.assert_array_equal(result.position, [0])
+
+
+def test_single_precision_display_stamp_keeps_a_current_plan():
+    planner = HoldPlanner()
+    runtime = MPCReferenceManager(planner, bounds())
+    runtime.update(at(1e8), [.3], .02)
+    plan = runtime.plan
+    runtime.discard_outdated(np.float32(1e8), [.3])
+    assert runtime.plan is plan
+    runtime.discard_outdated(np.nextafter(np.float32(1e8), np.float32(np.inf)), [.3])
+    assert runtime.plan is None
 
 
 @pytest.mark.parametrize("period,tolerance", [(0, .03), (.1, 0), (np.inf, .03), (.1, np.nan)])

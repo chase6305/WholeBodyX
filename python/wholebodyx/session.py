@@ -66,21 +66,29 @@ class TrackingSession:
     def set_scenario(self, scenario):
         if scenario not in SCENARIOS:
             raise ValueError("unknown scenario")
-        previous_scenario = self.scenario
-        self.scenario = scenario
+        # New components own reset side effects; retain the old session
+        # bindings until configuration and simulation reset both succeed.
+        previous = self.__dict__.copy()
         try:
+            self.scenario = scenario
             self.configure(self.backend, SCENARIOS[scenario].mode or self.mode, self.mpc_backend)
-        except Exception:
-            self.scenario = previous_scenario
+            self.goal = array(INITIAL_Q if scenario in ("cartesian_circle", "coordination") else DEFAULT_GOAL, 1, "goal")
+            self.reset()
+        except BaseException:
+            self.__dict__ = previous
             raise
-        self.goal = array(INITIAL_Q if scenario in ("cartesian_circle", "coordination") else DEFAULT_GOAL, 1, "goal")
-        self.reset()
 
     def reset(self):
-        self.plant = JointIntegrator(self.model.limits, RobotState(INITIAL_Q, np.zeros(6)))
-        self.controller.reset()
-        if self.reference_manager is not None:
-            self.reference_manager.reset()
+        plant = JointIntegrator(self.model.limits, RobotState(INITIAL_Q, np.zeros(6)))
+        self._invalidate_plan("retry")
+        try:
+            self.controller.reset()
+            if self.reference_manager is not None:
+                self.reference_manager.reset()
+        except BaseException as exc:
+            self.failure = str(exc) or type(exc).__name__
+            raise
+        self.plant = plant
         self._prediction_cache = {}
         self._cached_plan = None
         self.steps = 0
@@ -114,9 +122,9 @@ class TrackingSession:
             result = self._step()
             self.failure = None
             return result
-        except (ValueError, TypeError, RuntimeError, ImportError) as exc:
+        except BaseException as exc:
             self._invalidate_plan("retry")
-            self.failure = str(exc)
+            self.failure = str(exc) or type(exc).__name__
             raise
 
     def _step(self):

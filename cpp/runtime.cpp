@@ -33,11 +33,11 @@ CommandGate::CommandGate(JointLimits limits, double control_dt) : limits_(std::m
 }
 void CommandGate::reset() {
   last_stamp_.reset();
-  observed_stamp_.reset();
+  observed_state_.reset();
   fault_.clear();
 }
 void CommandGate::latch_fault(std::string detail) {
-  if (fault_.empty()) fault_ = std::move(detail);
+  if (fault_.empty()) fault_ = detail.empty() ? "unspecified control fault" : std::move(detail);
 }
 RobotState CommandGate::observe(const RobotState& state) {
   if (!fault_.empty()) throw std::runtime_error("command gate is faulted: " + fault_ + "; reset before continuing");
@@ -50,13 +50,17 @@ RobotState CommandGate::observe(const RobotState& state) {
   require(!(state.v.array().abs() > limits_.velocity.array() + tolerance).any(),
           "measured velocity exceeds configured limits");
   require(!last_stamp_ || state.stamp > *last_stamp_, "robot state clock did not advance");
-  last_stamp_ = observed_stamp_ = state.stamp;
+  last_stamp_ = state.stamp;
+  observed_state_ = state;
   return state;
 }
 VelocityCommand CommandGate::validate(const RobotState& state, const VelocityCommand& command) const {
   if (!fault_.empty()) throw std::runtime_error("command gate is faulted: " + fault_ + "; reset before continuing");
-  require(observed_stamp_ && same_time(state.stamp, *observed_stamp_),
+  require(observed_state_ && same_time(state.stamp, observed_state_->stamp),
           "command was not validated against the latest observed state");
+  require(state.q.size() == observed_state_->q.size() && state.v.size() == observed_state_->v.size() &&
+          (state.q.array() == observed_state_->q.array()).all() && (state.v.array() == observed_state_->v.array()).all(),
+          "command state differs from the latest observed state");
   require(command.velocity.size() == state.q.size() && command.velocity.allFinite(),
           "command and measured state dimensions differ");
   require(std::isfinite(command.stamp) && std::isfinite(command.valid_until) && command.stamp >= 0 &&
@@ -77,11 +81,23 @@ VelocityCommand CommandGate::validate(const RobotState& state, const VelocityCom
 VelocityControlLoop::VelocityControlLoop(VelocityRobotBackend& backend, Controller& controller,
                                          JointLimits limits, double control_dt)
     : backend_(backend), controller_(controller), gate_(std::move(limits), control_dt), control_dt_(control_dt) {}
-void VelocityControlLoop::reset() {
-  controller_.reset();
-  gate_.reset();
+VelocityControlLoop::VelocityControlLoop(VelocityRobotBackend& backend, Controller& controller,
+                                         JointLimits limits, double control_dt, double max_cycle_time)
+    : VelocityControlLoop(backend, controller, std::move(limits), control_dt) {
+  require(std::isfinite(max_cycle_time) && max_cycle_time > 0, "max cycle time must be positive and finite");
+  max_cycle_time_ = max_cycle_time;
 }
-[[noreturn]] void VelocityControlLoop::fail(const std::exception& exc) {
+void VelocityControlLoop::reset() {
+  try {
+    controller_.reset();
+    gate_.reset();
+  } catch (const std::exception& exc) {
+    fail(exc, "reset");
+  } catch (...) {
+    fail(std::runtime_error("non-standard exception during controller reset"), "reset");
+  }
+}
+[[noreturn]] void VelocityControlLoop::fail(const std::exception& exc, const char* operation) {
   gate_.latch_fault(exc.what());
   std::string detail = exc.what();
   try {
@@ -92,25 +108,40 @@ void VelocityControlLoop::reset() {
   } catch (...) {
     detail += "; backend stop failed with unknown exception";
   }
-  throw std::runtime_error("velocity control cycle fault: " + detail);
+  throw std::runtime_error(std::string("velocity control ") + operation + " fault: " + detail);
 }
 CycleResult VelocityControlLoop::step(const TaskFactory& task_factory) {
   if (!gate_.fault().empty()) throw std::runtime_error("velocity control loop is faulted: " + gate_.fault() + "; reset before continuing");
   require(static_cast<bool>(task_factory), "task factory must be callable");
+  const auto cycle_started = std::chrono::steady_clock::now();
+  const auto check_deadline = [&](const VelocityCommand* command = nullptr) {
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - cycle_started).count();
+    if (max_cycle_time_) {
+      const double budget = command ? std::min(*max_cycle_time_, command->valid_until - command->stamp) : *max_cycle_time_;
+      if (elapsed >= budget) throw std::runtime_error("velocity control cycle exceeded its execution deadline");
+    }
+    return elapsed * 1000;
+  };
   try {
     const RobotState state = gate_.observe(backend_.read());
+    check_deadline();
     const auto tasks = task_factory(state);
     for (const auto& task : tasks) task.validate(state.q.size());
+    check_deadline();
     const auto started = std::chrono::steady_clock::now();
     ControlResult control = controller_.step(state, tasks, control_dt_);
     const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     validate_control(control);
     const VelocityCommand command = gate_.validate(state, *control.command);
+    check_deadline(&command);
     backend_.write(command);
+    const double cycle_ms = check_deadline(&command);
     control.command = command;
-    return {state, std::move(control), elapsed};
+    return {state, std::move(control), elapsed, cycle_ms};
   } catch (const std::exception& exc) {
     fail(exc);
+  } catch (...) {
+    fail(std::runtime_error("non-standard exception in velocity control cycle"));
   }
 }
 }  // namespace wholebodyx

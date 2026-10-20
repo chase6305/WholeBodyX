@@ -10,6 +10,7 @@ from .types import JointLimits, array, positive
 
 
 def _time_window(stamp, dt, count):
+    stamp, dt = float(stamp), float(dt)
     end = stamp + dt * count
     if not np.isfinite([stamp, end]).all() or stamp < 0 or end <= stamp or dt <= 8 * max(ulp(stamp), ulp(end)):
         raise ValueError("plan time window must be finite and resolve each time step")
@@ -61,7 +62,8 @@ class JointPlan:
     def __post_init__(self):
         q = array(self.positions, 2, "positions")
         v = array(self.velocities, 2, "velocities")
-        positive(self.dt, "plan dt")
+        object.__setattr__(self, "dt", positive(self.dt, "plan dt"))
+        object.__setattr__(self, "stamp", float(self.stamp))
         if not v.shape[0] or not v.shape[1] or q.shape != (v.shape[0] + 1, v.shape[1]):
             raise ValueError("plan must contain N+1 positions and N velocities")
         _time_window(self.stamp, self.dt, len(v))
@@ -75,6 +77,7 @@ class JointPlan:
         return self.stamp + self.dt * len(self.velocities)
 
     def sample(self, stamp):
+        stamp = float(stamp)
         if not np.isfinite(stamp) or stamp < self.stamp or stamp >= self.valid_until:
             raise ValueError("reference is future-dated or expired")
         elapsed = stamp - self.stamp

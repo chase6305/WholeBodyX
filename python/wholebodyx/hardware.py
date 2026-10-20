@@ -40,9 +40,9 @@ class CommandGate:
     control_dt: float
 
     def __post_init__(self):
-        positive(self.control_dt, "control dt")
+        object.__setattr__(self, "control_dt", positive(self.control_dt, "control dt"))
         object.__setattr__(self, "_last_stamp", None)
-        object.__setattr__(self, "_observed_stamp", None)
+        object.__setattr__(self, "_observed_state", None)
         object.__setattr__(self, "_fault", None)
 
     @property
@@ -51,7 +51,7 @@ class CommandGate:
 
     def reset(self):
         object.__setattr__(self, "_last_stamp", None)
-        object.__setattr__(self, "_observed_stamp", None)
+        object.__setattr__(self, "_observed_state", None)
         object.__setattr__(self, "_fault", None)
 
     def latch_fault(self, detail):
@@ -71,8 +71,9 @@ class CommandGate:
             raise ValueError("measured velocity exceeds configured limits")
         if self._last_stamp is not None and state.stamp <= self._last_stamp:
             raise ValueError("robot state clock did not advance")
+        snapshot = RobotState(state.q, state.v, state.stamp)
         object.__setattr__(self, "_last_stamp", state.stamp)
-        object.__setattr__(self, "_observed_stamp", state.stamp)
+        object.__setattr__(self, "_observed_state", snapshot)
         return state
 
     def validate(self, state, command):
@@ -80,8 +81,11 @@ class CommandGate:
             raise RuntimeError(f"command gate is faulted: {self._fault}; reset before continuing")
         if not isinstance(command, VelocityCommand):
             raise ValueError("controller must return VelocityCommand")
-        if self._observed_stamp is None or not _same_time(state.stamp, self._observed_stamp):
+        observed = self._observed_state
+        if not isinstance(state, RobotState) or observed is None or not _same_time(state.stamp, observed.stamp):
             raise ValueError("command was not validated against the latest observed state")
+        if not np.array_equal(state.q, observed.q) or not np.array_equal(state.v, observed.v):
+            raise ValueError("command state differs from the latest observed state")
         if not _same_time(command.stamp, state.stamp):
             raise ValueError("command timestamp does not match measured state")
         end = state.stamp + self.control_dt
@@ -127,6 +131,7 @@ class CycleResult:
     state: RobotState
     control: ControlResult
     control_ms: float
+    cycle_ms: float = 0.
 
     @property
     def command(self):
@@ -138,9 +143,11 @@ class VelocityControlLoop:
 
     Any read, task, solve, validation, or write error latches a fault and calls the
     backend's stop method once. Call reset() before attempting another cycle.
+    max_cycle_time optionally bounds the complete cycle in wall-clock seconds;
+    it detects overruns at stage boundaries and cannot interrupt blocking calls.
     """
 
-    def __init__(self, backend, limits, controller, control_dt):
+    def __init__(self, backend, limits, controller, control_dt, *, max_cycle_time=None):
         if not all(callable(getattr(backend, name, None)) for name in ("read", "write", "stop")):
             raise TypeError("robot backend must implement read, write, and stop")
         if not all(callable(getattr(controller, name, None)) for name in ("reset", "step")):
@@ -148,34 +155,65 @@ class VelocityControlLoop:
         self.backend, self.controller = backend, controller
         self.gate = CommandGate(limits, control_dt)
         self.control_dt = self.gate.control_dt
+        self._max_cycle_time = (None if max_cycle_time is None
+                                else positive(max_cycle_time, "max cycle time"))
+
+    max_cycle_time = property(lambda self: self._max_cycle_time)
 
     @property
     def fault(self):
         return self.gate.fault
 
     def reset(self):
-        self.controller.reset()
+        try:
+            self.controller.reset()
+        except Exception as exc:
+            self._fail(exc, "reset")
+        except BaseException as exc:
+            self._cancel(exc)
         self.gate.reset()
 
-    def _fail(self, exc):
+    def _fail(self, exc, operation="cycle"):
         self.gate.latch_fault(exc)
         detail = str(exc)
         try:
             self.backend.stop()
         except Exception as stop_exc:
             detail = f"{detail}; backend stop failed: {type(stop_exc).__name__}: {stop_exc}"
-        raise RuntimeError(f"velocity control cycle fault: {detail}") from exc
+        raise RuntimeError(f"velocity control {operation} fault: {detail}") from exc
+
+    def _cancel(self, exc):
+        self.gate.latch_fault(type(exc).__name__)
+        try:
+            self.backend.stop()
+        except BaseException as stop_exc:
+            raise exc from stop_exc
+        raise exc
 
     def step(self, task_factory: Callable[[RobotState], list[LinearTask]]):
         if not callable(task_factory):
             raise TypeError("task_factory must be callable")
         if self.fault is not None:
             raise RuntimeError(f"velocity control loop is faulted: {self.fault}; reset before continuing")
+        cycle_started = perf_counter()
+
+        def check_deadline(command=None):
+            elapsed = perf_counter() - cycle_started
+            if self.max_cycle_time is not None:
+                budget = self.max_cycle_time
+                if command is not None:
+                    budget = min(budget, command.valid_until - command.stamp)
+                if not np.isfinite(elapsed) or elapsed < 0 or elapsed >= budget:
+                    raise RuntimeError("velocity control cycle exceeded its execution deadline")
+            return elapsed * 1000
+
         try:
             state = self.gate.observe(self.backend.read())
+            check_deadline()
             tasks = task_factory(state)
             if not isinstance(tasks, (list, tuple)) or not all(isinstance(task, LinearTask) for task in tasks):
                 raise ValueError("task_factory must return a list or tuple of LinearTask values")
+            check_deadline()
             started = perf_counter()
             control = self.controller.step(state, list(tasks), self.control_dt)
             elapsed = (perf_counter() - started) * 1000
@@ -186,7 +224,13 @@ class VelocityControlLoop:
             if not np.isfinite(control.solver.violation) or control.solver.violation < 0 or control.solver.violation > 1e-6:
                 raise ValueError("controller reported an invalid constraint violation")
             command = self.gate.validate(state, control.command)
+            check_deadline(command)
             self.backend.write(command)
-            return CycleResult(state, ControlResult(control.solver, command), elapsed)
+            cycle_ms = check_deadline(command)
+            return CycleResult(state, ControlResult(control.solver, command), elapsed, cycle_ms)
         except Exception as exc:
             self._fail(exc)
+        except BaseException as exc:
+            # Cancellation must stop the driver too, while preserving
+            # KeyboardInterrupt/SystemExit for the calling application.
+            self._cancel(exc)

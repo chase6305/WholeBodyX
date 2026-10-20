@@ -19,6 +19,24 @@ def test_stationary_equilibrium_and_immutable_plan():
             plan.sample(stamp)
 
 
+def test_numpy_single_precision_plan_clock_and_sampling():
+    stamp, dt = np.float32(1e8), np.float32(.1)
+    states = np.zeros((4, 3, 2))
+    states[:, 0] = np.arange(4)[:, None] * float(dt)
+    states[:, 1] = 1.
+    plan = CoMPlan(states, np.zeros((3, 2)), stamp, dt, np.float32(.95), np.float32(9.81))
+    for name in ("stamp", "dt", "height", "gravity"):
+        assert type(getattr(plan, name)) is float
+    np.testing.assert_array_equal(plan.sample(stamp)[0], [0., 0.])
+    sample_stamp = float(stamp) + 1.5 * float(dt)
+    np.testing.assert_allclose(plan.sample(sample_stamp)[0], sample_stamp - float(stamp), atol=1e-12)
+    with pytest.raises(ValueError):
+        plan.sample(float(stamp) + 3 * float(dt))
+    mpc = CoMPreviewMPC(SUPPORT, .95, horizon=2, dt=dt)
+    planned = mpc.plan([0, 0], [0, 0], [0, 0], np.zeros((2, 2)), stamp=stamp)
+    np.testing.assert_allclose(planned.sample(stamp)[0], 0., atol=1e-9)
+
+
 def test_continuous_zmp_support_and_jerk_dynamics():
     mpc = CoMPreviewMPC(SUPPORT, .95)
     plan = mpc.plan([0., 0.], [0., 0.], [0., 0.], np.tile([.07, .15], (20, 1)))

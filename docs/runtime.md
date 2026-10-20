@@ -25,6 +25,10 @@
 下一次周期规划为 0.18 s，而不会在全局第 5 个控制步骤的 0.10 s 再次规划。
 目标变化、预测偏差和有效期检查仍可提前触发。
 
+`RobotState`、`VelocityCommand`、`JointPlan` 和 `CoMPlan` 的时间标量保存为 Python
+`float`；计划采样时也先转换时间参数，避免 NumPy 单精度运算使大时间戳下的有效区间折叠。
+转换保留输入已经表示的数值，不能恢复调用方先前丢失的时间精度；无法分辨步长的计划仍会被拒绝。
+
 ## 接收自有 MPC 的结果
 
 接入自己的仓库时，adapter 返回 `PlanResult(QPResult(...), JointPlan(...))`。
@@ -39,6 +43,8 @@
 影响已接收的参考。目标可为限位外的软目标；预测状态本身仍需要满足硬约束。
 
 一次刷新失败时，`ReferenceUpdate.success` 为假，位置/速度均为空，旧计划被清除。
+`reset()` 在调用外部规划器前先使旧参考失效；外部复位抛错时继续保持失效，
+时钟回退锁存只在复位成功后清除。取消异常原样传给调用方。
 运行模块不自动退回旧轨迹，不会把陈旧或未来时间戳改写成当前时间。
 参数错误抛出 `ValueError`；规划器的 `ValueError` / `RuntimeError` 转换成失败结果供运行层处理。
 
@@ -64,6 +70,39 @@ if not update.success:
 [TrackingSession](../python/wholebodyx/session.py)。WBC 失败时该 session 同样清除参考，
 控制步骤不推进仿真时间。真实硬件的停机或降级行为需由硬件运行层实现；同步模块没有后台 worker、
 超时中断、跨进程参考交换或硬实时保证。
+
+## 速度驱动边界与执行期限
+
+`VelocityControlLoop` 串行执行 `read → task_factory → controller.step → gate → write`。
+驱动实现 `read()`、`write(command)` 和 `stop()`；控制器继续使用现有 `Controller` 契约。
+`CommandGate` 保存测量状态的独立快照，下发前核对时间、关节位置和速度，
+防止相同时间戳下换入不同状态，或任务/后端修改输入数组后仍通过校验。
+
+实际驱动接入时可显式配置执行预算，单位为秒：
+
+```python
+from wholebodyx import VelocityControlLoop
+
+# driver、limits、controller、task_factory 由应用提供。
+loop = VelocityControlLoop(driver, limits, controller, control_dt=.005,
+                           max_cycle_time=.004)
+cycle = loop.step(task_factory)
+print(cycle.control_ms, cycle.cycle_ms)
+```
+
+预算从调用 `read()` 前开始，覆盖读取、任务构造、求解、校验和下发。
+超期会锁存故障并调用一次 `stop()`；下发前超期则不写命令，下发阻塞超期则在返回后停机。
+即使预算较长，也不允许本次执行耗时超过命令自身的有效区间长度。
+`control_ms` 只计控制器调用，新增的 `cycle_ms` 包含整个周期。
+默认 `max_cycle_time=None` 保留原同步行为；C++ 保留原四参数构造函数，
+可使用第五个正有限秒数配置相同预算。
+
+故障后调用 `reset()` 清除控制器和门控历史，重新建立状态时钟起点。
+控制器复位失败也会尝试一次 `stop()` 并锁存故障；成功复位后才允许再次读写驱动。
+Python 取消执行时先停机，再原样抛出 `KeyboardInterrupt` / `SystemExit`；
+C++ 非标准异常也进入停机路径。
+执行预算不能抢占阻塞中的 I/O 或求解器；状态时间戳的时钟映射、传感数据年龄、
+周期调度和设备端看门狗仍由驱动/应用负责。
 
 ## 状态偏移恢复示例
 

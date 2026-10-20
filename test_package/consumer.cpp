@@ -1,5 +1,15 @@
 #include <wholebodyx/control.hpp>
 #include <wholebodyx/joint_order.hpp>
+#include <wholebodyx/runtime.hpp>
+
+struct Backend : wholebodyx::VelocityRobotBackend {
+  int writes = 0, stops = 0;
+  wholebodyx::RobotState read() override {
+    return {wholebodyx::Vector::Zero(1), wholebodyx::Vector::Zero(1), 0};
+  }
+  void write(const wholebodyx::VelocityCommand&) override { ++writes; }
+  void stop() override { ++stops; }
+};
 
 int main() {
   using namespace wholebodyx;
@@ -12,6 +22,13 @@ int main() {
   ReorderedController wrapped(std::make_unique<KinematicWBC>(order.limits_to_backend(three)), order);
   auto converted = wrapped.step({Vector::Zero(3), Vector::Zero(3), 0},
                                 {{Matrix::Identity(3, 3), Vector::Ones(3), Vector::Ones(3)}}, .02);
+  Backend backend;
+  VelocityControlLoop loop(backend, controller, limits, 1., .5);
+  const auto cycle = loop.step([](const RobotState&) {
+    return std::vector<LinearTask>{{Matrix::Identity(1, 1), Vector::Constant(1, .5), Vector::Ones(1)}};
+  });
   return result.solver.success() && converted.command &&
-         (converted.command->velocity - three.velocity).norm() < 1e-6 ? 0 : 1;
+         (converted.command->velocity - three.velocity).norm() < 1e-6 &&
+         cycle.control.command && cycle.cycle_ms >= cycle.control_ms &&
+         backend.writes == 1 && backend.stops == 0 ? 0 : 1;
 }

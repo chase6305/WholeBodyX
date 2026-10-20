@@ -318,8 +318,15 @@ def test_mpc_continuity_fallback_is_feasibility_checked_and_bounded(demo_module,
     assert demo.mpc_continuity_fallbacks == 0
 
 
-def test_mpc_shift_push_tracking_and_support_force_smoothness(demo_module):
+def test_mpc_shift_push_tracking_and_support_force_smoothness(demo_module, monkeypatch):
     demo = demo_module.DynamicsDemo(controller="mpc", amplitude=.05, push_force=3.)
+    iterations = []
+    solve = demo.controller.solve
+    def measured_solve(*args, **kwargs):
+        result = solve(*args, **kwargs)
+        iterations.append(result["iterations"])
+        return result
+    monkeypatch.setattr(demo.controller, "solve", measured_solve)
     rows = [demo.step() for _ in range(3200)]
     errors = np.array([r["com_error_m"] for r in rows])
     forces = np.array([[r["left_fz_n"], r["right_fz_n"]] for r in rows])
@@ -330,6 +337,10 @@ def test_mpc_shift_push_tracking_and_support_force_smoothness(demo_module):
     assert max(r["forward_contact_violation"] for r in rows) <= 1e-5
     assert max(r["forward_dynamics_residual"] for r in rows) <= 1e-5
     assert demo.mpc_continuity_fallbacks == 0
+    # Fixed H1 trajectory: protect iteration tails without a wall-clock limit.
+    assert max(iterations) <= 8000
+    assert demo.controller.solver_setups == 1
+    assert demo.controller.solver_recoveries == 0
 
 
 def test_physical_constraint_error_refines_once(demo_module, monkeypatch):

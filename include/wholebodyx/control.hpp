@@ -22,6 +22,8 @@ struct JointLimits {
   Vector lower, upper, velocity;
   Vector acceleration;  // Empty means no velocity-slew constraint.
   void validate() const;
+  // With acceleration limits, retain enough travel for a discrete maximum-
+  // braking rollout; inconsistent states still produce inverted bounds.
   std::pair<Vector, Vector> velocity_bounds(const RobotState&, double dt) const;
 };
 

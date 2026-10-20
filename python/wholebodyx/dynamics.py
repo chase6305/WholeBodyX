@@ -5,6 +5,7 @@ implemented; the forward plant enforces the same persistent bilateral contacts.
 """
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 
@@ -20,6 +21,26 @@ class DynamicsState:
     q: np.ndarray
     v: np.ndarray
     stamp: float = 0.
+
+
+class DynamicsTerms(NamedTuple):
+    """One dynamics evaluation; positional indexing remains supported."""
+
+    mass: np.ndarray
+    bias: np.ndarray
+    contact_jacobian: np.ndarray
+    contact_drift: np.ndarray
+    contact_poses: list
+    com: np.ndarray
+    com_velocity: np.ndarray
+    com_drift: np.ndarray
+    com_jacobian: np.ndarray
+
+
+class ContactFormulation(NamedTuple):
+    problem: QuadraticProgram
+    terms: DynamicsTerms
+    contact_rhs: np.ndarray
 
 
 class FloatingBaseDynamics:
@@ -49,7 +70,7 @@ class FloatingBaseDynamics:
         q, v = np.asarray(state.q, dtype=float), np.asarray(state.v, dtype=float)
         if (q.shape != (self.model.nq,) or v.shape != (self.nv,)
                 or not np.isfinite(q).all() or not np.isfinite(v).all()
-                or not np.isfinite(state.stamp)):
+                or not np.isfinite(state.stamp) or state.stamp < 0):
             raise ValueError("invalid floating-base state")
         if abs(np.linalg.norm(q[3:7]) - 1.) > 1e-8:
             raise ValueError("floating-base quaternion must be normalized")
@@ -69,10 +90,11 @@ class FloatingBaseDynamics:
         com = p.centerOfMass(m, d, q, v, np.zeros(m.nv)).copy()
         com_v, com_drift = d.vcom[0].copy(), d.acom[0].copy()
         com_jac = p.jacobianCenterOfMass(m, d, q).copy()
-        return mass, bias, jac, drift, poses, com, com_v, com_drift, com_jac
+        return DynamicsTerms(mass, bias, jac, drift, poses, com, com_v, com_drift, com_jac)
 
     def forward(self, state, torque, contact_acceleration, terms, *, external_force=None):
         """Solve constrained forward dynamics from actuator torque, not QP ddq."""
+        self.validate_state(state)
         torque = np.asarray(torque, dtype=float)
         if torque.shape != (self.na,) or not np.isfinite(torque).all():
             raise ValueError("invalid actuator torque")
@@ -90,20 +112,34 @@ class FloatingBaseDynamics:
         # a redundant row at symmetric poses. Acceleration is unique, while
         # internal contact wrench can be indeterminate. Use a rank-aware solve.
         solution = np.linalg.lstsq(system, rhs, rcond=1e-10)[0]
-        if np.max(np.abs(system @ solution - rhs)) > 1e-5:
+        if not np.isfinite(solution).all():
+            raise RuntimeError("nonfinite constrained forward dynamics")
+        residual = system @ solution - rhs
+        if not np.isfinite(residual).all() or np.max(np.abs(residual)) > 1e-5:
             raise RuntimeError("inconsistent constrained forward dynamics")
         return solution[:self.nv], solution[self.nv:]
 
     def integrate(self, state, acceleration, dt):
+        dt = float(dt)
         if not np.isfinite(dt) or not 0 < dt <= .02:
             raise ValueError("dt must be in (0, 0.02]")
         q, v = self.validate_state(state)
+        start = float(state.stamp)
+        stamp = start + dt
+        if not np.isfinite(stamp) or stamp <= start:
+            raise ValueError("integration interval cannot be represented")
         acceleration = np.asarray(acceleration, dtype=float)
         if acceleration.shape != (self.nv,) or not np.isfinite(acceleration).all():
             raise ValueError("invalid generalized acceleration")
-        velocity = v + dt * acceleration
-        q = self.pin.integrate(self.model, q, dt * (v + .5 * dt * acceleration))
-        return DynamicsState(q, velocity, state.stamp + dt)
+        with np.errstate(over="ignore", invalid="ignore"):
+            velocity = v + dt * acceleration
+            displacement = dt * (v + .5 * dt * acceleration)
+        if not np.isfinite(velocity).all() or not np.isfinite(displacement).all():
+            raise ValueError("dynamics integration overflow")
+        q = self.pin.integrate(self.model, q, displacement)
+        if not np.isfinite(q).all():
+            raise ValueError("dynamics integration produced a nonfinite configuration")
+        return DynamicsState(q, velocity, stamp)
 
 
 class ContactWBC:
@@ -118,11 +154,30 @@ class ContactWBC:
         self.nominal = initial.q.copy()
         self.anchors = dynamics.terms(initial)[4]
         self._contact_reserve = 0.
+        nv, na, nc = dynamics.nv, dynamics.na, 6 * len(self.anchors)
+        n = nv + na + nc
+        self._hessian_template = np.diag(np.r_[np.full(nv, 1e-3), np.full(na, 1e-5), np.full(nc, 1e-6)])
+        self._posture_indices = np.arange(6, nv)
+        self._orientation_indices = np.arange(3, 6)
+        self._bounds_start = nv + nc
+        self._cone_start = self._bounds_start + nv + na
+        rows = self._cone_start + len(self.anchors) * len(self._planning_cone)
+        self._constraint_template = np.zeros((rows, n))
+        self._constraint_template[self._bounds_start:self._cone_start, :nv + na] = np.eye(nv + na)
+        self._lower_template, self._upper_template = np.zeros(rows), np.zeros(rows)
+        self._lower_template[self._cone_start:] = -np.inf
+        self._scale = np.r_[np.ones(nv), np.full(na, 50.), np.full(nc, 300.)]
+        self._update_contact_cone()
+        ContactWBC.reset(self)
+
+    def reset(self):
+        """Clear solver history and counters, retaining posture/contact anchors."""
         self.previous = None
         self._solver = None
         self.solver_setups = 0
         self.solver_recoveries = 0
         self._p_pattern = self._a_pattern = None
+        self._p_columns = self._a_columns = None
 
     @property
     def friction(self):
@@ -139,6 +194,13 @@ class ContactWBC:
         self._contact_reserve = float(value)
         self._planning_cone = self._physical_cone.copy()
         self._planning_cone[:, 2] *= 1 - self._contact_reserve
+        self._update_contact_cone()
+
+    def _update_contact_cone(self):
+        start = self.robot.nv + self.robot.na
+        for foot in range(len(self.anchors)):
+            row = self._cone_start + foot * len(self._planning_cone)
+            self._constraint_template[row:row + len(self._planning_cone), start + 6 * foot:start + 6 * foot + 6] = self._planning_cone
 
     def contact_violation(self, wrench):
         """Check actual local sole wrenches using the controller's contact bounds."""
@@ -148,7 +210,8 @@ class ContactWBC:
         force = force.reshape(-1, 6)
         return float(max(0., np.max(self._physical_cone @ force.T)))
 
-    def solve(self, state, target_com, dt=.005, *, target_velocity=None, target_acceleration=None):
+    def formulate(self, state, target_com, dt=.005, *, target_velocity=None, target_acceleration=None):
+        """Build the physical-units QP without advancing solver history."""
         r = self.robot
         if not np.isfinite(dt) or not 0 < dt <= .02:
             raise ValueError("dt must be in (0, 0.02]")
@@ -168,18 +231,19 @@ class ContactWBC:
         n = nv + na + nc
         error = np.concatenate([r.pin.log6(pose.inverse() * anchor).vector for pose, anchor in zip(poses, self.anchors)])
         contact_rhs = -drift + 100 * error - 20 * (jac @ state.v)
-        hessian = np.diag(np.r_[np.full(nv, 1e-3), np.full(na, 1e-5), np.full(nc, 1e-6)])
+        hessian = self._hessian_template.copy()
         gradient = np.zeros(n)
 
-        def task(matrix, desired, weight):
-            nonlocal hessian, gradient
-            hessian[:nv, :nv] += weight * matrix.T @ matrix
-            gradient[:nv] -= weight * matrix.T @ desired
-
-        task(com_jac, target_acceleration + 60 * (target_com - com) + 16 * (target_velocity - com_v) - com_drift, 1000.)
+        desired = target_acceleration + 60 * (target_com - com) + 16 * (target_velocity - com_v) - com_drift
+        hessian[:nv, :nv] += 1000. * com_jac.T @ com_jac
+        gradient[:nv] -= 1000. * com_jac.T @ desired
         posture = r.pin.difference(r.model, state.q, self.nominal)
-        task(np.eye(nv)[6:], 20 * posture[6:] - 8 * state.v[6:], 1.)
-        task(np.eye(nv)[3:6], 30 * posture[3:6] - 10 * state.v[3:6], 10.)
+        # These task Jacobians select coordinates; their normal matrices are
+        # diagonal. Preserve task order without multiplying dense identities.
+        hessian[self._posture_indices, self._posture_indices] += 1.
+        gradient[6:nv] -= 20 * posture[6:] - 8 * state.v[6:]
+        hessian[self._orientation_indices, self._orientation_indices] += 10.
+        gradient[3:6] -= 10. * (30 * posture[3:6] - 10 * state.v[3:6])
         # Soft load-sharing target for this two-foot support controller.
         if len(poses) == 2:
             spacing = poses[0].translation[1] - poses[1].translation[1]
@@ -190,12 +254,12 @@ class ContactWBC:
                     index = nv + na + 6 * foot + 2
                     hessian[index, index] += .001
                     gradient[index] -= .001 * weight * share
-        eq = np.zeros((nv + nc, n))
-        eq[:nv, :nv], eq[:nv, nv:nv + na], eq[:nv, nv + na:] = mass, -r.selection, -jac.T
-        eq[nv:, :nv] = jac
-        constraints, lower, upper = [eq], [np.r_[-bias, contact_rhs]], [np.r_[-bias, contact_rhs]]
-        bounds = np.zeros((nv + na, n))
-        bounds[:, :nv + na] = np.eye(nv + na)
+        constraint = self._constraint_template.copy()
+        constraint[:nv, :nv], constraint[:nv, nv:nv + na], constraint[:nv, nv + na:] = mass, -r.selection, -jac.T
+        constraint[nv:nv + nc, :nv] = jac
+        lower, upper = self._lower_template.copy(), self._upper_template.copy()
+        lower[:nv] = upper[:nv] = -bias
+        lower[nv:nv + nc] = upper[nv:nv + nc] = contact_rhs
         alo, ahi = np.full(nv, -40.), np.full(nv, 40.)
         velocity = np.minimum(r.model.velocityLimit[6:], 2.)
         alo[6:] = np.maximum(alo[6:], (-velocity - state.v[6:]) / dt)
@@ -207,21 +271,25 @@ class ContactWBC:
         upper_speed = np.minimum(velocity, np.sqrt(2 * 20. * np.maximum(r.model.upperPositionLimit[7:] - state.q[7:], 0.)))
         alo[6:] = np.maximum(alo[6:], (-lower_speed - state.v[6:]) / dt)
         ahi[6:] = np.minimum(ahi[6:], (upper_speed - state.v[6:]) / dt)
-        constraints.append(bounds)
-        lower.append(np.r_[alo, -r.model.effortLimit[6:]])
-        upper.append(np.r_[ahi, r.model.effortLimit[6:]])
-        for foot in range(nc // 6):
-            cone = self._planning_cone
-            block = np.zeros((len(cone), n))
-            block[:, nv + na + 6 * foot:nv + na + 6 * foot + 6] = cone
-            constraints.append(block)
-            lower.append(np.full(len(cone), -np.inf))
-            upper.append(np.zeros(len(cone)))
-        problem = QuadraticProgram(hessian, gradient, np.vstack(constraints), np.concatenate(lower), np.concatenate(upper))
+        lower[self._bounds_start:self._bounds_start + nv] = alo
+        upper[self._bounds_start:self._bounds_start + nv] = ahi
+        lower[self._bounds_start + nv:self._cone_start] = -r.model.effortLimit[6:]
+        upper[self._bounds_start + nv:self._cone_start] = r.model.effortLimit[6:]
+        problem = QuadraticProgram(hessian, gradient, constraint, lower, upper)
         if np.any(problem.lower > problem.upper):
             raise RuntimeError("dynamics WBC has inconsistent state/limit bounds")
+        return ContactFormulation(problem, terms, contact_rhs)
+
+    def solve(self, state, target_com, dt=.005, *, target_velocity=None, target_acceleration=None):
+        formulation = self.formulate(state, target_com, dt, target_velocity=target_velocity,
+                                     target_acceleration=target_acceleration)
+        problem, terms, contact_rhs = formulation
+        r = self.robot
+        mass, bias, jac = terms[:3]
+        nv, na, nc = r.nv, r.na, len(jac)
+        n = nv + na + nc
         # Scale accelerations, torques and wrenches into comparable QP units.
-        scale = np.r_[np.ones(nv), np.full(na, 50.), np.full(nc, 300.)]
+        scale = self._scale
         matrix = problem.constraint * scale
         row_scale = 1 / np.maximum(np.max(np.abs(matrix), axis=1), 1.)
         scaled_hessian = problem.hessian * scale[:, None] * scale
@@ -247,7 +315,7 @@ class ContactWBC:
                 tolerance = 1e-8 if attempt == 0 else 1e-9
                 self._solver.setup(P=self._p_pattern, q=problem.gradient * scale,
                                    A=self._a_pattern, l=problem.lower * row_scale, u=problem.upper * row_scale,
-                                   eps_abs=tolerance, eps_rel=tolerance, max_iter=30000, polishing=True, verbose=False, adaptive_rho_interval=200)
+                                   eps_abs=tolerance, eps_rel=tolerance, max_iter=30000, polishing=True, verbose=False, adaptive_rho_interval=200, alpha=1.4)
                 self.solver_setups += 1
             else:
                 self._solver.update(Px=scaled_hessian[self._p_pattern.indices, self._p_columns],
@@ -266,8 +334,9 @@ class ContactWBC:
                     self._solver, self.previous = None, None
                     raise RuntimeError("dynamics WBC returned an invalid solution")
                 physical = result.x * scale
-                violation = float(max(np.max(problem.lower - problem.constraint @ physical),
-                                      np.max(problem.constraint @ physical - problem.upper), 0.))
+                evaluation = problem.constraint @ physical
+                violation = float(max(np.max(problem.lower - evaluation),
+                                      np.max(evaluation - problem.upper), 0.))
                 if violation <= 1e-5:
                     break
                 # Scaled solver tolerances are not physical acceptance bounds.

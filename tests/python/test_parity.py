@@ -25,3 +25,22 @@ def test_native_python_formulations_and_solutions(backend):
             np.testing.assert_allclose(getattr(a, field), getattr(b, field), atol=1e-12)
         np.testing.assert_allclose(cpp_m.solve(state, goal).plan.positions,
                                    py_m.solve(state, goal).plan.positions, atol=2e-6)
+
+
+def test_braking_boundary_formulations_and_commands_match(backend):
+    if backend[0] is KinematicWBC:
+        return
+    from wholebodyx.native import NativeWBC
+
+    bounds = JointLimits([-1] * 3, [1] * 3, [1, 1, .4], [1, 1, 2])
+    state = RobotState([-.96, .96, .99], [-.3, .3, 0])
+    tasks = [LinearTask([[1, 1, 0], [0, 1, 1], [1, 0, 1]], [0, .6, -.2])]
+    cpp, python = NativeWBC(bounds), KinematicWBC(bounds)
+    for _ in range(30):
+        a, b = cpp.formulate(state, tasks, .1), python.formulate(state, tasks, .1)
+        np.testing.assert_allclose(a.lower, b.lower, atol=1e-12, rtol=0)
+        np.testing.assert_allclose(a.upper, b.upper, atol=1e-12, rtol=0)
+        actual, expected = cpp.step(state, tasks, .1), python.step(state, tasks, .1)
+        assert actual.command is not None and expected.command is not None
+        np.testing.assert_allclose(actual.command.velocity, expected.command.velocity, atol=2e-6, rtol=0)
+        state = RobotState(state.q + .1 * expected.command.velocity, expected.command.velocity, state.stamp + .1)

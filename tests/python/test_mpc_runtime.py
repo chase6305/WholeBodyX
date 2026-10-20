@@ -36,6 +36,19 @@ def test_unrepresentable_plan_time_window(backend, stamp, dt):
         plan_type(backend)(np.zeros((3, 1)), np.zeros((2, 1)), stamp, dt)
 
 
+def test_numpy_single_precision_plan_clock_uses_double_arithmetic(backend):
+    start, dt = np.float32(1e8), np.float32(.1)
+    velocities = np.array([[1.], [2.], [3.], [4.]])
+    positions = np.vstack(([0.], float(dt) * np.cumsum(velocities, axis=0)))
+    plan = plan_type(backend)(positions, velocities, start, dt)
+    assert plan.valid_until == float(start) + 4 * float(dt)
+    np.testing.assert_array_equal(plan.sample(start)[0], [0.])
+    np.testing.assert_array_equal(plan.sample(start)[1], [1.])
+    np.testing.assert_array_equal(plan.sample(float(start) + 3 * float(dt))[1], [4.])
+    with pytest.raises(ValueError):
+        plan.sample(plan.valid_until)
+
+
 def test_native_and_python_reject_inconsistent_plan_dynamics(backend):
     with pytest.raises(ValueError):
         plan_type(backend)(np.array([[0.], [1.]]), np.zeros((1, 1)), 0., .1)
