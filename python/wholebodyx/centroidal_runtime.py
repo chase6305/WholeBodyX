@@ -38,11 +38,17 @@ class CoMReferenceManager:
     it is called only when planning. Vertical reference components pass through.
     """
 
-    def __init__(self, planner, *, replan_period=.1, tracking_tolerance=.03):
-        if not all(callable(getattr(planner, name, None)) for name in ("plan", "reset", "validate_plan")):
+    def __init__(self, planner, *, replan_period=0.1, tracking_tolerance=0.03):
+        if not all(
+            callable(getattr(planner, name, None)) for name in ("plan", "reset", "validate_plan")
+        ):
             raise TypeError("CoM planner must implement plan, reset, and validate_plan")
         self.planner = planner
-        if isinstance(planner.horizon, bool) or not isinstance(planner.horizon, (int, np.integer)) or planner.horizon < 1:
+        if (
+            isinstance(planner.horizon, bool)
+            or not isinstance(planner.horizon, (int, np.integer))
+            or planner.horizon < 1
+        ):
             raise ValueError("CoM planner horizon must be a positive integer")
         self._horizon, self._dt = int(planner.horizon), positive(planner.dt, "planner dt")
         self.replan_period = positive(replan_period, "replan period")
@@ -70,8 +76,12 @@ class CoMReferenceManager:
         if not isinstance(plan, CoMPlan):
             raise ValueError("CoM planner must return a CoMPlan")
         plan = CoMPlan(plan.states, plan.jerks, plan.stamp, plan.dt, plan.height, plan.gravity)
-        if (plan.stamp != measured.stamp or plan.valid_until < measured.stamp + control_dt
-                or plan.dt != self._dt or len(plan.jerks) != self._horizon):
+        if (
+            plan.stamp != measured.stamp
+            or plan.valid_until < measured.stamp + control_dt
+            or plan.dt != self._dt
+            or len(plan.jerks) != self._horizon
+        ):
             raise ValueError("CoM plan must cover the current interval and match planner timing")
         expected = np.stack((measured.position[:2], measured.velocity[:2], seed))
         if not np.allclose(plan.states[0], expected, rtol=0, atol=1e-6):
@@ -91,12 +101,16 @@ class CoMReferenceManager:
         if self._clock_invalid or (self._last_stamp is not None and stamp < self._last_stamp):
             self._clock_invalid = True
             self.invalidate("clock_rollback")
-            return CoMReferenceUpdate(None, "clock_rollback", detail="clock moved backward; reset the runtime")
+            return CoMReferenceUpdate(
+                None, "clock_rollback", detail="clock moved backward; reset the runtime"
+            )
         self._last_stamp = stamp
         previous = self.plan
+        previous_sample = None
         error = None
         if previous is not None and previous.stamp <= stamp < previous.valid_until:
-            error = float(np.max(np.abs(measured.position[:2] - previous.sample(stamp)[0])))
+            previous_sample = previous.sample(stamp)
+            error = float(np.max(np.abs(measured.position[:2] - previous_sample[0])))
         if force:
             reason = "forced"
         elif previous is None:
@@ -117,43 +131,68 @@ class CoMReferenceManager:
             started = perf_counter()
             try:
                 if self.planner.horizon != self._horizon or self.planner.dt != self._dt:
-                    raise ValueError("CoM planner timing changed; construct a new reference manager")
-                stamps = stamp + (np.arange(self._horizon) + 1) * self._dt
+                    raise ValueError(
+                        "CoM planner timing changed; construct a new reference manager"
+                    )
                 if preview is None:
                     targets = np.tile(desired.position[:2], (self._horizon, 1))
                     velocities = np.tile(desired.velocity[:2], (self._horizon, 1))
                 else:
+                    stamps = stamp + (np.arange(self._horizon) + 1) * self._dt
                     targets, velocities = preview(stamps)
-                    targets, velocities = array(targets, 2, "CoM preview targets"), array(velocities, 2, "CoM preview velocities")
+                    targets, velocities = (
+                        array(targets, 2, "CoM preview targets"),
+                        array(velocities, 2, "CoM preview velocities"),
+                    )
                 expected_shape = (self._horizon, 2)
                 if targets.shape != expected_shape or velocities.shape != expected_shape:
                     raise ValueError("CoM preview must match the planner horizon")
                 seed = measured.acceleration[:2]
-                can_continue = previous is not None and previous.stamp <= stamp < previous.valid_until
+                can_continue = previous_sample is not None
                 if can_continue:
-                    seed = previous.sample(stamp)[2]
+                    seed = previous_sample[2]
                 try:
-                    plan = self.planner.plan(measured.position[:2], measured.velocity[:2], seed,
-                                              targets, stamp, target_velocities=velocities)
+                    plan = self.planner.plan(
+                        measured.position[:2],
+                        measured.velocity[:2],
+                        seed,
+                        targets,
+                        stamp,
+                        target_velocities=velocities,
+                    )
                 except RuntimeError:
                     if not can_continue:
                         raise
                     fallback = True
                     self.continuity_fallbacks += 1
                     seed = measured.acceleration[:2]
-                    plan = self.planner.plan(measured.position[:2], measured.velocity[:2], seed,
-                                              targets, stamp, target_velocities=velocities)
+                    plan = self.planner.plan(
+                        measured.position[:2],
+                        measured.velocity[:2],
+                        seed,
+                        targets,
+                        stamp,
+                        target_velocities=velocities,
+                    )
                 plan = self._accept(plan, measured, seed, control_dt)
                 next_replan = stamp + self.replan_period
                 if not np.isfinite(next_replan) or next_replan <= stamp:
                     raise ValueError("CoM replan deadline cannot be represented")
             except (ValueError, RuntimeError) as exc:
-                return CoMReferenceUpdate(None, reason, (perf_counter() - started) * 1000,
-                                           error, fallback, str(exc))
+                return CoMReferenceUpdate(
+                    None, reason, (perf_counter() - started) * 1000, error, fallback, str(exc)
+                )
             self.plan, self._next_replan = plan, next_replan
             solve_ms = (perf_counter() - started) * 1000
-        p, v, a = self.plan.sample(stamp)
-        reference = CoMReference(np.r_[p, desired.position[2]], stamp, end,
-                                  velocity=np.r_[v, desired.velocity[2]],
-                                  acceleration=np.r_[a, desired.acceleration[2]])
+        # Reuse the sample that established tracking error when no plan changed.
+        position, velocity, acceleration = (
+            previous_sample if reason == "reused" else self.plan.sample(stamp)
+        )
+        reference = CoMReference(
+            np.concatenate((position, desired.position[2:])),
+            stamp,
+            end,
+            velocity=np.concatenate((velocity, desired.velocity[2:])),
+            acceleration=np.concatenate((acceleration, desired.acceleration[2:])),
+        )
         return CoMReferenceUpdate(reference, reason, solve_ms, error, fallback)

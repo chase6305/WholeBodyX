@@ -54,6 +54,26 @@ def test_native_and_python_reject_inconsistent_plan_dynamics(backend):
         plan_type(backend)(np.array([[0.], [1.]]), np.zeros((1, 1)), 0., .1)
 
 
+@pytest.mark.parametrize("velocity", [1e308, 1.5e308])
+def test_plan_dynamics_overflow_cannot_certify_equal_infinities(backend, velocity):
+    # Both finite inputs overflow during float64 displacement evaluation.
+    # Equality of infinities cannot establish the integrator invariant.
+    with pytest.raises(ValueError, match="integrator dynamics"):
+        plan_type(backend)(np.array([[-1e308], [1e308]]), np.array([[velocity]]), 0., 2.)
+
+
+def test_large_representable_plan_dynamics_remain_valid(backend):
+    plan = plan_type(backend)(np.array([[-1e307], [1e307]]), np.array([[1e307]]), 0., 2.)
+    np.testing.assert_allclose(plan.sample(1.)[0], [0.], atol=0, rtol=0)
+
+
+def test_overflowed_expected_displacement_cannot_relax_relative_tolerance(backend):
+    # The expected displacement and its relative tolerance both become inf;
+    # a finite measured displacement must still fail the dynamics check.
+    with pytest.raises(ValueError, match="integrator dynamics"):
+        plan_type(backend)(np.array([[0.], [1.]]), np.array([[1.5e308]]), 0., 2.)
+
+
 @pytest.mark.parametrize("horizon", [1, 6])
 @pytest.mark.parametrize("acceleration", [None, [2, 3]])
 def test_cached_mpc_matches_direct_rollout_cost(backend, horizon, acceleration):

@@ -142,13 +142,17 @@ def _immutable_matrix_key(value):
         if not sparse.isspmatrix_csc(value):
             return None
         buffers = tuple(
-            _immutable_matrix_key(part) for part in (value.data, value.indices, value.indptr)
+            _immutable_array_key(part) for part in (value.data, value.indices, value.indptr)
         )
         return (
             _SparseMatrixKey(value.shape, buffers)
             if all(key is not None for key in buffers)
             else None
         )
+    return _immutable_array_key(value)
+
+
+def _immutable_array_key(value):
     base = value
     while isinstance(base, np.ndarray):
         base = base.base
@@ -157,6 +161,23 @@ def _immutable_matrix_key(value):
     return _DenseMatrixKey(
         base, value.shape, value.strides, value.dtype.str, value.__array_interface__["data"][0]
     )
+
+
+def _sparse_view(value):
+    """Share immutable CSC buffers with independent matrix and array metadata."""
+    return sparse.csc_matrix(
+        (value.data.view(), value.indices.view(), value.indptr.view()),
+        shape=value.shape,
+        copy=False,
+    )
+
+
+def _matrix_snapshot(value, key):
+    # A matching certificate covers bytes, not the caller's mutable metadata.
+    # Ordinary public arrays still need an owned copy to detect later writes.
+    if key is None:
+        return value.copy()
+    return _sparse_view(value) if sparse.issparse(value) else value.view()
 
 
 def _same_immutable_key(previous, current):
@@ -540,10 +561,10 @@ class OSQPSolver:
         # Record snapshots after setup/update returns. Preserve the original A
         # independently of solver scaling for physical residual validation.
         if not same_hessian:
-            self._hessian = problem.hessian.copy()
+            self._hessian = _matrix_snapshot(problem.hessian, keys[0])
             self._sparse_hessian = solver_hessian
         if not same_constraint:
-            self._constraint = problem.constraint.copy()
+            self._constraint = _matrix_snapshot(problem.constraint, keys[1])
             self._sparse_constraint = solver_constraint
             self._physical_constraint = physical_constraint
         self._matrix_keys = keys

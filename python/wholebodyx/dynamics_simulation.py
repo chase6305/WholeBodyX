@@ -12,11 +12,11 @@ from .types import positive
 
 
 class FixedContactSimulator:
-    def __init__(self, dynamics, initial, control_dt=.005, *, friction=.6, external_force=None):
+    def __init__(self, dynamics, initial, control_dt=0.005, *, friction=0.6, external_force=None):
         dynamics.validate_state(initial)
         self.dynamics = dynamics
         self._control_dt = positive(control_dt, "simulation control dt")
-        if self.control_dt > .02:
+        if self.control_dt > 0.02:
             raise ValueError("simulation control dt must not exceed 0.02 s")
         if external_force is not None and not callable(external_force):
             raise TypeError("external_force must be a callable of the measured state")
@@ -42,22 +42,34 @@ class FixedContactSimulator:
         if np.any(np.abs(command.torque) > robot.model.effortLimit[6:] + 1e-5):
             raise ValueError("torque command exceeds simulation effort limits")
         terms = robot.terms(state)
-        error = np.concatenate([robot.pin.log6(pose.inverse() * anchor).vector
-                                for pose, anchor in zip(terms.contact_poses, self.anchors)])
+        error = np.concatenate(
+            [
+                robot.pin.log6(pose.inverse() * anchor).vector
+                for pose, anchor in zip(terms.contact_poses, self.anchors)
+            ]
+        )
         rhs = -terms.contact_drift + 100 * error - 20 * (terms.contact_jacobian @ state.v)
         external = None if self.external_force is None else self.external_force(state)
-        acceleration, wrench = robot.forward(state, command.torque, rhs, terms, external_force=external)
-        if (np.shape(acceleration) != (robot.nv,) or np.shape(wrench) != (6 * len(self._cones),)
-                or not np.isfinite(acceleration).all() or not np.isfinite(wrench).all()):
+        acceleration, wrench = robot.forward(
+            state, command.torque, rhs, terms, external_force=external
+        )
+        if (
+            np.shape(acceleration) != (robot.nv,)
+            or np.shape(wrench) != (6 * len(self._cones),)
+            or not np.isfinite(acceleration).all()
+            or not np.isfinite(wrench).all()
+        ):
             raise RuntimeError("invalid forward dynamics result")
         for cone, force in zip(self._cones, wrench.reshape(-1, 6)):
             if np.max(cone @ force) > 1e-5:
                 raise RuntimeError("forward contact wrench violates physical support bounds")
         candidate = robot.integrate(state, acceleration, dt)
         model = robot.model
-        if (np.any(candidate.q[7:] < model.lowerPositionLimit[7:] - 1e-6)
-                or np.any(candidate.q[7:] > model.upperPositionLimit[7:] + 1e-6)
-                or np.any(np.abs(candidate.v[6:]) > model.velocityLimit[6:] + 1e-6)):
+        if (
+            np.any(candidate.q[7:] < model.lowerPositionLimit[7:] - 1e-6)
+            or np.any(candidate.q[7:] > model.upperPositionLimit[7:] + 1e-6)
+            or np.any(np.abs(candidate.v[6:]) > model.velocityLimit[6:] + 1e-6)
+        ):
             raise RuntimeError("forward dynamics violates actuated joint limits")
         # Commit only after forward dynamics, contact and state checks succeed.
         self._state = candidate

@@ -1,7 +1,7 @@
 """Synchronous MPC reference scheduling, independent of robot geometry and UI."""
 
 from dataclasses import dataclass
-from math import ulp
+from math import isfinite, ulp
 from time import perf_counter
 
 import numpy as np
@@ -20,8 +20,8 @@ def _deadline_reached(stamp, deadline, origin, control_dt):
     Cap the allowance below one control tick so poor clock resolution cannot
     turn rounding tolerance into a materially early replan.
     """
-    ticks = max(1., np.ceil(max(0., stamp - origin) / control_dt))
-    tolerance = min((4 + ticks) * max(ulp(stamp), ulp(deadline)), .25 * control_dt)
+    ticks = max(1.0, np.ceil(max(0.0, stamp - origin) / control_dt))
+    tolerance = min((4 + ticks) * max(ulp(stamp), ulp(deadline)), 0.25 * control_dt)
     return stamp >= deadline - tolerance
 
 
@@ -89,21 +89,28 @@ class MPCReferenceManager:
         goal = array(goal, 1, "goal")
         if goal.shape != state.q.shape:
             raise ValueError("goal and state dimensions differ")
-        if not np.isfinite(state.stamp + control_dt) or state.stamp + control_dt <= state.stamp:
+        control_end = state.stamp + control_dt
+        if not isfinite(control_end) or control_end <= state.stamp:
             raise ValueError("control interval cannot be represented")
         if self._clock_invalid or (self._last_stamp is not None and state.stamp < self._last_stamp):
             self._clock_invalid = True
             self.invalidate("clock_rollback")
-            return ReferenceUpdate(None, None, "clock_rollback", QPResult("error", detail="clock moved backward; reset the runtime"))
+            return ReferenceUpdate(
+                None,
+                None,
+                "clock_rollback",
+                QPResult("error", detail="clock moved backward; reset the runtime"),
+            )
         self._last_stamp = state.stamp
         self.discard_outdated(state.stamp, goal)
         error = None
         if self.plan is None:
             reason = self._pending_reason
-        elif state.stamp + control_dt > self.plan.valid_until:
+        elif control_end > self.plan.valid_until:
             reason = "coverage"
         else:
-            predicted, _ = self.plan.sample(state.stamp)
+            sampled = self.plan.sample(state.stamp)
+            predicted = sampled[0]
             error = float(np.max(np.abs(state.q - predicted)))
             if error > self.tracking_tolerance:
                 reason = "tracking_error"
@@ -122,18 +129,35 @@ class MPCReferenceManager:
                 result = outcome.solver
                 if not result.success or outcome.plan is None:
                     if result.status == "solved":
-                        result = QPResult("error", detail="solved result has no valid solution or plan")
-                    return ReferenceUpdate(None, None, reason, result, (perf_counter() - started) * 1000, error)
+                        result = QPResult(
+                            "error", detail="solved result has no valid solution or plan"
+                        )
+                    return ReferenceUpdate(
+                        None, None, reason, result, (perf_counter() - started) * 1000, error
+                    )
                 plan = _validated_joint_plan(outcome.plan, state, self.limits, control_dt)
                 next_replan = state.stamp + self.replan_period
-                if not np.isfinite(next_replan) or next_replan <= state.stamp:
+                if not isfinite(next_replan) or next_replan <= state.stamp:
                     raise ValueError("replan deadline cannot be represented")
             except (ValueError, RuntimeError) as exc:
-                return ReferenceUpdate(None, None, reason, QPResult("error", detail=str(exc)),
-                                       (perf_counter() - started) * 1000, error)
+                return ReferenceUpdate(
+                    None,
+                    None,
+                    reason,
+                    QPResult("error", detail=str(exc)),
+                    (perf_counter() - started) * 1000,
+                    error,
+                )
             solve_ms = (perf_counter() - started) * 1000
             self.plan, self._goal = plan, goal
             self._next_replan = next_replan
-        position, velocity = self.plan.sample(state.stamp)
-        return ReferenceUpdate(array(position, 1, "reference position"), array(velocity, 1, "reference velocity"),
-                               reason, result, solve_ms, error)
+            sampled = plan.sample(state.stamp)
+        position, velocity = sampled
+        return ReferenceUpdate(
+            array(position, 1, "reference position"),
+            array(velocity, 1, "reference velocity"),
+            reason,
+            result,
+            solve_ms,
+            error,
+        )

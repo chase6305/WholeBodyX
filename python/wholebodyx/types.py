@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
@@ -30,7 +31,7 @@ def _snapshot(value, ndim, name):
 
 def positive(value, name):
     value = float(value)
-    if not np.isfinite(value) or value <= 0:
+    if not isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be positive and finite")
     return value
 
@@ -70,7 +71,9 @@ class RobotState:
         if self.q.size == 0 or self.q.shape != self.v.shape:
             raise ValueError("fixed-base q and v must have equal, nonzero dimensions")
         stamp = float(self.stamp)
-        if not np.isfinite(stamp) or self.stamp < 0:
+        # Check the original sign: an extended-precision negative timestamp
+        # can underflow to -0.0 when converted to a Python float.
+        if not isfinite(stamp) or self.stamp < 0:
             raise ValueError("stamp must be finite and nonnegative")
         object.__setattr__(self, "stamp", stamp)
 
@@ -190,7 +193,7 @@ class VelocityCommand:
         object.__setattr__(self, "stamp", float(self.stamp))
         object.__setattr__(self, "valid_until", float(self.valid_until))
         object.__setattr__(self, "velocity", array(self.velocity, 1, "velocity"))
-        if not self.velocity.size or not np.isfinite([self.stamp, self.valid_until]).all():
+        if not self.velocity.size or not isfinite(self.stamp) or not isfinite(self.valid_until):
             raise ValueError("invalid command")
         if self.stamp < 0 or self.valid_until <= self.stamp:
             raise ValueError("invalid command validity interval")

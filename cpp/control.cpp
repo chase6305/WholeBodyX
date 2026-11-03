@@ -32,16 +32,19 @@ using detail::time_window;
 }  // namespace
 
 void RobotState::validate() const {
-  require(q.size() > 0 && q.size() == v.size() && q.allFinite() && v.allFinite(), "invalid fixed-base state");
+  require(q.size() > 0 && q.size() == v.size() && q.allFinite() && v.allFinite(),
+          "invalid fixed-base state");
   require(std::isfinite(stamp) && stamp >= 0, "invalid timestamp");
 }
 void JointLimits::validate() const {
   const auto n = lower.size();
   require(n > 0 && upper.size() == n && velocity.size() == n, "invalid joint limit dimensions");
   require(lower.allFinite() && upper.allFinite() && velocity.allFinite(), "nonfinite joint limits");
-  require((lower.array() < upper.array()).all() && (velocity.array() > 0).all(), "invalid joint limits");
+  require((lower.array() < upper.array()).all() && (velocity.array() > 0).all(),
+          "invalid joint limits");
   require(acceleration.size() == 0 || (acceleration.size() == n && acceleration.allFinite() &&
-          (acceleration.array() > 0).all()), "invalid acceleration limits");
+                                       (acceleration.array() > 0).all()),
+          "invalid acceleration limits");
 }
 std::pair<Vector, Vector> JointLimits::velocity_bounds(const RobotState& state, double dt) const {
   validate();
@@ -65,22 +68,25 @@ std::pair<Vector, Vector> JointLimits::velocity_bounds(const RobotState& state, 
   return {lo, hi};
 }
 void LinearTask::validate(Eigen::Index joints) const {
-  require(jacobian.cols() == joints && jacobian.rows() > 0 && target_velocity.size() == jacobian.rows() &&
-          weight.size() == jacobian.rows(), "invalid task dimensions");
+  require(jacobian.cols() == joints && jacobian.rows() > 0 &&
+              target_velocity.size() == jacobian.rows() && weight.size() == jacobian.rows(),
+          "invalid task dimensions");
   require(jacobian.allFinite() && target_velocity.allFinite() && weight.allFinite() &&
-          (weight.array() >= 0).all(), "invalid task values");
+              (weight.array() >= 0).all(),
+          "invalid task values");
 }
-void QuadraticProgram::validate() const {
-  validate_against(nullptr);
-}
+void QuadraticProgram::validate() const { validate_against(nullptr); }
 void QuadraticProgram::validate_against(const Matrix* previous) const {
   const auto n = gradient.size(), m = lower.size();
   require(n > 0 && hessian.rows() == n && hessian.cols() == n && constraint.rows() == m &&
-          constraint.cols() == n && upper.size() == m, "invalid QP dimensions");
+              constraint.cols() == n && upper.size() == m,
+          "invalid QP dimensions");
   require(hessian.allFinite() && gradient.allFinite() && constraint.allFinite() &&
-          !lower.array().isNaN().any() && !upper.array().isNaN().any(), "invalid QP values");
+              !lower.array().isNaN().any() && !upper.array().isNaN().any(),
+          "invalid QP values");
   require((hessian - hessian.transpose()).cwiseAbs().maxCoeff() <= 1e-10, "nonsymmetric Hessian");
-  if (previous && previous->rows() == n && previous->cols() == n && (previous->array() == hessian.array()).all())
+  if (previous && previous->rows() == n && previous->cols() == n &&
+      (previous->array() == hessian.array()).all())
     return;  // Exact values only: caller mutation always triggers convexity validation.
   Eigen::LLT<Matrix> cholesky(hessian);
   if (cholesky.info() == Eigen::Success) return;
@@ -89,54 +95,71 @@ void QuadraticProgram::validate_against(const Matrix* previous) const {
 }
 
 KinematicWBC::KinematicWBC(JointLimits limits, double regularization, double smoothing,
-                         std::shared_ptr<QPSolver> solver)
-    : limits_(std::move(limits)), regularization_(regularization), smoothing_(smoothing),
+                           std::shared_ptr<QPSolver> solver)
+    : limits_(std::move(limits)),
+      regularization_(regularization),
+      smoothing_(smoothing),
       solver_(solver ? std::move(solver) : std::make_shared<OSQPSolver>()) {
   limits_.validate();
   positive(regularization_, "invalid regularization");
   require(std::isfinite(smoothing_) && smoothing_ >= 0, "invalid smoothing");
 }
 void KinematicWBC::reset() { solver_->reset(); }
-QuadraticProgram KinematicWBC::formulate(const RobotState& state, const std::vector<LinearTask>& tasks, double dt) const {
+QuadraticProgram KinematicWBC::formulate(const RobotState& state,
+                                         const std::vector<LinearTask>& tasks, double dt) const {
   auto bounds = limits_.velocity_bounds(state, dt);
-  const auto n = state.q.size();
-  Matrix h = (regularization_ + smoothing_) * Matrix::Identity(n, n);
-  Vector g = -smoothing_ * state.v;
+  const auto joint_count = state.q.size();
+  Matrix hessian = (regularization_ + smoothing_) * Matrix::Identity(joint_count, joint_count);
+  Vector gradient = -smoothing_ * state.v;
   for (const auto& task : tasks) {
-    task.validate(n);
-    h.noalias() += task.jacobian.transpose() * task.weight.asDiagonal() * task.jacobian;
-    g.noalias() -= task.jacobian.transpose() * task.weight.asDiagonal() * task.target_velocity;
+    task.validate(joint_count);
+    hessian.noalias() += task.jacobian.transpose() * task.weight.asDiagonal() * task.jacobian;
+    gradient.noalias() -=
+        task.jacobian.transpose() * task.weight.asDiagonal() * task.target_velocity;
   }
-  return {h, g, Matrix::Identity(n, n), bounds.first, bounds.second};
+  return {std::move(hessian), std::move(gradient), Matrix::Identity(joint_count, joint_count),
+          std::move(bounds.first), std::move(bounds.second)};
 }
-ControlResult KinematicWBC::step(const RobotState& state, const std::vector<LinearTask>& tasks, double dt) {
+ControlResult KinematicWBC::step(const RobotState& state, const std::vector<LinearTask>& tasks,
+                                 double dt) {
   const auto problem = formulate(state, tasks, dt);
   auto result = solver_->solve(problem);
-  if (!result.success()) return {result, std::nullopt};
+  if (!result.success()) return {std::move(result), std::nullopt};
   if (result.x.size() != state.q.size() || !result.x.allFinite())
     return {{"error", {}, result.iterations, INFINITY, "invalid WBC solution"}, std::nullopt};
   const Vector velocity = result.x.cwiseMax(problem.lower).cwiseMin(problem.upper);
   const double correction = (velocity - result.x).cwiseAbs().maxCoeff();
   if (correction > 1e-6)
-    return {{"error", {}, result.iterations, correction, "WBC solution exceeds velocity bounds"}, std::nullopt};
-  if (correction > 0) { result.x = velocity; result.violation = 0; }
-  return {result, VelocityCommand{result.x, state.stamp, state.stamp + dt}};
+    return {{"error", {}, result.iterations, correction, "WBC solution exceeds velocity bounds"},
+            std::nullopt};
+  if (correction > 0) {
+    result.x = velocity;
+    result.violation = 0;
+  }
+  VelocityCommand command{result.x, state.stamp, state.stamp + dt};
+  return {std::move(result), std::move(command)};
 }
 
 double JointPlan::valid_until() const { return stamp + dt * velocities.rows(); }
 void JointPlan::validate() const {
   positive(dt, "invalid plan time step");
-  require(velocities.rows() > 0 && velocities.cols() > 0 && positions.rows() == velocities.rows() + 1 &&
-          positions.cols() == velocities.cols() && positions.allFinite() && velocities.allFinite(), "invalid plan shape");
+  require(velocities.rows() > 0 && velocities.cols() > 0 &&
+              positions.rows() == velocities.rows() + 1 && positions.cols() == velocities.cols() &&
+              positions.allFinite() && velocities.allFinite(),
+          "invalid plan shape");
   time_window(stamp, dt, velocities.rows());
-  Matrix expected = dt * velocities;
-  Matrix difference = positions.bottomRows(velocities.rows()) - positions.topRows(velocities.rows());
-  require(((difference - expected).array().abs() <= 1e-8 + 1e-7 * expected.array().abs()).all(),
+  const auto expected = dt * velocities;
+  const auto difference =
+      positions.bottomRows(velocities.rows()) - positions.topRows(velocities.rows());
+  // Finite velocities can overflow dt*v; inf <= inf cannot certify dynamics.
+  require((expected.array().isFinite() &&
+           ((difference - expected).array().abs() <= 1e-8 + 1e-7 * expected.array().abs())).all(),
           "plan positions and velocities must satisfy integrator dynamics");
 }
 std::pair<Vector, Vector> JointPlan::sample(double time) const {
   validate();
-  require(std::isfinite(time) && time >= stamp && time < valid_until(), "reference is future-dated or expired");
+  require(std::isfinite(time) && time >= stamp && time < valid_until(),
+          "reference is future-dated or expired");
   const auto k = interval(time, stamp, dt, velocities.rows());
   Vector v = velocities.row(k).transpose();
   return {positions.row(k).transpose() + std::max(0.0, time - stamp - k * dt) * v, v};
@@ -144,8 +167,12 @@ std::pair<Vector, Vector> JointPlan::sample(double time) const {
 
 JointMPC::JointMPC(JointLimits limits, int horizon, double dt, double tracking_weight,
                    double control_weight, double terminal_weight, std::shared_ptr<QPSolver> solver)
-    : limits_(std::move(limits)), horizon_(horizon), dt_(dt), tracking_weight_(tracking_weight),
-      control_weight_(control_weight), terminal_weight_(terminal_weight),
+    : limits_(std::move(limits)),
+      horizon_(horizon),
+      dt_(dt),
+      tracking_weight_(tracking_weight),
+      control_weight_(control_weight),
+      terminal_weight_(terminal_weight),
       solver_(solver ? std::move(solver) : std::make_shared<OSQPSolver>()) {
   limits_.validate();
   require(horizon_ > 0, "invalid horizon");
@@ -155,7 +182,8 @@ JointMPC::JointMPC(JointLimits limits, int horizon, double dt, double tracking_w
   positive(terminal_weight_, "invalid terminal weight");
   time_window(0, dt_, horizon_);
   const auto n = limits_.lower.size();
-  require(n <= std::numeric_limits<int>::max() / (horizon_ * (horizon_ + 4LL)), "MPC dimensions exceed sparse index capacity");
+  require(n <= std::numeric_limits<int>::max() / (horizon_ * (horizon_ + 4LL)),
+          "MPC dimensions exceed sparse index capacity");
   const auto size = n * horizon_;
   std::vector<Eigen::Triplet<double>> h, a;
   h.reserve(n * horizon_ * horizon_);
@@ -166,7 +194,8 @@ JointMPC::JointMPC(JointLimits limits, int horizon, double dt, double tracking_w
   Vector lo(rows), hi(rows);
   for (int k = 0; k < horizon_; ++k) {
     for (int j = 0; j < horizon_; ++j) {
-      const double remaining_weight = terminal_weight_ + (horizon_ - 1 - std::max(k, j)) * tracking_weight_;
+      const double remaining_weight =
+          terminal_weight_ + (horizon_ - 1 - std::max(k, j)) * tracking_weight_;
       const double value = dt_ * dt_ * remaining_weight + (k == j ? control_weight_ : 0.);
       for (Eigen::Index joint = 0; joint < n; ++joint) {
         h.emplace_back(k * n + joint, j * n + joint, value);
@@ -175,7 +204,8 @@ JointMPC::JointMPC(JointLimits limits, int horizon, double dt, double tracking_w
     }
     const double remaining_weight = terminal_weight_ + (horizon_ - 1 - k) * tracking_weight_;
     gradient_weights_[k] = dt_ * remaining_weight;
-    for (Eigen::Index joint = 0; joint < n; ++joint) a.emplace_back(k * n + joint, k * n + joint, 1.);
+    for (Eigen::Index joint = 0; joint < n; ++joint)
+      a.emplace_back(k * n + joint, k * n + joint, 1.);
     lo.segment(k * n, n) = -limits_.velocity;
     hi.segment(k * n, n) = limits_.velocity;
     lo.segment(size + k * n, n) = limits_.lower;
@@ -190,28 +220,39 @@ JointMPC::JointMPC(JointLimits limits, int horizon, double dt, double tracking_w
       hi.segment(row, n) = dt_ * limits_.acceleration;
     }
   }
-  require(gradient_weights_.allFinite() && lo.allFinite() && hi.allFinite(), "nonfinite MPC matrices or bounds");
+  require(gradient_weights_.allFinite() && lo.allFinite() && hi.allFinite(),
+          "nonfinite MPC matrices or bounds");
   Eigen::SparseMatrix<double> hessian(size, size), constraint(rows, size);
-  hessian.setFromTriplets(h.begin(), h.end()); constraint.setFromTriplets(a.begin(), a.end());
-  fixed_ = std::shared_ptr<const detail::FixedQP>(new detail::FixedQP(std::move(hessian), std::move(constraint)));
+  hessian.setFromTriplets(h.begin(), h.end());
+  constraint.setFromTriplets(a.begin(), a.end());
+  fixed_ = std::shared_ptr<const detail::FixedQP>(
+      new detail::FixedQP(std::move(hessian), std::move(constraint)));
   lower_ = std::move(lo);
   upper_ = std::move(hi);
 }
-void JointMPC::reset() { solver_->reset(); last_plan_.reset(); }
+void JointMPC::reset() {
+  solver_->reset();
+  last_plan_.reset();
+}
 std::size_t JointMPC::fixed_matrix_bytes() const {
-  return detail::sparse_matrix_bytes(fixed_->hessian) + detail::sparse_matrix_bytes(fixed_->constraint);
+  return detail::sparse_matrix_bytes(fixed_->hessian) +
+         detail::sparse_matrix_bytes(fixed_->constraint);
 }
 QuadraticProgram JointMPC::formulate(const RobotState& state, const Vector& goal) const {
   Vector gradient, lo, hi;
   vectors(state, goal, gradient, lo, hi);
-  return {Matrix(fixed_->hessian), std::move(gradient), Matrix(fixed_->constraint), std::move(lo), std::move(hi)};
+  return {Matrix(fixed_->hessian), std::move(gradient), Matrix(fixed_->constraint), std::move(lo),
+          std::move(hi)};
 }
-void JointMPC::vectors(const RobotState& state, const Vector& goal, Vector& gradient, Vector& lo, Vector& hi) const {
+void JointMPC::vectors(const RobotState& state, const Vector& goal, Vector& gradient, Vector& lo,
+                       Vector& hi) const {
   state.validate();
   time_window(state.stamp, dt_, horizon_);
   const auto n = state.q.size(), size = n * horizon_;
-  require(n == limits_.lower.size() && goal.size() == n && goal.allFinite(), "invalid MPC dimensions or goal");
-  lo = lower_; hi = upper_;
+  require(n == limits_.lower.size() && goal.size() == n && goal.allFinite(),
+          "invalid MPC dimensions or goal");
+  lo = lower_;
+  hi = upper_;
   for (int k = 0; k < horizon_; ++k) {
     lo.segment(size + k * n, n) -= state.q;
     hi.segment(size + k * n, n) -= state.q;
@@ -234,12 +275,15 @@ PlanResult JointMPC::solve(const RobotState& state, const Vector& goal) {
     const int offset = static_cast<int>(interval(state.stamp, last_plan_->stamp, dt_, horizon_));
     warm.resize(n * horizon_);
     for (int k = 0; k < horizon_; ++k)
-      warm.segment(k * n, n) = last_plan_->velocities.row(std::min(k + offset, horizon_ - 1)).transpose();
+      warm.segment(k * n, n) =
+          last_plan_->velocities.row(std::min(k + offset, horizon_ - 1)).transpose();
   }
   auto* osqp = dynamic_cast<OSQPSolver*>(solver_.get());
-  auto result = osqp ? osqp->solve_fixed(fixed_, gradient, lo, hi, warm)
-                     : solver_->solve({Matrix(fixed_->hessian), gradient, Matrix(fixed_->constraint), lo, hi}, warm);
-  if (!result.success()) return {result, std::nullopt};
+  auto result =
+      osqp ? osqp->solve_fixed(fixed_, gradient, lo, hi, warm)
+           : solver_->solve({Matrix(fixed_->hessian), gradient, Matrix(fixed_->constraint), lo, hi},
+                            warm);
+  if (!result.success()) return {std::move(result), std::nullopt};
   if (result.x.size() != n * horizon_ || !result.x.allFinite())
     return {{"error", {}, result.iterations, INFINITY, "invalid MPC solution"}, std::nullopt};
   JointPlan plan{Matrix(horizon_ + 1, n), Matrix(horizon_, n), state.stamp, dt_};
@@ -250,8 +294,10 @@ PlanResult JointMPC::solve(const RobotState& state, const Vector& goal) {
   }
   const double violation = detail::joint_plan_violation(plan, limits_, state);
   if (violation > 1e-6)
-    return {{"error", {}, result.iterations, violation, "reconstructed MPC plan violates joint bounds"}, std::nullopt};
+    return {
+        {"error", {}, result.iterations, violation, "reconstructed MPC plan violates joint bounds"},
+        std::nullopt};
   last_plan_ = plan;
-  return {result, plan};
+  return {std::move(result), std::move(plan)};
 }
 }  // namespace wholebodyx

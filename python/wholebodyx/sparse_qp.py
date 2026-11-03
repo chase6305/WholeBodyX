@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy import sparse
 
-from .qp import QuadraticProgram, _FixedQP, _immutable, _immutable_matrix_key
+from .qp import QuadraticProgram, _FixedQP, _immutable, _immutable_matrix_key, _sparse_view
 
 
 def _frozen_csc(value, name):
@@ -20,15 +20,6 @@ def _frozen_csc(value, name):
         buffer = getattr(result, attribute)
         setattr(result, attribute, np.frombuffer(buffer.tobytes(), dtype=buffer.dtype))
     return result
-
-
-def _view(value):
-    # New matrix metadata; immutable numeric and index buffers may be shared.
-    return sparse.csc_matrix(
-        (value.data.view(), value.indices.view(), value.indptr.view()),
-        shape=value.shape,
-        copy=False,
-    )
 
 
 @dataclass(frozen=True)
@@ -96,7 +87,7 @@ class _SparseFixedQP(_FixedQP):
 
     _problem_type = SparseQuadraticProgram
     _freeze_matrix = staticmethod(_frozen_csc)
-    _view_matrix = staticmethod(_view)
+    _view_matrix = staticmethod(_sparse_view)
 
     @classmethod
     def separable(cls, temporal_hessian, joints, constraint):

@@ -22,12 +22,15 @@ bool deadline_reached(double stamp, double deadline, double origin, double dt) {
 }
 }  // namespace
 
-MPCReferenceManager::MPCReferenceManager(Planner& planner, JointLimits limits,
-                                         double replan_period, double tracking_tolerance)
-    : planner_(planner), limits_(std::move(limits)), replan_period_(replan_period),
+MPCReferenceManager::MPCReferenceManager(Planner& planner, JointLimits limits, double replan_period,
+                                         double tracking_tolerance)
+    : planner_(planner),
+      limits_(std::move(limits)),
+      replan_period_(replan_period),
       tracking_tolerance_(tracking_tolerance) {
   limits_.validate();
-  require(std::isfinite(replan_period_) && replan_period_ > 0, "replan period must be positive and finite");
+  require(std::isfinite(replan_period_) && replan_period_ > 0,
+          "replan period must be positive and finite");
   require(std::isfinite(tracking_tolerance_) && tracking_tolerance_ > 0,
           "tracking tolerance must be positive and finite");
 }
@@ -58,30 +61,39 @@ void MPCReferenceManager::discard_outdated(double stamp, const Vector& goal) {
   else if (stamp < plan_->stamp || stamp >= plan_->valid_until())
     invalidate("expired");
 }
-JointPlan MPCReferenceManager::accept(const JointPlan& proposed, const RobotState& state, double control_dt) const {
+JointPlan MPCReferenceManager::accept(const JointPlan& proposed, const RobotState& state,
+                                      double control_dt) const {
   JointPlan plan = proposed;  // Own all arrays, independently of planner storage.
   plan.validate();
   require(plan.stamp == state.stamp, "planner returned a stale or future-dated plan");
   require(plan.positions.cols() == state.q.size() &&
-          (plan.positions.row(0).transpose() - state.q).cwiseAbs().maxCoeff() <= 1e-6,
+              (plan.positions.row(0).transpose() - state.q).cwiseAbs().maxCoeff() <= 1e-6,
           "plan does not start at the supplied measured state");
-  require(plan.valid_until() >= state.stamp + control_dt, "plan does not cover the complete control interval");
+  require(plan.valid_until() >= state.stamp + control_dt,
+          "plan does not cover the complete control interval");
   constexpr double tolerance = 1e-6;
   for (Eigen::Index k = 0; k < plan.velocities.rows(); ++k) {
-    require(!((plan.positions.row(k + 1).transpose().array() < limits_.lower.array() - tolerance).any() ||
-              (plan.positions.row(k + 1).transpose().array() > limits_.upper.array() + tolerance).any() ||
-              (plan.velocities.row(k).transpose().array().abs() > limits_.velocity.array() + tolerance).any()),
-            "plan violates position or velocity limits");
+    require(
+        !((plan.positions.row(k + 1).transpose().array() < limits_.lower.array() - tolerance)
+              .any() ||
+          (plan.positions.row(k + 1).transpose().array() > limits_.upper.array() + tolerance)
+              .any() ||
+          (plan.velocities.row(k).transpose().array().abs() > limits_.velocity.array() + tolerance)
+              .any()),
+        "plan violates position or velocity limits");
     if (limits_.acceleration.size()) {
-      Vector previous = k == 0 ? state.v : Vector(plan.velocities.row(k - 1).transpose());
-      require(!((plan.velocities.row(k).transpose() - previous).array().abs() >
-                 limits_.acceleration.array() * plan.dt + tolerance).any(),
-              "plan violates velocity-slew limits");
+      for (Eigen::Index joint = 0; joint < plan.velocities.cols(); ++joint) {
+        const double previous_velocity = k == 0 ? state.v[joint] : plan.velocities(k - 1, joint);
+        require(std::abs(plan.velocities(k, joint) - previous_velocity) <=
+                    limits_.acceleration[joint] * plan.dt + tolerance,
+                "plan violates velocity-slew limits");
+      }
     }
   }
   return plan;
 }
-ReferenceUpdate MPCReferenceManager::update(const RobotState& state, const Vector& goal, double control_dt) {
+ReferenceUpdate MPCReferenceManager::update(const RobotState& state, const Vector& goal,
+                                            double control_dt) {
   state.validate();
   require(state.q.size() == limits_.lower.size(), "state and limits dimensions differ");
   require(goal.size() == state.q.size() && goal.allFinite(), "goal and state dimensions differ");
@@ -98,19 +110,25 @@ ReferenceUpdate MPCReferenceManager::update(const RobotState& state, const Vecto
   }
   last_stamp_ = state.stamp;
   discard_outdated(state.stamp, goal);
-  if (!plan_) update.reason = pending_reason_;
-  else if (end > plan_->valid_until()) update.reason = "coverage";
+  if (!plan_)
+    update.reason = pending_reason_;
+  else if (end > plan_->valid_until())
+    update.reason = "coverage";
   else {
     update.tracking_error = (state.q - plan_->sample(state.stamp).first).cwiseAbs().maxCoeff();
-    if (*update.tracking_error > tracking_tolerance_) update.reason = "tracking_error";
-    else if (deadline_reached(state.stamp, *next_replan_, plan_->stamp, control_dt)) update.reason = "periodic";
-    else update.reason = "reused";
+    if (*update.tracking_error > tracking_tolerance_)
+      update.reason = "tracking_error";
+    else if (deadline_reached(state.stamp, *next_replan_, plan_->stamp, control_dt))
+      update.reason = "periodic";
+    else
+      update.reason = "reused";
   }
   if (update.reason != "reused") {
     invalidate(update.reason);
     const auto started = std::chrono::steady_clock::now();
     const auto elapsed = [&] {
-      return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+      return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
+          .count();
     };
     const auto failure = [&](const std::exception& exc) {
       update.solver = QPResult{"error", {}, 0, INFINITY, exc.what()};
@@ -122,7 +140,8 @@ ReferenceUpdate MPCReferenceManager::update(const RobotState& state, const Vecto
       update.solver = outcome.solver;
       if (!outcome.solver.success() || !outcome.plan) {
         if (outcome.solver.status == "solved")
-          update.solver = QPResult{"error", {}, 0, INFINITY, "solved result has no valid solution or plan"};
+          update.solver =
+              QPResult{"error", {}, 0, INFINITY, "solved result has no valid solution or plan"};
         update.solve_ms = elapsed();
         return update;
       }
@@ -132,8 +151,11 @@ ReferenceUpdate MPCReferenceManager::update(const RobotState& state, const Vecto
       plan_ = std::move(accepted);
       goal_ = goal;
       next_replan_ = next;
-    } catch (const std::invalid_argument& exc) { return failure(exc); }
-      catch (const std::runtime_error& exc) { return failure(exc); }
+    } catch (const std::invalid_argument& exc) {
+      return failure(exc);
+    } catch (const std::runtime_error& exc) {
+      return failure(exc);
+    }
     update.solve_ms = elapsed();
   }
   auto sampled = plan_->sample(state.stamp);

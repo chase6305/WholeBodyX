@@ -6,19 +6,30 @@
 
 namespace wholebodyx::detail {
 
-inline double joint_plan_violation(const JointPlan& plan, const JointLimits& limits, const RobotState& initial) {
+inline double joint_plan_violation(const JointPlan& plan, const JointLimits& limits,
+                                   const RobotState& initial) {
   if (!plan.positions.allFinite() || !plan.velocities.allFinite()) return INFINITY;
   double violation = 0.;
-  Vector previous = initial.v;
-  for (Eigen::Index k = 0; k < plan.velocities.rows(); ++k) {
-    const Vector position = plan.positions.row(k + 1).transpose();
-    const Vector velocity = plan.velocities.row(k).transpose();
-    violation = std::max({violation, (limits.lower - position).maxCoeff(),
-                          (position - limits.upper).maxCoeff(),
-                          (velocity.cwiseAbs() - limits.velocity).maxCoeff()});
-    if (limits.acceleration.size())
-      violation = std::max(violation, ((velocity - previous).cwiseAbs() - plan.dt * limits.acceleration).maxCoeff());
-    previous = velocity;
+  const bool check_slew = limits.acceleration.size() != 0;
+  const auto interval_count = plan.velocities.rows();
+  // Column views follow Eigen's storage order and let reductions operate
+  // without allocating position/velocity vectors for every interval.
+  for (Eigen::Index joint = 0; joint < plan.velocities.cols(); ++joint) {
+    const auto positions = plan.positions.col(joint).tail(interval_count);
+    const auto velocities = plan.velocities.col(joint);
+    violation = std::max({violation, limits.lower[joint] - positions.minCoeff(),
+                          positions.maxCoeff() - limits.upper[joint],
+                          velocities.cwiseAbs().maxCoeff() - limits.velocity[joint]});
+    if (check_slew) {
+      double maximum_change = std::abs(velocities[0] - initial.v[joint]);
+      if (interval_count > 1) {
+        maximum_change = std::max(
+            maximum_change,
+            (velocities.tail(interval_count - 1) - velocities.head(interval_count - 1))
+                .cwiseAbs().maxCoeff());
+      }
+      violation = std::max(violation, maximum_change - plan.dt * limits.acceleration[joint]);
+    }
   }
   return violation;
 }
