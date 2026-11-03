@@ -84,7 +84,8 @@ class NativeWBC:
         return _problem(self._impl.formulate(_state(self._module, state), self._tasks(tasks), dt))
 
     def step(self, state, tasks, dt):
-        native_state, native_tasks = _state(self._module, state), self._tasks(tasks)
+        native_state = _state(self._module, state)
+        native_tasks = self._tasks(tasks)
         with OSQP_EXECUTION_LOCK:
             native_result = self._impl.step(native_state, native_tasks, dt)
         native_command = native_result.command

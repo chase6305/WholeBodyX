@@ -257,7 +257,7 @@ class _FixedQP:
     _view_matrix = staticmethod(np.ndarray.view)
 
     def __init__(self, hessian, constraint):
-        _, problem = self.with_problem(
+        problem = self._build_problem(
             hessian,
             np.zeros(np.shape(hessian)[0]),
             constraint,
@@ -269,6 +269,12 @@ class _FixedQP:
     @classmethod
     def with_problem(cls, hessian, gradient, constraint, lower, upper):
         """Validate actual vectors once and retain the certified immutable model."""
+        problem = cls._build_problem(hessian, gradient, constraint, lower, upper)
+        return cls._from_problem(problem)
+
+    @classmethod
+    def _build_problem(cls, hessian, gradient, constraint, lower, upper):
+        """Validate a snapshot without allocating an intermediate template."""
         problem = object.__new__(cls._problem_type)
         for name, value in (
             ("hessian", cls._freeze_matrix(hessian, "hessian")),
@@ -282,7 +288,7 @@ class _FixedQP:
         problem._validate_hessian()
         problem._validate_constraint()
         problem._remember_matrix_validation()
-        return cls._from_problem(problem)
+        return problem
 
     def with_hessian(self, hessian, gradient, lower, upper):
         """Keep certified A storage and validate a replacement H and vectors."""
@@ -430,9 +436,9 @@ class OSQPSolver:
             if warm_start.shape != problem.gradient.shape:
                 raise ValueError("warm start dimensions differ")
         try:
-            warm_start = self._update_workspace(problem, warm_start)
-            if warm_start is not None:
-                self._solver.warm_start(x=warm_start)
+            solver_warm_start = self._update_workspace(problem, warm_start)
+            if solver_warm_start is not None:
+                self._solver.warm_start(x=solver_warm_start)
             with OSQP_EXECUTION_LOCK:
                 result = self._solver.solve(raise_error=False)
         except osqp.OSQPException as exc:
@@ -441,7 +447,7 @@ class OSQPSolver:
         return self._validate_result(problem, result)
 
     def _update_workspace(self, problem, warm_start):
-        """Validate changed inputs, update OSQP, and retain matrix snapshots.
+        """Update OSQP and return the warm start in solver coordinates.
 
         Matrix identity, sparsity, and numeric values have separate reuse rules:
         unchanged matrices need only new vectors; the same sparsity permits a
@@ -469,49 +475,53 @@ class OSQPSolver:
             problem._validate_constraint()
 
         if not same_matrices:
-            hessian = (
+            solver_hessian = (
                 self._sparse_hessian
                 if same_hessian
                 else _upper_csc(problem.hessian, self._upper_cache)
             )
-            constraint = (
+            solver_constraint = (
                 self._sparse_constraint
                 if same_constraint
                 else sparse.csc_matrix(problem.constraint)
             )
             if not same_constraint:
-                physical_constraint = constraint
+                physical_constraint = solver_constraint
             if scale is not None:
                 if not same_hessian:
-                    hessian = _scaled_csc(hessian, scale, rows=True)
+                    solver_hessian = _scaled_csc(solver_hessian, scale, rows=True)
                 if not same_constraint:
-                    physical_constraint = constraint.copy()
-                    constraint = _scaled_csc(constraint, scale)
-                if not np.isfinite(hessian.data).all() or not np.isfinite(constraint.data).all():
+                    physical_constraint = solver_constraint.copy()
+                    solver_constraint = _scaled_csc(solver_constraint, scale)
+                if (
+                    not np.isfinite(solver_hessian.data).all()
+                    or not np.isfinite(solver_constraint.data).all()
+                ):
                     raise ValueError("nonfinite scaled QP matrices")
             pattern = tuple(
                 (matrix.shape, matrix.indptr.tobytes(), matrix.indices.tobytes())
-                for matrix in (hessian, constraint)
+                for matrix in (solver_hessian, solver_constraint)
             )
 
-        gradient = problem.gradient
+        solver_gradient = problem.gradient
+        solver_warm_start = warm_start
         if scale is not None:
             with np.errstate(over="raise", invalid="raise", divide="raise"):
                 try:
-                    gradient = gradient * scale
+                    solver_gradient = solver_gradient * scale
                     if warm_start is not None:
-                        warm_start = warm_start / scale
+                        solver_warm_start = warm_start / scale
                 except FloatingPointError as exc:
                     raise ValueError("nonfinite scaled QP vectors") from exc
 
         if same_matrices:
-            self._solver.update(q=gradient, l=problem.lower, u=problem.upper)
+            self._solver.update(q=solver_gradient, l=problem.lower, u=problem.upper)
         elif pattern != self._pattern:
             self._solver = osqp.OSQP()
             self._solver.setup(
-                P=hessian,
-                q=gradient,
-                A=constraint,
+                P=solver_hessian,
+                q=solver_gradient,
+                A=solver_constraint,
                 l=problem.lower,
                 u=problem.upper,
                 verbose=False,
@@ -520,24 +530,24 @@ class OSQPSolver:
             )
             self._pattern = pattern
         else:
-            updates = dict(q=gradient, l=problem.lower, u=problem.upper)
+            updates = dict(q=solver_gradient, l=problem.lower, u=problem.upper)
             if not same_hessian:
-                updates["Px"] = hessian.data
+                updates["Px"] = solver_hessian.data
             if not same_constraint:
-                updates["Ax"] = constraint.data
+                updates["Ax"] = solver_constraint.data
             self._solver.update(**updates)
 
         # Record snapshots after setup/update returns. Preserve the original A
         # independently of solver scaling for physical residual validation.
         if not same_hessian:
             self._hessian = problem.hessian.copy()
-            self._sparse_hessian = hessian
+            self._sparse_hessian = solver_hessian
         if not same_constraint:
             self._constraint = problem.constraint.copy()
-            self._sparse_constraint = constraint
+            self._sparse_constraint = solver_constraint
             self._physical_constraint = physical_constraint
         self._matrix_keys = keys
-        return warm_start
+        return solver_warm_start
 
     def _validate_result(self, problem, result):
         """Map solver coordinates to physical units and enforce acceptance."""
