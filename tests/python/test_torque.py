@@ -15,6 +15,26 @@ def reference(robot, state, dt=.005):
     return CoMReference(robot.terms(state).com, state.stamp, state.stamp + dt)
 
 
+def test_gate_initialization_defers_the_subclass_runtime_reset_hook(floating_robot):
+    class AuditedGate(TorqueCommandGate):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.reset_events = []
+
+        def reset(self):
+            self.reset_events.append("reset")
+            super().reset()
+
+    robot, state = floating_robot
+    gate = AuditedGate(robot, .005)
+    assert gate.reset_events == []
+    gate.observe(state)
+    gate.latch_fault("injected")
+    gate.reset()
+    assert gate.reset_events == ["reset"] and gate.fault is None
+    gate.observe(state)  # A successful reset also permits a fresh clock origin.
+
+
 def test_torque_loop_and_independent_plant_hold_static_equilibrium(floating_robot):
     robot, state = floating_robot
     plant = FixedContactSimulator(robot, state)

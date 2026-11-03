@@ -115,7 +115,11 @@ class KinematicWBC:
         problem = self.formulate(state, tasks, dt)
         result = self.solver.solve(problem)
         if result.success:
-            if np.shape(result.x) != state.q.shape or not np.isfinite(result.x).all():
+            if (
+                np.shape(result.x) != state.q.shape
+                or np.iscomplexobj(result.x)
+                or not np.isfinite(result.x).all()
+            ):
                 return ControlResult(
                     QPResult("error", iterations=result.iterations, detail="invalid WBC solution")
                 )

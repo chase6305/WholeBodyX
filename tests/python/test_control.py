@@ -8,6 +8,40 @@ def limits(n=2, acceleration=None):
     return JointLimits(np.full(n, -2.0), np.full(n, 2.0), np.ones(n), acceleration)
 
 
+def test_solver_initialization_defers_the_subclass_runtime_reset_hook():
+    class AuditedSolver(OSQPSolver):
+        def __init__(self):
+            super().__init__()
+            self.reset_events = []
+
+        def reset(self):
+            self.reset_events.append("reset")
+            super().reset()
+
+    solver = AuditedSolver()
+    problem = QuadraticProgram([[1.]], [-.2], [[1.]], [-1.], [1.])
+    assert solver.reset_events == []
+    assert solver.solve(problem).success
+    solver.reset()
+    assert solver.reset_events == ["reset"]
+    assert solver.solve(problem).success
+
+
+@pytest.mark.parametrize("imaginary", [0., .1])
+def test_wbc_rejects_a_custom_solver_complex_decision(imaginary):
+    from types import SimpleNamespace
+    from wholebodyx import KinematicWBC, QPResult
+
+    decision = np.array([.2 + imaginary * 1j, .1])
+    solver = SimpleNamespace(solve=lambda problem: QPResult("solved", decision, iterations=7,
+                                                          violation=0.))
+    result = KinematicWBC(limits(), solver=solver).step(
+        RobotState([0., 0.], [0., 0.]), [LinearTask(np.eye(2), [.1, .1])], .02)
+    assert result.command is None and not result.solver.success
+    assert result.solver.status == "error" and result.solver.x is None
+    assert result.solver.iterations == 7
+
+
 def test_command_mixed_precision_clock_is_validated_after_conversion():
     start = np.float32(1e8)
     command = VelocityCommand([0.], start, float(start) + .1)

@@ -51,7 +51,8 @@ class TorqueCommandGate:
             raise ValueError("positive effort and joint limits must match actuated dimensions")
         self.friction = positive(friction, "friction")
         self._cones = tuple(spec.wrench_cone(self.friction) for spec in dynamics.contact_specs)
-        self.reset()
+        # Initialize base state before a subclass's runtime reset hook is ready.
+        TorqueCommandGate.reset(self)
 
     def reset(self):
         self._last_stamp = self._observed = self._fault = None

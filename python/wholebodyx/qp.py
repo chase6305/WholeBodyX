@@ -424,7 +424,8 @@ class OSQPSolver:
             polishing=polishing,
             adaptive_rho_interval=int(adaptive_rho_interval),
         )
-        self.reset()
+        # Initialize base state before a subclass's runtime reset hook is ready.
+        OSQPSolver.reset(self)
 
     @property
     def variable_scaling(self):
