@@ -84,11 +84,11 @@ class KinematicWBC:
             # residuals to the exact box before integrating a command, so an
             # active braking bound remains feasible on the next cycle.
             velocity = np.clip(result.x, problem.lower, problem.upper)
-            correction = float(np.max(np.abs(velocity - result.x)))
-            if correction > 1e-6:
-                return ControlResult(QPResult("error", iterations=result.iterations, violation=correction,
-                                              detail="WBC solution exceeds velocity bounds"))
             if not np.array_equal(velocity, result.x):
+                correction = float(np.max(np.abs(velocity - result.x)))
+                if correction > 1e-6:
+                    return ControlResult(QPResult("error", iterations=result.iterations, violation=correction,
+                                                  detail="WBC solution exceeds velocity bounds"))
                 result = replace(result, x=array(velocity, 1, "velocity"), violation=0.)
         command = VelocityCommand(result.x, state.stamp, state.stamp + dt) if result.success else None
         return ControlResult(result, command)

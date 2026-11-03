@@ -62,13 +62,19 @@ class QuadraticProgram:
                 raise ValueError("bounds must be vectors without NaNs")
             value.setflags(write=False)
             object.__setattr__(self, name, value)
-        self._check_vectors()
+        # The copies above already certify real storage, a finite gradient,
+        # and NaN-free bounds. Only dimensions remain to be checked here.
+        # solve() still checks the public buffers again before every update.
+        self._check_dimensions()
 
-    def _check_vectors(self):
+    def _check_dimensions(self):
         n, m = self.gradient.size, self.lower.size
         if (self.gradient.ndim != 1 or self.lower.ndim != 1 or not n or
                 self.hessian.shape != (n, n) or self.constraint.shape != (m, n) or self.upper.shape != (m,)):
             raise ValueError("QP dimensions do not match")
+
+    def _check_vectors(self):
+        self._check_dimensions()
         if any(np.iscomplexobj(value) for value in
                (self.hessian, self.gradient, self.constraint, self.lower, self.upper)):
             raise ValueError("QP storage must remain real-valued")
@@ -403,10 +409,12 @@ class OSQPSolver:
             return QPResult(status, iterations=result.info.iter, detail=result.info.status)
         if np.shape(result.x) != p.gradient.shape or not np.isfinite(result.x).all():
             return QPResult("error", iterations=result.info.iter, detail="invalid or nonfinite solution")
-        with np.errstate(over="ignore", invalid="ignore"):
-            solution = result.x if scale is None else result.x * scale
-        if not np.isfinite(solution).all():
-            return QPResult("error", iterations=result.info.iter, detail="nonfinite physical solution")
+        solution = result.x
+        if scale is not None:
+            with np.errstate(over="ignore", invalid="ignore"):
+                solution = result.x * scale
+            if not np.isfinite(solution).all():
+                return QPResult("error", iterations=result.info.iter, detail="nonfinite physical solution")
         x = array(solution, 1, "solution")
         # Evaluate the original A in physical coordinates. Cached CSC storage
         # avoids scanning dense zeros; numerical scaling never changes the

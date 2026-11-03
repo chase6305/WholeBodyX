@@ -95,3 +95,23 @@ def test_fixed_templates_skip_duplicate_convexity_validation_but_check_changed_m
     assert calls == [1]
     assert solver.solve(template.problem([0.] * 3, [-1.] * 3, [1.] * 3)).success
     assert calls == [1]
+
+
+@pytest.mark.parametrize("field,value", [("gradient", np.nan), ("gradient", np.inf),
+                                        ("lower", np.nan), ("upper", np.nan)])
+def test_sparse_vector_mutation_is_rejected_before_cached_workspace_update(field, value):
+    problem = SparseQuadraticProgram(sparse.eye(2), [-1., -1.], sparse.eye(2), [-2., -2.], [2., 2.])
+    solver = OSQPSolver()
+    assert solver.solve(problem).success
+    workspace = solver._solver
+    vector = getattr(problem, field)
+    original = vector.copy()
+    vector.setflags(write=True)
+    vector[0] = value
+    with pytest.raises(ValueError):
+        solver.solve(problem)
+    assert solver._solver is workspace
+    vector[:] = original
+    recovered = solver.solve(problem)
+    assert recovered.success
+    np.testing.assert_allclose(recovered.x, [1., 1.], atol=1e-6)

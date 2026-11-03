@@ -97,3 +97,29 @@ def test_mismatched_scaling_and_nonfinite_transformation_are_rejected():
         OSQPSolver(variable_scaling=[1e308]).solve(problem)
     with pytest.raises(ValueError, match="scaled QP vectors"):
         OSQPSolver(variable_scaling=[1e-3]).solve(problem, warm_start=[1e308])
+
+
+@pytest.mark.parametrize("scale", [None, [2.]])
+@pytest.mark.parametrize("solution", [np.nan, np.inf])
+def test_nonfinite_solver_output_is_rejected_with_and_without_scaling(monkeypatch, scale, solution):
+    solver = OSQPSolver(variable_scaling=scale)
+    problem = QuadraticProgram([[1.]], [0.], [[1.]], [-1.], [1.])
+    assert solver.solve(problem).success
+    info = SimpleNamespace(status="solved", status_val=1, iter=7)
+    monkeypatch.setattr(solver._solver, "solve",
+                        lambda **kwargs: SimpleNamespace(info=info, x=np.array([solution])))
+    rejected = solver.solve(problem)
+    assert rejected.status == "error" and rejected.x is None
+    assert rejected.iterations == 7
+
+
+def test_finite_scaled_solution_overflow_is_rejected(monkeypatch):
+    solver = OSQPSolver(variable_scaling=[2.])
+    problem = QuadraticProgram([[1.]], [0.], [[1.]], [-1.], [1.])
+    assert solver.solve(problem).success
+    info = SimpleNamespace(status="solved", status_val=1, iter=7)
+    monkeypatch.setattr(solver._solver, "solve", lambda **kwargs: SimpleNamespace(
+        info=info, x=np.array([np.finfo(float).max])))
+    rejected = solver.solve(problem)
+    assert rejected.status == "error" and rejected.x is None
+    assert "physical solution" in rejected.detail
