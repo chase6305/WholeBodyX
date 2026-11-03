@@ -9,3 +9,7 @@ build_type=Release
 
 [conf]
 tools.build:compiler_executables={"c": "gcc-12", "cpp": "g++-12"}
+# Align OSQP kernel sections to cache lines with bounded function padding.
+osqp/*:tools.build:cflags=["-falign-functions=64:16:16"]
+# Keep this code-generation choice distinct from existing dependency packages.
+osqp/*:tools.info.package_id:confs=["tools.build:cflags"]

@@ -120,6 +120,9 @@ def main():
         Path(__file__).resolve(),
         ROOT / "bindings/module.cpp",
         ROOT / "CMakeLists.txt",
+        ROOT / "conanfile.py",
+        ROOT / "conan.lock",
+        ROOT / "profiles/linux-gcc12-release",
     ]
     hashes = source_hashes(ROOT, sources)
     report = dict(
