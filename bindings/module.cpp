@@ -1,4 +1,5 @@
 #include "wholebodyx/control.hpp"
+#include "wholebodyx/sparse_mpc.hpp"
 #include <pybind11/eigen.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -49,5 +50,14 @@ PYBIND11_MODULE(wholebodyx_native, m) {
         return std::make_unique<JointMPC>(l, n, dt, q, r, f);
       }))
       .def("reset", &JointMPC::reset).def("formulate", &JointMPC::formulate)
+      .def_property_readonly("fixed_matrix_bytes", &JointMPC::fixed_matrix_bytes)
       .def("solve", &JointMPC::solve, py::call_guard<py::gil_scoped_release>());
+  py::class_<SparseMPCProblem>(m, "SparseMPCProblem")
+      .def_readonly("hessian", &SparseMPCProblem::hessian).def_readonly("gradient", &SparseMPCProblem::gradient)
+      .def_readonly("constraint", &SparseMPCProblem::constraint).def_readonly("lower", &SparseMPCProblem::lower)
+      .def_readonly("upper", &SparseMPCProblem::upper);
+  py::class_<SparseJointMPC>(m, "SparseJointMPC")
+      .def(py::init<JointLimits, int, double, double, double, double>())
+      .def("reset", &SparseJointMPC::reset).def("formulate", &SparseJointMPC::formulate)
+      .def("solve", &SparseJointMPC::solve, py::call_guard<py::gil_scoped_release>());
 }

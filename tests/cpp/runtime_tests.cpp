@@ -92,6 +92,19 @@ int main() {
     gate.reset();
     check(gate.observe(state).stamp == 1, "gate reset did not clear clock");
 
+    for (double stamp : {1e8, 1e12, 1e13}) {
+      const double dt = .01;
+      CommandGate coarse(limits, dt);
+      RobotState measured{Vector::Zero(2), Vector::Zero(2), stamp};
+      coarse.observe(measured);
+      coarse.validate(measured, {Vector::Zero(2), stamp, stamp + dt});
+      rejected([&] { coarse.validate(measured, {Vector::Zero(2), stamp, std::nextafter(stamp + dt, stamp)}); });
+      rejected([&] { coarse.validate(measured, {Vector::Zero(2), std::nextafter(stamp, INFINITY), stamp + dt}); });
+      RobotState shifted = measured;
+      shifted.stamp = std::nextafter(stamp, INFINITY);
+      rejected([&] { coarse.validate(shifted, {Vector::Zero(2), shifted.stamp, stamp + dt}); });
+    }
+
     FixedController fixed;
     MockBackend faulty{{Vector::Zero(2), Vector::Zero(2), 3}};
     fixed.result = solved(Vector::Zero(2), 0, 3.02);  // stale source timestamp

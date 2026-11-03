@@ -3,63 +3,46 @@
 Requires the optional Pinocchio dependency. Contact switches and impacts are not
 implemented; the forward plant enforces the same persistent bilateral contacts.
 """
-from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple
 
 import numpy as np
+from ._solver_execution import OSQP_EXECUTION_LOCK
 
 import osqp
 from scipy import sparse
 
-from .qp import QuadraticProgram
-from .contact import rectangular_wrench_cone
-
-
-@dataclass
-class DynamicsState:
-    q: np.ndarray
-    v: np.ndarray
-    stamp: float = 0.
-
-
-class DynamicsTerms(NamedTuple):
-    """One dynamics evaluation; positional indexing remains supported."""
-
-    mass: np.ndarray
-    bias: np.ndarray
-    contact_jacobian: np.ndarray
-    contact_drift: np.ndarray
-    contact_poses: list
-    com: np.ndarray
-    com_velocity: np.ndarray
-    com_drift: np.ndarray
-    com_jacobian: np.ndarray
-
-
-class ContactFormulation(NamedTuple):
-    problem: QuadraticProgram
-    terms: DynamicsTerms
-    contact_rhs: np.ndarray
+from .qp import QPResult, QuadraticProgram
+from .contact import ContactSpec
+from .dynamics_types import (CoMReference, ContactFormulation, DynamicsControlResult,
+                             DynamicsState, DynamicsTerms, TorqueCommand)
+from .types import positive
 
 
 class FloatingBaseDynamics:
-    def __init__(self, urdf, feet=("left_ankle_link", "right_ankle_link")):
+    def __init__(self, urdf, feet=("left_ankle_link", "right_ankle_link"), *, contact_specs=None):
         import pinocchio as pin
         self.pin = pin
         self.model = pin.buildModelFromUrdf(str(Path(urdf)), pin.JointModelFreeFlyer())
         if self.model.nq != self.model.nv + 1:
             raise ValueError("requires scalar actuated joints after the free-flyer")
-        if not feet or len(set(feet)) != len(feet):
+        if contact_specs is None:
+            contact_specs = tuple(ContactSpec(name) for name in feet)
+        else:
+            contact_specs = tuple(contact_specs)
+            if not all(isinstance(spec, ContactSpec) for spec in contact_specs):
+                raise TypeError("contact_specs must contain ContactSpec values")
+        names = tuple(spec.frame for spec in contact_specs)
+        if not names or len(set(names)) != len(names):
             raise ValueError("at least one distinct contact frame is required")
+        self.contact_specs = contact_specs
         self.contacts = []
-        for name in feet:
+        for spec in self.contact_specs:
+            name = spec.frame
             parent = self.model.getFrameId(name)
             if parent >= self.model.nframes:
                 raise ValueError(f"unknown contact frame: {name}")
             frame = self.model.frames[parent]
-            # Assumed sole plane for this demo; patch dimensions are not vendor data.
-            placement = frame.placement * pin.SE3(np.eye(3), np.array([0., 0., -.07]))
+            placement = frame.placement * pin.SE3(spec.rotation, spec.translation)
             self.contacts.append(self.model.addFrame(pin.Frame(name + "_sole", frame.parentJoint,
                                                               parent, placement, pin.OP_FRAME)))
         self.data = self.model.createData()
@@ -148,9 +131,6 @@ class ContactWBC:
         if not np.isfinite(friction) or friction <= 0:
             raise ValueError("friction must be positive")
         self.robot, self._friction = dynamics, float(friction)
-        self._physical_cone = np.vstack((rectangular_wrench_cone(self._friction),
-                                        [0., 0., -.015, 0., 0., 1.], [0., 0., -.015, 0., 0., -1.]))
-        self._planning_cone = self._physical_cone.copy()
         self.nominal = initial.q.copy()
         self.anchors = dynamics.terms(initial)[4]
         self._contact_reserve = 0.
@@ -161,7 +141,14 @@ class ContactWBC:
         self._orientation_indices = np.arange(3, 6)
         self._bounds_start = nv + nc
         self._cone_start = self._bounds_start + nv + na
-        rows = self._cone_start + len(self.anchors) * len(self._planning_cone)
+        cones = [spec.wrench_cone(self._friction) for spec in dynamics.contact_specs]
+        self._physical_wrench_constraint = np.zeros((sum(map(len, cones)), nc))
+        row = 0
+        for foot, cone in enumerate(cones):
+            self._physical_wrench_constraint[row:row + len(cone), 6 * foot:6 * foot + 6] = cone
+            row += len(cone)
+        self._planning_wrench_constraint = self._physical_wrench_constraint.copy()
+        rows = self._cone_start + row
         self._constraint_template = np.zeros((rows, n))
         self._constraint_template[self._bounds_start:self._cone_start, :nv + na] = np.eye(nv + na)
         self._lower_template, self._upper_template = np.zeros(rows), np.zeros(rows)
@@ -192,29 +179,39 @@ class ContactWBC:
         if not np.isfinite(value) or not 0 <= value <= .75:
             raise ValueError("contact reserve must be in [0, 0.75]")
         self._contact_reserve = float(value)
-        self._planning_cone = self._physical_cone.copy()
-        self._planning_cone[:, 2] *= 1 - self._contact_reserve
+        self._planning_wrench_constraint = self._physical_wrench_constraint.copy()
+        self._planning_wrench_constraint[:, 2::6] *= 1 - self._contact_reserve
         self._update_contact_cone()
 
     def _update_contact_cone(self):
         start = self.robot.nv + self.robot.na
-        for foot in range(len(self.anchors)):
-            row = self._cone_start + foot * len(self._planning_cone)
-            self._constraint_template[row:row + len(self._planning_cone), start + 6 * foot:start + 6 * foot + 6] = self._planning_cone
+        self._constraint_template[self._cone_start:, start:] = self._planning_wrench_constraint
 
     def contact_violation(self, wrench):
         """Check actual local sole wrenches using the controller's contact bounds."""
         force = np.asarray(wrench, dtype=float)
         if force.shape != (6 * len(self.anchors),) or not np.isfinite(force).all():
             raise ValueError("invalid contact wrench")
-        force = force.reshape(-1, 6)
-        return float(max(0., np.max(self._physical_cone @ force.T)))
+        return float(max(0., np.max(self._physical_wrench_constraint @ force)))
+
+    def step(self, state, reference, dt=.005):
+        """Consume a typed, current CoM reference with full interval coverage."""
+        dt = positive(dt, "control dt")
+        if not isinstance(reference, CoMReference):
+            raise ValueError("dynamics controller requires a CoMReference")
+        if not reference.covers(state.stamp, dt):
+            raise ValueError("CoM reference must cover the current control interval")
+        return self.solve(state, reference.position, dt, target_velocity=reference.velocity,
+                          target_acceleration=reference.acceleration)
 
     def formulate(self, state, target_com, dt=.005, *, target_velocity=None, target_acceleration=None):
         """Build the physical-units QP without advancing solver history."""
         r = self.robot
         if not np.isfinite(dt) or not 0 < dt <= .02:
             raise ValueError("dt must be in (0, 0.02]")
+        end = float(state.stamp) + float(dt)
+        if not np.isfinite(end) or end <= state.stamp:
+            raise ValueError("dynamics control interval cannot be represented")
         target_com = np.asarray(target_com, dtype=float)
         if target_com.shape != (3,) or not np.isfinite(target_com).all():
             raise ValueError("target_com must be a finite 3-vector")
@@ -328,7 +325,8 @@ class ContactWBC:
             self._solver.update_settings(rho=.1)
             if self.previous is not None:
                 self._solver.warm_start(x=self.previous / scale)
-            result = self._solver.solve(raise_error=False)
+            with OSQP_EXECUTION_LOCK:
+                result = self._solver.solve(raise_error=False)
             if result.info.status_val == 1:
                 if result.x is None or np.shape(result.x) != (n,) or not np.isfinite(result.x).all():
                     self._solver, self.previous = None, None
@@ -352,9 +350,12 @@ class ContactWBC:
                 self.solver_recoveries += 1
                 continue
             raise RuntimeError(f"dynamics WBC failed: {result.info.status}")
-        self.previous = physical.copy()
         acceleration, torque, wrench = np.split(physical, [nv, nv + na])
-        return dict(acceleration=acceleration, torque=torque, wrench=wrench,
-                    contact_rhs=contact_rhs, terms=terms, violation=violation, iterations=result.info.iter,
+        outcome = DynamicsControlResult(
+                    solver=QPResult("solved", physical, result.info.iter, violation, result.info.status),
+                    command=TorqueCommand(torque, state.stamp, float(state.stamp) + float(dt)),
+                    acceleration=acceleration, wrench=wrench, contact_rhs=contact_rhs, terms=terms,
                     dynamics_residual=float(np.max(np.abs(mass @ acceleration + bias - r.selection @ torque - jac.T @ wrench))),
                     contact_residual=float(np.max(np.abs(jac @ acceleration - contact_rhs))))
+        self.previous = physical.copy()
+        return outcome

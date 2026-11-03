@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from .qp import OSQPSolver, QPResult, QuadraticProgram, _FixedQP
+from .qp import OSQPSolver, QPResult, _FixedQP, _immutable
 from .types import VelocityCommand, array, positive
 
 
@@ -15,7 +15,7 @@ class ControlResult:
 
 
 class KinematicWBC:
-    def __init__(self, limits, regularization=1e-6, smoothing=0.0, solver=None):
+    def __init__(self, limits, regularization=1e-6, smoothing=0.0, solver=None, *, cache_task_hessian=False):
         self.limits = limits
         self.regularization = positive(regularization, "regularization")
         if not np.isfinite(smoothing) or smoothing < 0:
@@ -23,7 +23,15 @@ class KinematicWBC:
         self.smoothing = smoothing
         self.solver = solver if solver is not None else OSQPSolver()
         self._template = None
-        self._last_hessian = None
+        if not isinstance(cache_task_hessian, (bool, np.bool_)):
+            raise TypeError("cache_task_hessian must be a boolean")
+        self._cache_task_hessian = bool(cache_task_hessian)
+        self._task_hessian_cache = None
+
+    @property
+    def cache_task_hessian(self):
+        """Opt-in reuse for stable Jacobians/weights; targets remain dynamic."""
+        return self._cache_task_hessian
 
     def reset(self):
         self.solver.reset()
@@ -31,25 +39,39 @@ class KinematicWBC:
     def formulate(self, state, tasks, dt):
         lo, hi = self.limits.velocity_bounds(state, dt)
         n = state.q.size
-        h = (self.regularization + self.smoothing) * np.eye(n)
+        diagonal = self.regularization + self.smoothing
+        reuse = False
+        if self._cache_task_hessian:
+            tasks = tuple(tasks)
+            cached = self._task_hessian_cache
+            reuse = (cached is not None and cached[0] == diagonal and cached[2].shape == (n, n)
+                     and len(tasks) == len(cached[1])
+                     and all(np.array_equal(task.jacobian, j) and np.array_equal(task.weight, w)
+                             for task, (j, w) in zip(tasks, cached[1])))
+        h = cached[2] if reuse else diagonal * np.eye(n)
         g = -self.smoothing * state.v
         for task in tasks:
             if task.jacobian.shape[1] != n:
                 raise ValueError("task and state dimensions differ")
-            weighted_j = task.weight[:, None] * task.jacobian
-            h += task.jacobian.T @ weighted_j
+            if not reuse:
+                weighted_j = task.weight[:, None] * task.jacobian
+                h += task.jacobian.T @ weighted_j
             g -= task.jacobian.T @ (task.weight * task.target_velocity)
-        # Posture tracking changes the target and bounds every cycle, while H
-        # and the identity constraint stay fixed. Revalidate H whenever any
-        # task Jacobian, weight, or controller setting changes its value.
-        if self._last_hessian is None or not np.array_equal(h, self._last_hessian):
-            problem = QuadraticProgram(h, g, np.eye(n), lo, hi)
-            self._last_hessian = h.copy()
-            self._template = None
-            return problem
-        if self._template is None:
-            self._template = _FixedQP(h, np.eye(n))
-        return self._template.problem(g, lo, hi)
+        # Only an exactly equal Hessian reuses the validated immutable model.
+        if self._template is None or not np.array_equal(h, self._template._hessian):
+            if self._template is not None and self._template._constraint.shape == (n, n):
+                template, problem = self._template.with_hessian(h, g, lo, hi)
+            else:
+                template, problem = _FixedQP.with_problem(h, g, np.eye(n), lo, hi)
+        else:
+            template, problem = self._template, self._template.problem(g, lo, hi)
+        if self._cache_task_hessian and not reuse:
+            # Keep only the latest validated batch. Do not trust array identity
+            # or a reversible read-only flag, and do not cache dynamic vectors.
+            inputs = tuple((_immutable(task.jacobian), _immutable(task.weight)) for task in tasks)
+            self._task_hessian_cache = (diagonal, inputs, _immutable(h))
+        self._template = template
+        return problem
 
     def step(self, state, tasks, dt):
         dt = positive(dt, "dt")

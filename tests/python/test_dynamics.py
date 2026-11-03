@@ -194,10 +194,10 @@ def test_integrator_rejects_invalid_acceleration(demo_module, bad):
 
 def test_state_quaternion_and_contact_input_validation(demo_module):
     demo = demo_module.DynamicsDemo()
-    state = DynamicsState(demo.state.q.copy(), demo.state.v.copy())
-    state.q[3:7] *= 2
+    q = demo.state.q.copy()
+    q[3:7] *= 2
     with pytest.raises(ValueError, match="quaternion"):
-        demo.robot.terms(state)
+        DynamicsState(q, demo.state.v)
     with pytest.raises(ValueError, match="contact acceleration"):
         demo.robot.forward(demo.state, np.zeros(19), np.zeros((12, 1)), demo.robot.terms(demo.state))
 
@@ -298,7 +298,9 @@ def test_mpc_replan_preserves_reference_acceleration_and_measured_feedback(demo_
 def test_mpc_continuity_fallback_is_feasibility_checked_and_bounded(demo_module, measured_feasible):
     from types import SimpleNamespace
     demo = demo_module.DynamicsDemo(controller="mpc")
-    demo.planner.last_plan = SimpleNamespace(sample=lambda stamp: (None, None, np.full(2, 100.)))
+    demo.reference_manager.plan = SimpleNamespace(
+        stamp=demo.state.stamp, valid_until=demo.state.stamp + 1.,
+        sample=lambda stamp: (np.zeros(2), np.zeros(2), np.full(2, 100.)))
     if not measured_feasible:
         demo.com_acceleration[:] = 100.
     terms = demo.robot.terms(demo.state)

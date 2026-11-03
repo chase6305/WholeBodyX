@@ -18,9 +18,24 @@ def _native_planner(limits):
     return NativeMPC(limits)
 
 
+def _sparse_planner(limits):
+    from .sparse_mpc import SparseJointMPC
+    return SparseJointMPC(limits)
+
+
+def _native_sparse_planner(limits):
+    from .native import NativeSparseMPC
+    return NativeSparseMPC(limits)
+
+
 def _check_native():
     from .native import _extension
     _extension()
+
+
+def _check_native_sparse():
+    from .native import _sparse_extension
+    _sparse_extension()
 
 
 @dataclass(frozen=True)
@@ -50,6 +65,8 @@ class BackendRegistry:
         self._backends = {}
         self.register("python", controller=KinematicWBC, planner=JointMPC)
         self.register("native", controller=_native_controller, planner=_native_planner, check=_check_native)
+        self.register("sparse", planner=_sparse_planner)
+        self.register("native-sparse", planner=_native_sparse_planner, check=_check_native_sparse)
 
     def register(self, name, *, controller=None, planner=None, check=None):
         if not isinstance(name, str) or not name or name.strip() != name:

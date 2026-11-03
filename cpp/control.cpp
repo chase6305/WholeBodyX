@@ -1,4 +1,7 @@
 #include "wholebodyx/control.hpp"
+#include "time_utils.hpp"
+#include "fixed_qp.hpp"
+#include "plan_validation.hpp"
 
 #include <Eigen/Eigenvalues>
 #include <Eigen/Cholesky>
@@ -24,24 +27,8 @@ double braking_speed(double distance, double acceleration, double dt) {
   const long double speed = (travel / count) / dt + .5L * (count - 1) * change;
   return static_cast<double>(std::min(speed, travel / dt));
 }
-double ulp(double value) {
-  const double next = std::nextafter(value, INFINITY);
-  return std::isfinite(next) ? next - value : value - std::nextafter(value, -INFINITY);
-}
-double time_window(double stamp, double dt, Eigen::Index count) {
-  const double end = stamp + dt * count;
-  require(std::isfinite(stamp) && stamp >= 0 && std::isfinite(end) && end > stamp &&
-          dt > 8 * std::max(ulp(stamp), ulp(end)), "plan time window must be finite and resolve each time step");
-  return end;
-}
-Eigen::Index interval(double time, double start, double dt, Eigen::Index count) {
-  if (time >= start + count * dt) return count;
-  const double elapsed = (time - start) / dt;
-  const auto nearest = static_cast<Eigen::Index>(std::round(elapsed));
-  const double knot = start + nearest * dt;
-  if (std::abs(time - knot) <= 4 * std::max(ulp(time), ulp(knot))) return std::min(nearest, count - 1);
-  return std::min(static_cast<Eigen::Index>(elapsed), count - 1);
-}
+using detail::interval;
+using detail::time_window;
 }  // namespace
 
 void RobotState::validate() const {
@@ -168,45 +155,63 @@ JointMPC::JointMPC(JointLimits limits, int horizon, double dt, double tracking_w
   positive(terminal_weight_, "invalid terminal weight");
   time_window(0, dt_, horizon_);
   const auto n = limits_.lower.size();
+  require(n <= std::numeric_limits<int>::max() / (horizon_ * (horizon_ + 4LL)), "MPC dimensions exceed sparse index capacity");
   const auto size = n * horizon_;
-  Matrix prediction = Matrix::Zero(size, size);
-  Vector weights = Vector::Constant(size, tracking_weight_);
-  weights.tail(n).setConstant(terminal_weight_);
-  Matrix repeated = Matrix::Zero(size, n);
+  std::vector<Eigen::Triplet<double>> h, a;
+  h.reserve(n * horizon_ * horizon_);
+  a.reserve(n * (horizon_ * (horizon_ + 1LL) / 2 + 3LL * horizon_));
+  gradient_weights_.resize(horizon_);
   const bool slew = limits_.acceleration.size() != 0;
-  Matrix a = Matrix::Zero((slew ? 3 : 2) * size, size);
-  a.topRows(size).setIdentity();
-  Vector lo(a.rows()), hi(a.rows());
+  const auto rows = (slew ? 3 : 2) * size;
+  Vector lo(rows), hi(rows);
   for (int k = 0; k < horizon_; ++k) {
-    for (int j = 0; j <= k; ++j) prediction.block(k * n, j * n, n, n).diagonal().setConstant(dt_);
-    repeated.block(k * n, 0, n, n).setIdentity();
+    for (int j = 0; j < horizon_; ++j) {
+      const double remaining_weight = terminal_weight_ + (horizon_ - 1 - std::max(k, j)) * tracking_weight_;
+      const double value = dt_ * dt_ * remaining_weight + (k == j ? control_weight_ : 0.);
+      for (Eigen::Index joint = 0; joint < n; ++joint) {
+        h.emplace_back(k * n + joint, j * n + joint, value);
+        if (j <= k) a.emplace_back(size + k * n + joint, j * n + joint, dt_);
+      }
+    }
+    const double remaining_weight = terminal_weight_ + (horizon_ - 1 - k) * tracking_weight_;
+    gradient_weights_[k] = dt_ * remaining_weight;
+    for (Eigen::Index joint = 0; joint < n; ++joint) a.emplace_back(k * n + joint, k * n + joint, 1.);
     lo.segment(k * n, n) = -limits_.velocity;
     hi.segment(k * n, n) = limits_.velocity;
     lo.segment(size + k * n, n) = limits_.lower;
     hi.segment(size + k * n, n) = limits_.upper;
     if (slew) {
       const auto row = 2 * size + k * n;
-      a.block(row, k * n, n, n).setIdentity();
-      if (k > 0) a.block(row, (k - 1) * n, n, n).diagonal().setConstant(-1);
+      for (Eigen::Index joint = 0; joint < n; ++joint) {
+        a.emplace_back(row + joint, k * n + joint, 1.);
+        if (k > 0) a.emplace_back(row + joint, (k - 1) * n + joint, -1.);
+      }
       lo.segment(row, n) = -dt_ * limits_.acceleration;
       hi.segment(row, n) = dt_ * limits_.acceleration;
     }
   }
-  a.middleRows(size, size) = prediction;
-  hessian_ = prediction.transpose() * weights.asDiagonal() * prediction;
-  hessian_.diagonal().array() += control_weight_;
-  gradient_map_ = prediction.transpose() * weights.asDiagonal() * repeated;
-  constraint_ = std::move(a);
+  require(gradient_weights_.allFinite() && lo.allFinite() && hi.allFinite(), "nonfinite MPC matrices or bounds");
+  Eigen::SparseMatrix<double> hessian(size, size), constraint(rows, size);
+  hessian.setFromTriplets(h.begin(), h.end()); constraint.setFromTriplets(a.begin(), a.end());
+  fixed_ = std::shared_ptr<const detail::FixedQP>(new detail::FixedQP(std::move(hessian), std::move(constraint)));
   lower_ = std::move(lo);
   upper_ = std::move(hi);
 }
 void JointMPC::reset() { solver_->reset(); last_plan_.reset(); }
+std::size_t JointMPC::fixed_matrix_bytes() const {
+  return detail::sparse_matrix_bytes(fixed_->hessian) + detail::sparse_matrix_bytes(fixed_->constraint);
+}
 QuadraticProgram JointMPC::formulate(const RobotState& state, const Vector& goal) const {
+  Vector gradient, lo, hi;
+  vectors(state, goal, gradient, lo, hi);
+  return {Matrix(fixed_->hessian), std::move(gradient), Matrix(fixed_->constraint), std::move(lo), std::move(hi)};
+}
+void JointMPC::vectors(const RobotState& state, const Vector& goal, Vector& gradient, Vector& lo, Vector& hi) const {
   state.validate();
   time_window(state.stamp, dt_, horizon_);
   const auto n = state.q.size(), size = n * horizon_;
   require(n == limits_.lower.size() && goal.size() == n && goal.allFinite(), "invalid MPC dimensions or goal");
-  Vector lo = lower_, hi = upper_;
+  lo = lower_; hi = upper_;
   for (int k = 0; k < horizon_; ++k) {
     lo.segment(size + k * n, n) -= state.q;
     hi.segment(size + k * n, n) -= state.q;
@@ -215,12 +220,14 @@ QuadraticProgram JointMPC::formulate(const RobotState& state, const Vector& goal
     lo.segment(2 * size, n) += state.v;
     hi.segment(2 * size, n) += state.v;
   }
-  Vector gradient = gradient_map_ * (state.q - goal);
+  gradient.resize(size);
+  const Vector delta = state.q - goal;
+  for (int k = 0; k < horizon_; ++k) gradient.segment(k * n, n) = gradient_weights_[k] * delta;
   require(gradient.allFinite() && lo.allFinite() && hi.allFinite(), "nonfinite MPC vectors");
-  return {hessian_, gradient, constraint_, lo, hi};
 }
 PlanResult JointMPC::solve(const RobotState& state, const Vector& goal) {
-  auto problem = formulate(state, goal);
+  Vector gradient, lo, hi;
+  vectors(state, goal, gradient, lo, hi);
   const auto n = state.q.size();
   Vector warm;
   if (last_plan_ && state.stamp >= last_plan_->stamp) {
@@ -229,14 +236,21 @@ PlanResult JointMPC::solve(const RobotState& state, const Vector& goal) {
     for (int k = 0; k < horizon_; ++k)
       warm.segment(k * n, n) = last_plan_->velocities.row(std::min(k + offset, horizon_ - 1)).transpose();
   }
-  auto result = solver_->solve(problem, warm);
+  auto* osqp = dynamic_cast<OSQPSolver*>(solver_.get());
+  auto result = osqp ? osqp->solve_fixed(fixed_, gradient, lo, hi, warm)
+                     : solver_->solve({Matrix(fixed_->hessian), gradient, Matrix(fixed_->constraint), lo, hi}, warm);
   if (!result.success()) return {result, std::nullopt};
+  if (result.x.size() != n * horizon_ || !result.x.allFinite())
+    return {{"error", {}, result.iterations, INFINITY, "invalid MPC solution"}, std::nullopt};
   JointPlan plan{Matrix(horizon_ + 1, n), Matrix(horizon_, n), state.stamp, dt_};
   plan.positions.row(0) = state.q.transpose();
   for (int k = 0; k < horizon_; ++k) {
     plan.velocities.row(k) = result.x.segment(k * n, n).transpose();
     plan.positions.row(k + 1) = plan.positions.row(k) + dt_ * plan.velocities.row(k);
   }
+  const double violation = detail::joint_plan_violation(plan, limits_, state);
+  if (violation > 1e-6)
+    return {{"error", {}, result.iterations, violation, "reconstructed MPC plan violates joint bounds"}, std::nullopt};
   last_plan_ = plan;
   return {result, plan};
 }

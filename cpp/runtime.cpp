@@ -12,11 +12,11 @@ namespace {
 void require(bool condition, const char* message) {
   if (!condition) throw std::invalid_argument(message);
 }
-double time_tolerance(double a, double b) {
-  return 4 * std::max(std::nextafter(a, std::numeric_limits<double>::infinity()) - a,
-                      std::nextafter(b, std::numeric_limits<double>::infinity()) - b);
+double time_tolerance(double a, double b, double dt) {
+  return std::min(4 * std::max(std::nextafter(a, std::numeric_limits<double>::infinity()) - a,
+                              std::nextafter(b, std::numeric_limits<double>::infinity()) - b), 1e-6 * dt);
 }
-bool same_time(double a, double b) { return std::abs(a - b) <= time_tolerance(a, b); }
+bool same_time(double a, double b, double dt) { return std::abs(a - b) <= time_tolerance(a, b, dt); }
 void validate_control(const ControlResult& control) {
   require(control.solver.status != "solved" || control.solver.x.size() > 0,
           "solved controller result must contain a decision vector");
@@ -56,7 +56,7 @@ RobotState CommandGate::observe(const RobotState& state) {
 }
 VelocityCommand CommandGate::validate(const RobotState& state, const VelocityCommand& command) const {
   if (!fault_.empty()) throw std::runtime_error("command gate is faulted: " + fault_ + "; reset before continuing");
-  require(observed_state_ && same_time(state.stamp, observed_state_->stamp),
+  require(observed_state_ && same_time(state.stamp, observed_state_->stamp, control_dt_),
           "command was not validated against the latest observed state");
   require(state.q.size() == observed_state_->q.size() && state.v.size() == observed_state_->v.size() &&
           (state.q.array() == observed_state_->q.array()).all() && (state.v.array() == observed_state_->v.array()).all(),
@@ -65,10 +65,10 @@ VelocityCommand CommandGate::validate(const RobotState& state, const VelocityCom
           "command and measured state dimensions differ");
   require(std::isfinite(command.stamp) && std::isfinite(command.valid_until) && command.stamp >= 0 &&
           command.valid_until > command.stamp, "invalid command validity interval");
-  require(same_time(command.stamp, state.stamp), "command timestamp does not match measured state");
+  require(same_time(command.stamp, state.stamp, control_dt_), "command timestamp does not match measured state");
   const double end = state.stamp + control_dt_;
   require(std::isfinite(end) && end > state.stamp, "control interval cannot be represented");
-  require(command.valid_until + time_tolerance(command.valid_until, end) >= end,
+  require(end - command.valid_until <= time_tolerance(command.valid_until, end, control_dt_),
           "command does not cover the complete control interval");
   const auto bounds = limits_.velocity_bounds(state, control_dt_);
   constexpr double tolerance = 1e-6;

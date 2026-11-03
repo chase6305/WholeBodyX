@@ -405,7 +405,7 @@ if __name__ == "__main__":
     parser.add_argument("--motion", choices=("arms", "bow", "pickup", "march"), default="arms")
     parser.add_argument("--amplitude", type=float, default=1.25, help="Bow/pickup/march scale, 0.5–1.4 (default: 1.25)")
     parser.add_argument("--backend", choices=("python", "native"), default="python")
-    parser.add_argument("--mpc-backend", choices=("python", "native"))
+    parser.add_argument("--mpc-backend", choices=("python", "native", "sparse", "native-sparse"))
     parser.add_argument("--steps", type=int, default=400)
     parser.add_argument("--csv", type=Path)
     parser.add_argument("--viewer", action="store_true")

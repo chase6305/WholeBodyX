@@ -1,6 +1,8 @@
 #include <wholebodyx/control.hpp>
 #include <wholebodyx/joint_order.hpp>
 #include <wholebodyx/runtime.hpp>
+#include <wholebodyx/reference.hpp>
+#include <wholebodyx/sparse_mpc.hpp>
 
 struct Backend : wholebodyx::VelocityRobotBackend {
   int writes = 0, stops = 0;
@@ -27,8 +29,15 @@ int main() {
   const auto cycle = loop.step([](const RobotState&) {
     return std::vector<LinearTask>{{Matrix::Identity(1, 1), Vector::Constant(1, .5), Vector::Ones(1)}};
   });
+  JointMPC planner(limits);
+  MPCReferenceManager references(planner, limits);
+  const auto reference = references.update({Vector::Zero(1), Vector::Zero(1), 0}, Vector::Constant(1, .3), .02);
+  SparseJointMPC sparse(limits);
+  MPCReferenceManager sparse_references(sparse, limits);
+  const auto sparse_reference = sparse_references.update({Vector::Zero(1), Vector::Zero(1), 0}, Vector::Constant(1, .3), .02);
   return result.solver.success() && converted.command &&
          (converted.command->velocity - three.velocity).norm() < 1e-6 &&
          cycle.control.command && cycle.cycle_ms >= cycle.control_ms &&
-         backend.writes == 1 && backend.stops == 0 ? 0 : 1;
+         backend.writes == 1 && backend.stops == 0 && reference.success() && reference.replanned() &&
+         sparse_reference.success() && sparse_reference.replanned() ? 0 : 1;
 }

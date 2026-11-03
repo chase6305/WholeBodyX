@@ -304,8 +304,10 @@ def test_wbc_cached_problem_isolated_from_caller_changes():
     state = RobotState([0, 0], [0, 0])
     task = LinearTask(np.eye(2), [.2, .3])
     first = controller.formulate(state, [task], .1)
-    first.hessian.setflags(write=True)
-    first.hessian[:] = 99
+    with pytest.raises(ValueError):
+        first.hessian.setflags(write=True)
+    first.hessian.shape = (4,)
+    first.constraint.dtype = np.int64
     cached = controller.formulate(state, [task], .1)
     np.testing.assert_allclose(cached.hessian, np.eye(2) * 1.000001)
     cached.hessian.shape = (4,)

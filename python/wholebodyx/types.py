@@ -20,6 +20,14 @@ def array(value, ndim, name):
     return result
 
 
+def _snapshot(value, ndim, name):
+    """Validate and copy once into storage that cannot be made writable."""
+    value = np.asarray(value, dtype=float)
+    if value.ndim != ndim or not np.isfinite(value).all():
+        raise ValueError(f"{name} must be a finite {ndim}-D array")
+    return np.frombuffer(value.tobytes(), dtype=float).reshape(value.shape)
+
+
 def positive(value, name):
     value = float(value)
     if not np.isfinite(value) or value <= 0:

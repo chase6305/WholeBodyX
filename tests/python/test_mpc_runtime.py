@@ -141,15 +141,22 @@ def test_warm_start_after_large_forward_clock_jump(backend):
         planner.solve(RobotState([0, 0], [0, 0], 1e308), [.3, .3])
 
 
+@pytest.mark.parametrize("planner_name", ["JointMPC", "SparseJointMPC"])
 @pytest.mark.parametrize("elapsed,offset", [(0., 0), (.1, 1), (.2, 2), (.3, 3), (1e6, 3)])
-def test_shifted_warm_start_matches_plan_and_is_isolated(elapsed, offset):
+def test_shifted_warm_start_matches_plan_and_is_isolated(planner_name, elapsed, offset):
+    import wholebodyx
     from wholebodyx import QPResult
 
-    planner = JointMPC(bounds(), horizon=3)
+    planner = getattr(wholebodyx, planner_name)(bounds(), horizon=3)
     state = RobotState([0, 0], [0, 0])
     first = planner.solve(state, [.3, -.2]).plan
     original = first.velocities.copy()
-    expected = np.vstack((original[offset:], np.repeat(original[-1:], offset, axis=0))).reshape(-1)
+    expected = np.vstack((original[offset:], np.repeat(original[-1:], offset, axis=0)))
+    if planner_name == "SparseJointMPC":
+        positions = state.q + planner.dt * np.cumsum(expected, axis=0)
+        expected = np.r_[positions.ravel(), expected.ravel()]
+    else:
+        expected = expected.ravel()
 
     class InspectSolver:
         def solve(self, problem, warm_start=None):

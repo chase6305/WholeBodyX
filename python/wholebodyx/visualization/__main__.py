@@ -11,7 +11,7 @@ def main():
     parser.add_argument("--backend", choices=("python", "native"), default="python")
     parser.add_argument("--mode", choices=("WBC", "MPC + WBC"), default="MPC + WBC")
     parser.add_argument("--scenario", choices=tuple(SCENARIOS), default="tracking")
-    parser.add_argument("--mpc-backend", choices=("python", "native"), default=None)
+    parser.add_argument("--mpc-backend", choices=("python", "native", "sparse", "native-sparse"), default=None)
     args = parser.parse_args()
     viewer = ControlViewer(args.host, args.port, args.backend, args.mode, args.scenario, args.mpc_backend)
     viewer.run()

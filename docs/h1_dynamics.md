@@ -99,7 +99,18 @@ KKT 求解采用秩判定，处理冗余约束；接触力在冗余情况下可�
 返回 `ContactFormulation(problem, terms, contact_rhs)`，其中 QP 使用物理单位，
 不含内部数值缩放。调用它不会推进 warm start、创建求解器或更新求解计数，
 返回的 QP 是独立快照，可用于检查问题或接入其他求解器。
-`solve()` 继续返回原有字典，不改变加速度、力矩、接触力和诊断字段。
+`solve()` 返回 `DynamicsControlResult`，支持 `result.command`、`result.acceleration` 等字段。
+原有键读取、`get()` 和 `dict(result)` 保留；结果是只读 Mapping，不再是可修改字典。
+`DynamicsState`、命令和结果的加速度/wrench/RHS 均为独立只读快照；更新状态时构造新对象。
+`DynamicsTerms` 保持原有独立模型快照和元组访问语义，其模型项数组仍可用于本地诊断修改。
+`ContactWBC.step(state, CoMReference(...), dt)` 提供带参考有效期校验的统一动力学入口。
+
+`ContactSpec` 描述接触帧、局部放置、矩形尺寸和扭转摩擦；默认值复现 H1 示例假设，
+支撑多边形与接触力约束共用这些几何配置。`CoMReferenceManager` 管理质心参考的
+接受、覆盖、重规划和连续性，失败时清除旧参考。
+独立的 `TorqueControlLoop` 与 `FixedContactSimulator` 组合示例见
+[`torque_control.py`](../examples/python/torque_control.py)，使用仓库自带惯性 URDF。
+完整类型、执行与故障语义见 [执行接口](execution.md)。
 
 `ContactWBC.reset()` 清除求解工作区、warm start 和求解计数，保留标称姿态、
 接触锚点、摩擦和接触裕量；需要重设锚点时重新构造控制器。

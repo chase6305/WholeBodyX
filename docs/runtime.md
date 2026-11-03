@@ -2,7 +2,8 @@
 
 `MPCReferenceManager` 负责参考的接收校验、有效期和重规划时机，独立于机器人几何、
 仿真与 Viser。它使用现有 `Planner` / `JointPlan` 契约，可以接 Python 或 native MPC；
-采样结果可交给任一 WBC。当前运行模块使用 Python 同步调度。
+采样结果可交给任一 WBC。Python 使用 `runtime.py` 同步调度，独立 C++ 程序可使用
+`wholebodyx/reference.hpp`。带执行门控的通用组合见 [执行接口](execution.md)。
 
 ## 重规划条件
 
@@ -21,7 +22,8 @@
 | `retry` | 示例发生控制错误后，下一次手动运行重新获取参考 |
 | `clock_rollback` | 时钟回退，丢弃计划；必须 `reset()` 后恢复 |
 
-周期按状态时间戳判断，内部时间比较容忍 4 ULP 的舍入差异。例如 0.08 s 换目标后，
+周期按状态时间戳判断，容忍本次规划以来多次积分累积的 ULP 舍入差异，
+容差上限为四分之一控制周期，避免低分辨率时钟明显提前触发。例如 0.08 s 换目标后，
 下一次周期规划为 0.18 s，而不会在全局第 5 个控制步骤的 0.10 s 再次规划。
 目标变化、预测偏差和有效期检查仍可提前触发。
 
@@ -68,8 +70,18 @@ if not update.success:
 
 完整的任务构造、WBC 状态检查和积分执行见
 [TrackingSession](../python/wholebodyx/session.py)。WBC 失败时该 session 同样清除参考，
-控制步骤不推进仿真时间。真实硬件的停机或降级行为需由硬件运行层实现；同步模块没有后台 worker、
+控制步骤不推进仿真时间。`VelocitySession` 将同一参考管理器与 `VelocityControlLoop`
+组合，故障时清除参考并通过驱动 `stop()` 锁存故障；规划也纳入周期预算。
+真实硬件的停机行为由驱动实现；同步模块没有后台 worker、
 超时中断、跨进程参考交换或硬实时保证。
+
+## 可选独立进程规划
+
+同步 `MPCReferenceManager` 保留本页所述刷新策略。需要隔离规划耗时时，可显式选择
+`ProcessMPCWorker` 和 `AsyncMPCReferenceManager`，通过 `VelocitySession(reference_manager=...)`
+接入相同的控制与命令门控。异步版本要求启动种子、预测未来状态并按原时间戳接续；
+目标更新期间允许继续使用仍然有效的旧轨迹，失败时清空参考并锁存故障。
+启动顺序、延迟代价、控制周期匹配与可运行例子见 [独立进程关节 MPC](execution.md#独立进程关节-mpc)。
 
 ## 速度驱动边界与执行期限
 
@@ -77,6 +89,8 @@ if not update.success:
 驱动实现 `read()`、`write(command)` 和 `stop()`；控制器继续使用现有 `Controller` 契约。
 `CommandGate` 保存测量状态的独立快照，下发前核对时间、关节位置和速度，
 防止相同时间戳下换入不同状态，或任务/后端修改输入数组后仍通过校验。
+命令时钟与有效期比较最多容忍 4 ULP，同时限制在控制周期的百万分之一以内，
+避免大时间戳的低分辨率将明显偏移或过短的命令判为有效。C++ 使用相同规则。
 
 实际驱动接入时可显式配置执行预算，单位为秒：
 

@@ -28,6 +28,11 @@ Pinocchio、Viser uPlot 能否导入。缺少可选依赖仍可通过基础检�
 ## 后端注册
 
 每个应用拥有自己的 `BackendRegistry`。内置 `python`、`native`，分别提供 WBC 与 MPC。
+内置 `sparse` 只提供 MPC，可通过 `--mpc-backend sparse` 配合任一 WBC。
+`wholebodyx doctor --require sparse` 会检查稀疏 MPC 与 Python WBC 的组合求解。
+内置 `native-sparse` 同样只提供 MPC，使用 C++ 未消元稀疏问题；
+可通过 `--mpc-backend native-sparse` 与两种 WBC 组合。
+`wholebodyx doctor --require native-sparse` 实际检查该组合，旧扩展缺少此能力时需要重建。
 注册名不能重复；新后端可以只提供其中一项。工厂接收 `JointLimits`，每次调用必须创建
 独立实例，使求解器工作区、warm start 和重置状态不会跨控制循环共享。
 
@@ -56,6 +61,10 @@ metrics = run("disturbance_recovery", backend="my_wbc", mpc_backend="my_mpc",
 未指定 `mpc_backend` 时，优先采用 WBC 同名的规划器；仅注册 WBC 的名字默认搭配 Python MPC。
 WBC 模式不需要调用任何 MPC 工厂。
 
+`TrackingSession` 是自带场景的运行器；接入其他模型或驱动时使用
+[`VelocitySession`](execution.md)，直接注入模型、驱动、控制器、规划器和任务工厂。
+浮动基座力矩接口独立于速度级注册表，使用 `DynamicsController` 与 `TorqueControlLoop`。
+
 浏览器也接收同一个注册表，并按 controller/planner 能力分别填充两个菜单：
 
 ```python
@@ -68,6 +77,26 @@ ControlViewer(backend="my_wbc", mpc_backend="my_mpc", registry=registry).run()
 [custom_backends.py](../examples/python/custom_backends.py)，支持 `--viewer`。
 此示例演示注册、配置和运行复用，算法仍是已有 WBC/MPC，不代表已接入你的私有仓库。
 CLI 的 `--backend` 提供内置名字，自定义注册通过 Python 应用入口完成。
+
+### 稳定任务模型的可选 Hessian 复用
+
+`KinematicWBC(limits, cache_task_hessian=True)` 适用于 Jacobian 和权重经常保持不变、
+目标速度持续变化的任务。它逐项精确比较当前 Jacobian、权重、维度和基础对角项，
+只复用最近一批已验证任务的 Hessian；目标、状态、梯度、速度边界和命令检查每周期重算。
+即使调用方重新打开数组的写入标志并修改内容，也会重新构造和验证模型。
+失败的模型或动态向量不会替换健康缓存。reset 与已有 QP 模板一样保留这份模型，
+下一次调用仍须满足精确匹配条件；缓存不保存历史任务链。
+
+```python
+registry.register("stable_task_wbc",
+                  controller=partial(KinematicWBC, cache_task_hessian=True))
+```
+
+该选项默认关闭：较大且稳定的任务矩阵可能受益，Jacobian 持续改变时，比较和快照有额外成本。
+新增内存约为一份 Hessian、最近一批 Jacobian 与权重的数值存储，以及 Python 对象开销。
+这只影响 Python `KinematicWBC`，不是原生后端选项，也不提供实时调度保证。
+可运行 `scripts/benchmark_wbc_hessian_cache.py` 对自身维度做默认 / 开启选项的交错测量，
+再决定是否启用。基准会核对每一步的 QP 或完整求解结果一致，包含动态 Jacobian 对照。
 
 ## Adapter 必须转换的内容
 

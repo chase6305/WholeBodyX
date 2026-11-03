@@ -1,4 +1,4 @@
-#include "wholebodyx/control.hpp"
+#include "wholebodyx/reference.hpp"
 #include <algorithm>
 #include <iostream>
 
@@ -10,21 +10,17 @@ int main() {
   Vector goal = Vector::Constant(2, 0.5);
   JointMPC planner(limits, 15, 0.1);
   KinematicWBC controller(limits);
-  std::optional<JointPlan> plan;
+  MPCReferenceManager references(planner, limits);
   int replans = 0, goal_changes = 0;
   double max_violation = 0;
   for (int k = 0; k < 400; ++k) {
     // Off the periodic replan grid: changes must trigger an immediate solve.
     const bool changed = k == 103 || k == 207;
     if (changed) { goal.setConstant(k == 103 ? -0.4 : 0.25); ++goal_changes; }
-    if (k % 5 == 0 || changed) {
-      const auto result = planner.solve(state, goal);
-      if (!result.plan) { std::cerr << result.solver.detail << '\n'; return 1; }
-      plan = result.plan;
-      ++replans;
-    }
-    const auto reference = plan->sample(state.stamp);
-    LinearTask task{Matrix::Identity(2, 2), reference.second + 4 * (reference.first - state.q), Vector::Ones(2)};
+    const auto reference = references.update(state, goal, dt);
+    if (!reference.success()) { std::cerr << reference.solver->detail << '\n'; return 1; }
+    replans += reference.replanned();
+    LinearTask task{Matrix::Identity(2, 2), *reference.velocity + 4 * (*reference.position - state.q), Vector::Ones(2)};
     const auto result = controller.step(state, {task}, dt);
     if (!result.command) { std::cerr << result.solver.detail << '\n'; return 1; }
     const auto bounds = limits.velocity_bounds(state, dt);
@@ -39,5 +35,5 @@ int main() {
   const double error = (state.q - goal).norm();
   std::cout << "goal_changes=" << goal_changes << " replans=" << replans
             << " final_joint_error=" << error << " max_violation=" << max_violation << '\n';
-  return error < 1e-3 && goal_changes == 2 && replans == 82 ? 0 : 1;
+  return error < 1e-3 && goal_changes == 2 && replans == 81 ? 0 : 1;
 }

@@ -115,10 +115,28 @@ def check(controller="mpc", output=Path("/tmp/h1-browser-check")):
                 wait(lambda text: time_in(text) == .005, "single step")
                 checkbox("运行")
                 wait(lambda text: time_in(text) is not None and time_in(text) > 10.0, "continuous second cycle", 40)
+                pause_requested = time.monotonic()
                 checkbox("运行")
-                time.sleep(.3)
                 paused = time_in(body())
+                stable_since = time.monotonic()
+                deadline = stable_since + 5
+                pause_samples = []
+                while time.monotonic() < deadline:
+                    current = time_in(body())
+                    pause_samples.append(dict(elapsed_s=time.monotonic() - pause_requested, stamp=current))
+                    if current != paused:
+                        paused, stable_since = current, time.monotonic()
+                    # A queued final render may arrive after the UI stopped.
+                    # Require a quiet interval, not one delayed animation frame.
+                    if paused is not None and time.monotonic() - stable_since >= 2.:
+                        break
+                    time.sleep(.1)
+                else:
+                    raise AssertionError("pause did not settle within five seconds")
+                pause_observed_latency_s = time.monotonic() - pause_requested
                 time.sleep(.3)
+                pause_samples.append(dict(elapsed_s=time.monotonic() - pause_requested, stamp=time_in(body())))
+                (output / "pause_trace.json").write_text(json.dumps(pause_samples, indent=2) + "\n")
                 assert time_in(body()) == paused, "pause failed"
                 shot = call("Page.captureScreenshot", dict(format="png"))
                 (output / "viewer.png").write_bytes(base64.b64decode(shot["data"]))
@@ -143,7 +161,8 @@ def check(controller="mpc", output=Path("/tmp/h1-browser-check")):
                 wait(lambda text: time_in(text) == .005, "step after reset")
                 assert not errors, errors
                 report = dict(controller=controller, status="passed", checks=["load", "single_step", "continuous_loop",
-                              "pause", "stop_at_boundary", "side_push", "reset", "step_after_reset"], browser_exceptions=errors)
+                              "pause", "stop_at_boundary", "side_push", "reset", "step_after_reset"],
+                              pause_observed_latency_s=pause_observed_latency_s, browser_exceptions=errors)
                 (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
                 print(json.dumps(report), flush=True)
         finally:

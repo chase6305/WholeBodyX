@@ -13,6 +13,7 @@ C++ 与 Python 均可实现控制器和规划器的机器人控制框架。
 - [Unitree H1 浮动基座动力学、质心 MPC 与力矩 WBC](docs/h1_dynamics.md)
 - [参考调度、失败处理与状态偏移恢复](docs/runtime.md)
 - [自有仓库接入、后端注册与统一命令](docs/integration.md)
+- [模型/驱动注入、稀疏 MPC 与力矩执行](docs/execution.md)
 - [C++ / Python 关节顺序适配](docs/joint_order.md)
 
 目前提供 C++ / Python 速度级 WBC、关节空间 MPC、OSQP adapter、
@@ -20,7 +21,8 @@ Python 末端/姿态任务、可选 URDF adapter、平面双臂示例，以及�
 核心算法可分别运行，Python 不强制安装本项目的 C++ 扩展。
 
 核心双臂案例仍是固定基座运动学基线。另有实验性 Python H1 浮动基座动力学 WBC、
-恒定高度质心/ZMP MPC 和固定双脚接触仿真；真实硬件、碰撞与接触切换尚未实现。
+恒定高度质心/ZMP MPC 和固定接触力矩仿真；已提供速度/力矩驱动边界，
+实际设备驱动、碰撞与接触切换尚未实现。
 双臂测试模型为两条平面 3R 链，仿真后端为关节速度积分器。
 
 ## 浏览器可视化
@@ -60,6 +62,10 @@ uv run --extra viz wholebodyx view tracking
 
 `doctor --require native urdf viz` 可检查指定的可选能力。WBC/MPC 的创建统一经过
 `BackendRegistry`，支持分别注册自己的工厂并交给运行器或浏览器。
+
+MPC 可显式选择 `python`、`native`、`sparse` 或 `native-sparse`；后两者采用
+未消元稀疏问题，适合单独评估较长预测范围。`native-sparse` 需要重新构建匹配的扩展。
+问题规模和目标变化方式都会影响收益，见 [性能记录](docs/performance.md)。
 可运行的自定义配置示例：`uv run python examples/python/custom_backends.py`。
 
 另有任务权重、限位与失败恢复、URDF 跟踪等示例。动态场景支持 CSV 导出及浏览器展示：
@@ -69,7 +75,7 @@ uv run python examples/python/dual_arm_coordination.py --csv /tmp/coordination.c
 uv run --extra viz python examples/python/cartesian_circle.py --viewer
 ```
 
-共 11 个 Python 示例入口、5 个独立 C++ 入口，详见 [示例指南](examples/README.md)。
+示例覆盖双臂、URDF、H1 和独立力矩闭环，另有 5 个独立 C++ 入口，详见 [示例指南](examples/README.md)。
 
 基础环境没有 native 扩展和 Pinocchio 时，对应的可选测试会跳过。
 需要 URDF 时安装 `urdf` extra：
@@ -139,7 +145,11 @@ CMake toolchain 或依赖查找配置。当前 wheel 为本机构建产物，尚
 | 关节顺序映射与控制器/规划器包装 | `python/wholebodyx/joint_order.py`、`include/wholebodyx/joint_order.hpp` |
 | 后端工厂与加载诊断 | `python/wholebodyx/backends.py`、`diagnostics.py` |
 | 场景执行、CSV 与统一命令 | `python/wholebodyx/session.py`、`runner.py`、`cli.py` |
-| MPC 参考校验、有效期与重规划 | `python/wholebodyx/runtime.py` |
+| MPC 参考校验、有效期与重规划 | `python/wholebodyx/runtime.py`、`include/wholebodyx/reference.hpp` |
+| 可注入的速度组合运行器 | `python/wholebodyx/execution.py` |
+| 稀疏 QP / 关节 MPC | `python/wholebodyx/sparse_qp.py`、`sparse_mpc.py`、`include/wholebodyx/sparse_mpc.hpp` |
+| 动力学契约、力矩门控与独立仿真 | `python/wholebodyx/dynamics_types.py`、`torque.py`、`dynamics_simulation.py` |
+| 质心 MPC 与参考调度 | `python/wholebodyx/centroidal.py`、`centroidal_runtime.py` |
 | 浏览器场景与诊断 | `python/wholebodyx/visualization/` |
 | 构建配置 | `conanfile.py`、`profiles/`、`pyproject.toml`、`native/` |
 | 数值与闭环测试 | `tests/`、`test_package/` |

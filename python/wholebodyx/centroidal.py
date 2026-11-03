@@ -5,13 +5,14 @@ CoM acceleration is the linear inverted-pendulum approximation, not a full
 centroidal momentum or contact-switching model.
 """
 from dataclasses import dataclass
+from typing import Protocol
 
 import numpy as np
 from scipy.spatial import ConvexHull
 
 from .qp import OSQPSolver, _FixedQP, _immutable
 from .mpc import _time_window
-from .types import array
+from .types import _snapshot, array
 
 
 @dataclass(frozen=True)
@@ -26,8 +27,8 @@ class CoMPlan:
     def __post_init__(self):
         for name in ("stamp", "dt", "height", "gravity"):
             object.__setattr__(self, name, float(getattr(self, name)))
-        states = array(self.states, 3, "CoM states")
-        jerks = array(self.jerks, 2, "CoM jerks")
+        states = _snapshot(self.states, 3, "CoM states")
+        jerks = _snapshot(self.jerks, 2, "CoM jerks")
         if jerks.shape[1:] != (2,) or not len(jerks) or states.shape != (len(jerks) + 1, 3, 2):
             raise ValueError("CoM plan dimensions must be (N+1, 3, 2) and (N, 2)")
         for value in (self.dt, self.height, self.gravity):
@@ -39,8 +40,8 @@ class CoMPlan:
                               v + self.dt * a + .5 * self.dt**2 * jerks, a + self.dt * jerks), axis=1)
         if not np.allclose(predicted, states[1:], atol=1e-9, rtol=1e-8):
             raise ValueError("CoM plan must satisfy jerk integration")
-        object.__setattr__(self, "states", _immutable(states))
-        object.__setattr__(self, "jerks", _immutable(jerks))
+        object.__setattr__(self, "states", states)
+        object.__setattr__(self, "jerks", jerks)
 
     def sample(self, stamp):
         stamp = float(stamp)
@@ -54,8 +55,24 @@ class CoMPlan:
         return p + t * v + .5 * t**2 * a + t**3 / 6 * jerk, v + t * a + .5 * t**2 * jerk, a + t * jerk
 
     @property
+    def valid_until(self):
+        return self.stamp + self.dt * len(self.jerks)
+
+    @property
     def zmp(self):
         return self.states[:, 0] - self.height / self.gravity * self.states[:, 2]
+
+
+class CoMPlanner(Protocol):
+    horizon: int
+    dt: float
+
+    def reset(self) -> None: ...
+
+    def plan(self, position, velocity, acceleration, targets, stamp=0., *,
+             target_velocities=None) -> CoMPlan: ...
+
+    def validate_plan(self, plan: CoMPlan) -> float: ...
 
 
 @dataclass(frozen=True)
@@ -160,6 +177,34 @@ class CoMPreviewMPC:
         self.last_plan = None
         self.replans = 0
 
+    def validate_plan(self, plan):
+        """Independent physical validation, including complete interval curves.
+
+        Return the largest absolute bound violation; zero means feasible. This
+        does not use the QP matrices or the solver workspace.
+        """
+        if not isinstance(plan, CoMPlan):
+            raise ValueError("CoM planner must return a CoMPlan")
+        if plan.height != self.height or plan.gravity != self.gravity:
+            raise ValueError("CoM plan uses a different height or gravity")
+        p, v, a = np.moveaxis(plan.states[:-1], 1, 0)
+        j, dt, h = plan.jerks, plan.dt, self.height / self.gravity
+        z0 = p - h * a
+        zmp_controls = np.stack((z0, z0 + dt / 3 * (v - h * j),
+                                 z0 + 2 * dt / 3 * (v - h * j) + dt**2 / 6 * a,
+                                 plan.zmp[1:]), axis=1)
+        velocity_controls = np.stack((v, v + dt / 2 * a,
+                                      plan.states[1:, 1]), axis=1)
+        capture = plan.states[-1, 0] + np.sqrt(h) * plan.states[-1, 1]
+        values = (np.max(np.abs(j) - self.jerk_limit),
+                  np.max(np.abs(velocity_controls) - self.velocity_limit),
+                  np.max(np.abs(plan.states[:, 2]) - self.acceleration_limit),
+                  np.max(zmp_controls @ self.normals.T - self.offsets),
+                  np.max(self.normals @ capture - self.offsets))
+        if not np.isfinite(values).all():
+            raise ValueError("nonfinite CoM plan constraint evaluation")
+        return float(max(0., *values))
+
     def plan(self, position, velocity, acceleration, targets, stamp=0., *, target_velocities=None):
         initial = np.stack([array(x, 1, "CoM state") for x in (position, velocity, acceleration)])
         targets = array(targets, 2, "CoM targets")
@@ -189,10 +234,7 @@ class CoMPreviewMPC:
             raise RuntimeError(f"CoM MPC failed: {result.status}: {result.detail}")
         jerks = result.x.reshape(self.horizon, 2)
         states = np.concatenate((initial[None], nominal + self.state_control @ jerks))
-        # Own immutable snapshots: sampling must not depend on solver buffers.
-        states.setflags(write=False)
-        jerks = jerks.copy()
-        jerks.setflags(write=False)
+        # CoMPlan validates and owns immutable snapshots of both arrays.
         plan = CoMPlan(states, jerks, float(stamp), self.dt, self.height, self.gravity)
         self.last_plan = plan
         self.replans += 1
