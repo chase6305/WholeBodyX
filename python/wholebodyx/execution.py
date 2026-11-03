@@ -54,11 +54,29 @@ class VelocitySession:
     or rewinds its state. No history or unbounded diagnostics are retained.
     """
 
-    def __init__(self, model, backend, controller, control_dt=.02, *, planner=None, reference_manager=None,
-                 task_factory=None, limits=None, replan_period=.1,
-                 tracking_tolerance=.03, posture_gain=4., posture_weight=1.,
-                 max_cycle_time=None):
-        self.model, self.backend, self.controller, self.planner = model, backend, controller, planner
+    def __init__(
+        self,
+        model,
+        backend,
+        controller,
+        control_dt=0.02,
+        *,
+        planner=None,
+        reference_manager=None,
+        task_factory=None,
+        limits=None,
+        replan_period=0.1,
+        tracking_tolerance=0.03,
+        posture_gain=4.0,
+        posture_weight=1.0,
+        max_cycle_time=None,
+    ):
+        self.model, self.backend, self.controller, self.planner = (
+            model,
+            backend,
+            controller,
+            planner,
+        )
         self.limits = model.limits if limits is None else limits
         if len(model.joint_names) != self.limits.lower.size:
             raise ValueError("model joint names and configured limits dimensions differ")
@@ -76,19 +94,31 @@ class VelocitySession:
             if not isinstance(reference_manager, MPCReferenceManager):
                 raise TypeError("reference_manager must be an MPCReferenceManager")
             for name in ("lower", "upper", "velocity", "acceleration"):
-                if not np.array_equal(getattr(reference_manager.limits, name), getattr(self.limits, name)):
+                if not np.array_equal(
+                    getattr(reference_manager.limits, name), getattr(self.limits, name)
+                ):
                     raise ValueError("reference manager and session limits differ")
             self.planner = reference_manager.planner
-        self.reference_manager = (reference_manager if reference_manager is not None else
-                                  MPCReferenceManager(planner, self.limits, replan_period, tracking_tolerance)
-                                  if planner is not None else None)
-        self.loop = VelocityControlLoop(backend, self.limits,
-                                        _SessionController(controller, self.reference_manager),
-                                        self.control_dt, max_cycle_time=max_cycle_time)
+            self.reference_manager = reference_manager
+        elif planner is not None:
+            self.reference_manager = MPCReferenceManager(
+                planner, self.limits, replan_period, tracking_tolerance
+            )
+        else:
+            self.reference_manager = None
+        self.loop = VelocityControlLoop(
+            backend,
+            self.limits,
+            _SessionController(controller, self.reference_manager),
+            self.control_dt,
+            max_cycle_time=max_cycle_time,
+        )
         # Validate the actual controller too, rather than only the wrapper.
         if not all(callable(getattr(controller, name, None)) for name in ("reset", "step")):
             raise TypeError("controller must implement reset and step")
-        if planner is not None and not all(callable(getattr(planner, name, None)) for name in ("reset", "solve")):
+        if planner is not None and not all(
+            callable(getattr(planner, name, None)) for name in ("reset", "solve")
+        ):
             raise TypeError("planner must implement reset and solve")
         self.steps = 0
         self.last_reference = None
@@ -130,15 +160,24 @@ class VelocitySession:
                 update = self.reference_manager.update(state, target, self.control_dt)
                 if not update.success:
                     raise RuntimeError(f"MPC: {update.solver.status} — {update.solver.detail}")
-                result.append(PostureTask(update.position, gain=self.posture_gain,
-                                           weight=self.posture_weight,
-                                           feedforward=update.velocity).linearize(self.model, state))
+                result.append(
+                    PostureTask(
+                        update.position,
+                        gain=self.posture_gain,
+                        weight=self.posture_weight,
+                        feedforward=update.velocity,
+                    ).linearize(self.model, state)
+                )
             elif goal is not None:
-                raise ValueError("joint goals require a planner; provide WBC targets through task_factory")
+                raise ValueError(
+                    "joint goals require a planner; provide WBC targets through task_factory"
+                )
             if self.task_factory is not None:
                 extra = self.task_factory(self.model, state)
                 if not isinstance(extra, (list, tuple)):
-                    raise ValueError("task_factory must return a list or tuple of LinearTask values")
+                    raise ValueError(
+                        "task_factory must return a list or tuple of LinearTask values"
+                    )
                 result.extend(extra)
             return result
 

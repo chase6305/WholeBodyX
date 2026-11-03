@@ -2,14 +2,31 @@
 
 from math import ceil, ulp
 from time import monotonic
+from typing import NamedTuple
 
 import numpy as np
 
 from .mpc import JointPlan, PlanResult, _validated_joint_plan
-from .process_mpc import PlanningReply
+from .process_mpc import PlanningReply, PlanningToken
 from .qp import QPResult
 from .runtime import MPCReferenceManager, ReferenceUpdate, _deadline_reached
 from .types import RobotState, array, positive
+
+
+class _PendingPlan(NamedTuple):
+    token: PlanningToken
+    state: RobotState
+    goal: np.ndarray
+    submitted_at: float  # Monotonic wall time; state.stamp uses the driver clock.
+    reason: str
+    nominal_start: float
+
+
+class _CompletedPlan(NamedTuple):
+    plan: JointPlan
+    reply: PlanningReply
+    reason: str
+    nominal_start: float
 
 
 def _forecast_window(stamp, control_dt, lookahead):
@@ -64,8 +81,16 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
     None retains the original sampling policy without a lateness bound.
     """
 
-    def __init__(self, worker, *, replan_period=.1, tracking_tolerance=.03,
-                 lookahead=.1, max_pending_time=1., max_adoption_delay=None):
+    def __init__(
+        self,
+        worker,
+        *,
+        replan_period=0.1,
+        tracking_tolerance=0.03,
+        lookahead=0.1,
+        max_pending_time=1.0,
+        max_adoption_delay=None,
+    ):
         for method in ("submit", "poll", "cancel", "reset"):
             if not callable(getattr(worker, method, None)):
                 raise TypeError("worker must implement submit, poll, cancel and reset")
@@ -109,7 +134,9 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
         and its limits. This method does not clear a latched clock/session fault.
         """
         if self._clock_invalid or self._needs_reset:
-            raise RuntimeError("reset the runtime before seeding after invalidation or clock rollback")
+            raise RuntimeError(
+                "reset the runtime before seeding after invalidation or clock rollback"
+            )
         if self.plan is not None or self.pending:
             raise RuntimeError("reset the runtime before replacing its seed")
         self.limits.check_state(state)
@@ -129,15 +156,21 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
         # Goal changes are handled by update, where they fence pending work.
         # A display boundary may hide expired data but must never run a solver.
         stamp = float(stamp)
-        if self.plan is not None and (not np.isfinite(stamp) or
-                                      stamp < self.plan.stamp or stamp >= self.plan.valid_until):
+        if self.plan is not None and (
+            not np.isfinite(stamp) or stamp < self.plan.stamp or stamp >= self.plan.valid_until
+        ):
             self.invalidate("expired")
 
     def _failure(self, reason, detail, result=None, solve_ms=None, error=None):
         self.invalidate(reason)
-        return ReferenceUpdate(None, None, reason,
-                               QPResult("error", detail=detail) if result is None else result,
-                               solve_ms, error)
+        return ReferenceUpdate(
+            None,
+            None,
+            reason,
+            QPResult("error", detail=detail) if result is None else result,
+            solve_ms,
+            error,
+        )
 
     def _receive(self, control_dt):
         reply = self.planner.poll()
@@ -145,10 +178,14 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
             return
         if not isinstance(reply, PlanningReply) or self._pending is None:
             raise ValueError("unexpected planning reply")
-        token, state, goal, _, reason, nominal_start = self._pending
-        if (reply.token != token or reply.state.stamp != state.stamp or
-                not np.array_equal(reply.state.q, state.q) or
-                not np.array_equal(reply.state.v, state.v) or not np.array_equal(reply.goal, goal)):
+        pending = self._pending
+        if (
+            reply.token != pending.token
+            or reply.state.stamp != pending.state.stamp
+            or not np.array_equal(reply.state.q, pending.state.q)
+            or not np.array_equal(reply.state.v, pending.state.v)
+            or not np.array_equal(reply.goal, pending.goal)
+        ):
             raise ValueError("planning reply differs from the current request")
         outcome = reply.outcome
         if not isinstance(outcome, PlanResult) or not isinstance(outcome.solver, QPResult):
@@ -156,16 +193,54 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
         if not np.isfinite(reply.solve_ms) or reply.solve_ms < 0:
             raise ValueError("invalid worker solve duration")
         if not outcome.solver.success or outcome.plan is None:
-            raise RuntimeError(f"worker planning failed: {outcome.solver.status}: {outcome.solver.detail}")
-        x = array(outcome.solver.x, 1, "worker solution")
-        expected = self.planner.horizon * state.q.size * (2 if "sparse" in self.planner.backend else 1)
-        if x.shape != (expected,):
+            raise RuntimeError(
+                f"worker planning failed: {outcome.solver.status}: {outcome.solver.detail}"
+            )
+        solution = array(outcome.solver.x, 1, "worker solution")
+        expected_solution_size = (
+            self.planner.horizon
+            * pending.state.q.size
+            * (2 if "sparse" in self.planner.backend else 1)
+        )
+        if solution.shape != (expected_solution_size,):
             raise ValueError("worker solution dimensions differ")
-        plan = _validated_joint_plan(outcome.plan, state, self.limits, control_dt)
+        plan = _validated_joint_plan(outcome.plan, pending.state, self.limits, control_dt)
         if plan.dt != self.planner.dt or len(plan.velocities) != self.planner.horizon:
             raise ValueError("worker returned a different planning model")
-        self._future = (plan, reply, reason, nominal_start)
+        self._future = _CompletedPlan(plan, reply, pending.reason, pending.nominal_start)
         self._pending = None
+
+    def _submit_future(self, state, goal, control_dt, reason):
+        """Forecast and submit once; a busy relay leaves the request due for retry."""
+        try:
+            start, previous = _forecast_window(state.stamp, control_dt, self.lookahead)
+        except ValueError as exc:
+            return self._failure("coverage", str(exc))
+        if start + control_dt > self.plan.valid_until:
+            return self._failure(
+                "coverage", "active plan cannot predict the requested future interval"
+            )
+        position, _ = self.plan.sample(start)
+        _, held_velocity = self.plan.sample(previous)
+        predicted_state = RobotState(position, held_velocity, start)
+        try:
+            token = self.planner.submit(predicted_state, goal)
+        except (ValueError, RuntimeError) as exc:
+            return self._failure("worker_error", str(exc))
+        if token is not None:
+            deadline = state.stamp + self.replan_period
+            if not np.isfinite(deadline) or deadline <= state.stamp:
+                return self._failure("coverage", "replan deadline cannot be represented")
+            self._pending = _PendingPlan(
+                token,
+                predicted_state,
+                goal,
+                monotonic(),
+                reason,
+                max(start, previous + control_dt),
+            )
+            self._next_replan = deadline
+        return None
 
     def update(self, state, goal, control_dt):
         self.limits.check_state(state)
@@ -182,7 +257,9 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
         if self.planner.error is not None:
             return self._failure("worker_error", self.planner.error)
         if self.plan is None:
-            return self._failure("unseeded", "asynchronous references require an approved seed after reset")
+            return self._failure(
+                "unseeded", "asynchronous references require an approved seed after reset"
+            )
         changed = not np.array_equal(goal, self._goal)
         if changed:
             self.planner.cancel()
@@ -195,14 +272,17 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
             return self._failure("worker_result", str(exc))
         result = solve_ms = None
         reason = "goal_changed" if changed else "reused"
-        if self._future is not None and state.stamp >= self._future[0].stamp:
-            plan, reply, request_reason, nominal_start = self._future
+        if self._future is not None and state.stamp >= self._future.plan.stamp:
+            completed = self._future
+            plan = completed.plan
             # Use the latest forecast clock convention, rather than the
             # downward-biased plan stamp, for the optional adoption deadline.
             # A stale candidate never extends the active plan's lifetime.
-            rounding = min(8 * ulp(state.stamp), control_dt * .25)
-            late = (self.max_adoption_delay is not None and
-                    state.stamp - nominal_start > self.max_adoption_delay + rounding)
+            rounding = min(8 * ulp(state.stamp), control_dt * 0.25)
+            late = (
+                self.max_adoption_delay is not None
+                and state.stamp - completed.nominal_start > self.max_adoption_delay + rounding
+            )
             if late:
                 self._future = None
                 self._next_replan = state.stamp
@@ -213,44 +293,55 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
                 predicted, _ = plan.sample(state.stamp)
                 error = float(np.max(np.abs(state.q - predicted)))
                 if error > self.tracking_tolerance:
-                    return self._failure("tracking_error", "measured state diverged from the future plan", error=error)
-                self.plan, self._active_goal = plan, reply.goal.copy()
+                    return self._failure(
+                        "tracking_error",
+                        "measured state diverged from the future plan",
+                        error=error,
+                    )
+                self.plan, self._active_goal = plan, completed.reply.goal.copy()
                 self._future = None
-                result, solve_ms, reason = reply.outcome.solver, reply.solve_ms, request_reason
-        if state.stamp < self.plan.stamp or state.stamp >= self.plan.valid_until or state.stamp + control_dt > self.plan.valid_until:
-            return self._failure("coverage", "active plan does not cover the complete control interval")
+                result = completed.reply.outcome.solver
+                solve_ms = completed.reply.solve_ms
+                reason = completed.reason
+        if (
+            state.stamp < self.plan.stamp
+            or state.stamp >= self.plan.valid_until
+            or state.stamp + control_dt > self.plan.valid_until
+        ):
+            return self._failure(
+                "coverage", "active plan does not cover the complete control interval"
+            )
         position, velocity = self.plan.sample(state.stamp)
         error = float(np.max(np.abs(state.q - position)))
         if error > self.tracking_tolerance:
-            return self._failure("tracking_error", "measured state diverged from the active plan", error=error)
-        if self._pending is not None and monotonic() - self._pending[3] > self.max_pending_time:
+            return self._failure(
+                "tracking_error", "measured state diverged from the active plan", error=error
+            )
+        if (
+            self._pending is not None
+            and monotonic() - self._pending.submitted_at > self.max_pending_time
+        ):
             return self._failure("worker_timeout", "planning request exceeded its wall-time budget")
         if not self.pending:
             due = _deadline_reached(state.stamp, self._next_replan, self.plan.stamp, control_dt)
-            coverage = state.stamp + self.lookahead + self.replan_period + control_dt >= self.plan.valid_until
+            coverage = (
+                state.stamp + self.lookahead + self.replan_period + control_dt
+                >= self.plan.valid_until
+            )
             if due or coverage:
-                try:
-                    start, previous = _forecast_window(state.stamp, control_dt, self.lookahead)
-                except ValueError as exc:
-                    return self._failure("coverage", str(exc))
-                if start + control_dt > self.plan.valid_until:
-                    return self._failure("coverage", "active plan cannot predict the requested future interval")
-                q, _ = self.plan.sample(start)
-                _, v = self.plan.sample(previous)
-                predicted = RobotState(q, v, start)
-                try:
-                    token = self.planner.submit(predicted, goal)
-                except (ValueError, RuntimeError) as exc:
-                    return self._failure("worker_error", str(exc))
-                if token is not None:
-                    deadline = state.stamp + self.replan_period
-                    if not np.isfinite(deadline) or deadline <= state.stamp:
-                        return self._failure("coverage", "replan deadline cannot be represented")
-                    request_reason = "goal_changed" if changed else "coverage" if coverage else "periodic"
-                    self._pending = (token, predicted, goal, monotonic(), request_reason,
-                                     max(start, previous + control_dt))
-                    self._next_replan = deadline
+                request_reason = (
+                    "goal_changed" if changed else "coverage" if coverage else "periodic"
+                )
+                failure = self._submit_future(state, goal, control_dt, request_reason)
+                if failure is not None:
+                    return failure
         if result is None and self.pending and not changed and reason != "late_reply":
             reason = "pending"
-        return ReferenceUpdate(array(position, 1, "reference position"),
-                               array(velocity, 1, "reference velocity"), reason, result, solve_ms, error)
+        return ReferenceUpdate(
+            array(position, 1, "reference position"),
+            array(velocity, 1, "reference velocity"),
+            reason,
+            result,
+            solve_ms,
+            error,
+        )

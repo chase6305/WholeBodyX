@@ -32,7 +32,7 @@ class ReferenceUpdate:
     reason: str
     solver: QPResult | None = None
     solve_ms: float | None = None
-    tracking_error: float | None = None  # Max joint error against the previous plan.
+    tracking_error: float | None = None  # Max joint-position error from the latest tracking check.
 
     @property
     def success(self):

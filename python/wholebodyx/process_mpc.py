@@ -41,25 +41,44 @@ def _child_main(connection, backend, settings):
             factory = JointMPC
         elif backend == "sparse":
             from .sparse_mpc import SparseJointMPC
+
             factory = SparseJointMPC
         else:
             from .native import NativeMPC, NativeSparseMPC
+
             factory = NativeMPC if backend == "native" else NativeSparseMPC
-        planner = factory(settings.limits, horizon=settings.horizon, dt=settings.dt,
-                          tracking_weight=settings.tracking_weight,
-                          control_weight=settings.control_weight,
-                          terminal_weight=settings.terminal_weight)
+        planner = factory(
+            settings.limits,
+            horizon=settings.horizon,
+            dt=settings.dt,
+            tracking_weight=settings.tracking_weight,
+            control_weight=settings.control_weight,
+            terminal_weight=settings.terminal_weight,
+        )
         package = Path(__file__).resolve().parent
         import osqp
         import scipy
-        info = dict(backend=backend, package=str(package), python=sys.version.split()[0],
-                    numpy=np.__version__, scipy=scipy.__version__, osqp=osqp.__version__, source_sha256={
-            str(p.relative_to(package)): hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in package.rglob("*.py")})
+
+        info = dict(
+            backend=backend,
+            package=str(package),
+            python=sys.version.split()[0],
+            numpy=np.__version__,
+            scipy=scipy.__version__,
+            osqp=osqp.__version__,
+            source_sha256={
+                str(p.relative_to(package)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in package.rglob("*.py")
+            },
+        )
         if backend.startswith("native"):
             import wholebodyx_native
+
             binary = Path(wholebodyx_native.__file__).resolve()
-            info.update(native_file=str(binary), native_sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
+            info.update(
+                native_file=str(binary),
+                native_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+            )
         connection.send(("ready", info))
         generation = None
         while True:
@@ -97,12 +116,22 @@ class ProcessMPCWorker:
     immediately fences all older generations without waiting for child work.
     """
 
-    def __init__(self, limits, *, backend="sparse", horizon=30, dt=.02,
-                 tracking_weight=10., control_weight=.1, terminal_weight=30.):
+    def __init__(
+        self,
+        limits,
+        *,
+        backend="sparse",
+        horizon=30,
+        dt=0.02,
+        tracking_weight=10.0,
+        control_weight=0.1,
+        terminal_weight=30.0,
+    ):
         if backend not in ("python", "native", "sparse", "native-sparse"):
             raise ValueError("process planner requires a built-in joint MPC backend")
-        self._settings = _MPCSettings(limits, horizon, dt, tracking_weight,
-                                      control_weight, terminal_weight)
+        self._settings = _MPCSettings(
+            limits, horizon, dt, tracking_weight, control_weight, terminal_weight
+        )
         self._backend = backend
         self._generation = self._sequence = 0
         self._latest = self._outbox = self._reply = None
@@ -112,12 +141,14 @@ class ProcessMPCWorker:
         self._info = None
         self._lock = Lock()
         self._stop, self._ready = Event(), Event()
-        self._counts = dict(submitted=0, coalesced=0, completed=0, discarded=0,
-                            max_solve_ms=0., mean_solve_ms=0.)
+        self._counts = dict(
+            submitted=0, coalesced=0, completed=0, discarded=0, max_solve_ms=0.0, mean_solve_ms=0.0
+        )
         context = mp.get_context("spawn")
         self._connection, child = context.Pipe()
-        self._process = context.Process(target=_child_main,
-                                        args=(child, backend, self._settings), daemon=True)
+        self._process = context.Process(
+            target=_child_main, args=(child, backend, self._settings), daemon=True
+        )
         try:
             self._process.start()
         except BaseException:
@@ -132,10 +163,10 @@ class ProcessMPCWorker:
         except BaseException:
             self._closed = True
             self._process.terminate()
-            self._process.join(1.)
+            self._process.join(1.0)
             if self._process.is_alive():
                 self._process.kill()
-                self._process.join(1.)
+                self._process.join(1.0)
             self._connection.close()
             if not self._process.is_alive():
                 self._process.close()
@@ -144,8 +175,9 @@ class ProcessMPCWorker:
     @property
     def limits(self):
         from .types import JointLimits
-        s = self._settings.limits
-        return JointLimits(s.lower, s.upper, s.velocity, s.acceleration)
+
+        limits = self._settings.limits
+        return JointLimits(limits.lower, limits.upper, limits.velocity, limits.acceleration)
 
     horizon = property(lambda self: self._settings.horizon)
     backend = property(lambda self: self._backend)
@@ -163,10 +195,15 @@ class ProcessMPCWorker:
     @property
     def statistics(self):
         # Advisory counters; reading them never waits for the relay lock.
-        return {**self._counts, "generation": self._generation, "pid": self._pid,
-                "ready": self.ready, "closed": self._closed}
+        return {
+            **self._counts,
+            "generation": self._generation,
+            "pid": self._pid,
+            "ready": self.ready,
+            "closed": self._closed,
+        }
 
-    def wait_ready(self, timeout=10.):
+    def wait_ready(self, timeout=10.0):
         """Startup barrier for use before starting the control cycle."""
         if self.error is not None:
             raise RuntimeError(self.error)
@@ -211,7 +248,11 @@ class ProcessMPCWorker:
             return None
         try:
             reply, self._reply = self._reply, None
-            if reply is not None and reply.token == self._latest and reply.token.generation == self._generation:
+            if (
+                reply is not None
+                and reply.token == self._latest
+                and reply.token.generation == self._generation
+            ):
                 return reply
             return None
         finally:
@@ -237,8 +278,14 @@ class ProcessMPCWorker:
             raise ValueError("worker returned an invalid planning result")
         result = outcome.solver
         if not result.success:
-            return PlanResult(QPResult(result.status, iterations=result.iterations,
-                                       violation=result.violation, detail=result.detail))
+            return PlanResult(
+                QPResult(
+                    result.status,
+                    iterations=result.iterations,
+                    violation=result.violation,
+                    detail=result.detail,
+                )
+            )
         size = self.horizon * state.q.size * (2 if "sparse" in self.backend else 1)
         x = _snapshot(result.x, 1, "worker solution")
         if x.shape != (size,) or outcome.plan is None:
@@ -246,14 +293,15 @@ class ProcessMPCWorker:
         plan = _validated_joint_plan(outcome.plan, state, self._settings.limits, self.dt)
         if plan.velocities.shape != (self.horizon, state.q.size) or plan.dt != self.dt:
             raise ValueError("worker returned a different planning model")
-        return PlanResult(QPResult("solved", x, result.iterations,
-                                  result.violation, result.detail), plan)
+        return PlanResult(
+            QPResult("solved", x, result.iterations, result.violation, result.detail), plan
+        )
 
     def _relay_main(self):
         sent = None
         try:
             while not self._stop.is_set():
-                if self._connection.poll(.001):
+                if self._connection.poll(0.001):
                     message = self._connection.recv()
                     if not isinstance(message, tuple) or not message:
                         raise ValueError("invalid planner worker message")
@@ -270,11 +318,17 @@ class ProcessMPCWorker:
                         solve_ms = float(solve_ms)
                         if not np.isfinite(solve_ms) or solve_ms < 0:
                             raise ValueError("invalid planner worker duration")
-                        reply = PlanningReply(token, state, goal, self._snapshot(outcome, state), solve_ms)
+                        reply = PlanningReply(
+                            token, state, goal, self._snapshot(outcome, state), solve_ms
+                        )
                         with self._lock:
                             self._counts["completed"] += 1
-                            self._counts["max_solve_ms"] = max(self._counts["max_solve_ms"], solve_ms)
-                            self._counts["mean_solve_ms"] += (solve_ms - self._counts["mean_solve_ms"]) / self._counts["completed"]
+                            self._counts["max_solve_ms"] = max(
+                                self._counts["max_solve_ms"], solve_ms
+                            )
+                            self._counts["mean_solve_ms"] += (
+                                solve_ms - self._counts["mean_solve_ms"]
+                            ) / self._counts["completed"]
                             if token == self._latest and token.generation == self._generation:
                                 self._reply = reply
                             else:
@@ -288,7 +342,9 @@ class ProcessMPCWorker:
                     if request is not None:
                         token, state, goal = request
                         if token == self._latest and token.generation == self._generation:
-                            self._connection.send(("solve", token, state.q, state.v, state.stamp, goal))
+                            self._connection.send(
+                                ("solve", token, state.q, state.v, state.stamp, goal)
+                            )
                             sent = request
                 if not self._process.is_alive():
                     raise RuntimeError("planner worker exited unexpectedly")
@@ -297,7 +353,7 @@ class ProcessMPCWorker:
                 self._error = f"{type(exc).__name__}: {exc}"[:1000]
                 self._ready.set()
 
-    def close(self, timeout=1.):
+    def close(self, timeout=1.0):
         """Teardown outside the cycle; at most three timeout waits, idempotent."""
         timeout = positive(timeout, "close timeout")
         if self._shutdown_complete:
@@ -314,7 +370,9 @@ class ProcessMPCWorker:
             self._process.join(timeout)
         self._relay.join(timeout)
         if self._process.is_alive() or self._relay.is_alive():
-            raise RuntimeError("planner worker or relay did not stop within close timeouts; retry close")
+            raise RuntimeError(
+                "planner worker or relay did not stop within close timeouts; retry close"
+            )
         self._connection.close()
         self._process.close()
         self._shutdown_complete = True
