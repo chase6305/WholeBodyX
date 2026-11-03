@@ -94,8 +94,8 @@ PYTHONPATH=build/native uv run --extra viz python -m wholebodyx.visualization \
 
 MPC 菜单和上述命令也接受 `--mpc-backend sparse` 与 `--mpc-backend native-sparse`。
 后者使用新 C++ 稀疏规划器，需要重建原生扩展；WBC 后端仍单独选择。
-不同预测规模的测量、数值验收和并发限制见
-[2026-10-22 优化记录](../docs/optimization_20261022.md)。
+不同预测规模的测量见 [性能说明](../docs/performance.md)，
+数值验收和并发限制见 [验证方法](../docs/validation.md) 与 [执行接口](../docs/execution.md)。
 
 ## 算法配方
 
