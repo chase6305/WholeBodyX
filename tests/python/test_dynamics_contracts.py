@@ -24,6 +24,20 @@ def test_named_terms_are_independent_snapshots_with_tuple_compatibility(robot_st
     np.testing.assert_array_equal(terms.mass, original)
 
 
+@pytest.mark.parametrize("field", ["mass", "contact_jacobian"])
+def test_forward_dynamics_rejects_broadcastable_model_terms(robot_state, field, monkeypatch):
+    robot, state = robot_state
+    terms = robot.terms(state)
+    malformed = terms._replace(**{field: getattr(terms, field)[:, :1]})
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("malformed model terms must not reach the linear solver")
+
+    monkeypatch.setattr(np.linalg, "lstsq", forbidden)
+    with pytest.raises(ValueError, match="dynamics term dimensions"):
+        robot.forward(state, np.zeros(robot.na), np.zeros(len(terms.contact_jacobian)), malformed)
+
+
 def test_formulation_does_not_advance_solver_and_owns_its_qp(robot_state):
     robot, state = robot_state
     controller = ContactWBC(robot, state)

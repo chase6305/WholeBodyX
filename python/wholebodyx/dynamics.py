@@ -120,6 +120,9 @@ class FloatingBaseDynamics:
         mass, bias, contact_jacobian = terms[:3]
         contact_acceleration = np.asarray(contact_acceleration, dtype=float)
         nc = len(contact_jacobian)
+        # Block assignment must not broadcast malformed model terms.
+        if np.shape(mass) != (self.nv, self.nv) or np.shape(contact_jacobian) != (nc, self.nv):
+            raise ValueError("dynamics term dimensions do not match the model")
         if contact_acceleration.shape != (nc,) or not np.isfinite(contact_acceleration).all():
             raise ValueError("invalid contact acceleration")
         external_force = (
@@ -172,7 +175,11 @@ class FloatingBaseDynamics:
 
 
 class ContactWBC:
-    """Acceleration/torque/local-sole-wrench QP for prescribed contacts."""
+    """QP for prescribed contacts in physical coordinates.
+
+    The decision order is generalized acceleration, actuator torque, then local
+    sole wrenches. Each contact contributes six [force; moment] coordinates.
+    """
 
     def __init__(self, dynamics, initial, friction=0.6):
         if not np.isfinite(friction) or friction <= 0:

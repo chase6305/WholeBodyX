@@ -36,10 +36,12 @@ struct CscStorage {
     column_offsets.reserve(input.cols() + 1);
     column_offsets.push_back(0);
     for (Eigen::Index column = 0; column < input.cols(); ++column) {
-      for (Eigen::Index row = 0; row < input.rows(); ++row) {
-        if ((!upper_triangle || row <= column) && input(row, column) != 0) {
+      const auto row_count = upper_triangle ? std::min(input.rows(), column + 1) : input.rows();
+      for (Eigen::Index row = 0; row < row_count; ++row) {
+        const double value = input(row, column);
+        if (value != 0) {
           row_indices.push_back(row);
-          values.push_back(input(row, column));
+          values.push_back(value);
         }
       }
       column_offsets.push_back(values.size());

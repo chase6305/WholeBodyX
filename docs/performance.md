@@ -72,4 +72,7 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONPATH=build/native \
 
 `benchmark_process_mpc.py` 比较同步规划周期与进程父周期；`benchmark_wbc_hessian_cache.py`
 对照固定和变化任务的可选缓存。具体参数以各入口 `--help` 为准。
+版本对照中，`compare_python_mpc.py --backend sparse` 与
+`compare_native_mpc.py --backend native-sparse` 分别选择稀疏实现；默认仍为消元 MPC。
+两者在计时外独立复核导出计划的位置、速度和速度差约束。
 耐久与故障恢复的验收方法见 [验证说明](validation.md)，运行边界见 [执行接口](execution.md)。

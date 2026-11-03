@@ -6,7 +6,7 @@ use the model tangent order. Contact wrenches are local [force; moment].
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from math import ulp
+from math import isfinite, ulp
 from typing import ClassVar, NamedTuple, Protocol
 
 import numpy as np
@@ -37,7 +37,7 @@ class ContactFormulation(NamedTuple):
 
 def _window(stamp, valid_until):
     stamp, valid_until = float(stamp), float(valid_until)
-    if (not np.isfinite([stamp, valid_until]).all() or stamp < 0
+    if (not isfinite(stamp) or not isfinite(valid_until) or stamp < 0
             or valid_until <= stamp):
         raise ValueError("invalid dynamics validity interval")
     return stamp, valid_until
@@ -46,7 +46,7 @@ def _window(stamp, valid_until):
 def _covers(start, valid_until, stamp, dt):
     stamp, dt = float(stamp), float(dt)
     end = stamp + dt
-    return (start == stamp and np.isfinite(end) and end > stamp
+    return (start == stamp and isfinite(end) and end > stamp
             and end - valid_until <= min(4 * max(ulp(end), ulp(valid_until)), 1e-6 * dt))
 
 
