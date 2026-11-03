@@ -49,7 +49,12 @@ class JointOrder:
         values = np.asarray(values, dtype=float)
         if values.ndim not in (1, 2) or values.shape[-1] != len(indices):
             raise ValueError("expected a joint vector or matrix with joints along its last axis")
-        return array(np.take(values, indices, axis=-1), values.ndim, "joint values")
+        # np.take already gives the mapped values an independent buffer.
+        mapped = np.take(values, indices, axis=-1)
+        if not np.isfinite(mapped).all():
+            raise ValueError(f"joint values must be a finite {values.ndim}-D array")
+        mapped.setflags(write=False)
+        return mapped
 
     def to_backend(self, values):
         """Map a model-order vector or joint columns to backend order; returns a copy."""
