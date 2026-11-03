@@ -1,6 +1,7 @@
 #include "wholebodyx/control.hpp"
 
 #include <Eigen/Eigenvalues>
+#include <Eigen/Cholesky>
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -12,6 +13,17 @@ void require(bool condition, const char* message) {
   if (!condition) throw std::invalid_argument(message);
 }
 void positive(double value, const char* name) { require(std::isfinite(value) && value > 0, name); }
+double braking_speed(double distance, double acceleration, double dt) {
+  if (acceleration * dt == 0) return 0;
+  // Evaluate in extended precision so finite double inputs do not overflow
+  // while finding the number of positive, slew-limited braking intervals.
+  const long double travel = std::max(0.0, distance);
+  const long double change = static_cast<long double>(acceleration) * dt;
+  const long double root = std::sqrt(2.L * travel / acceleration) / dt;
+  const long double count = std::max(1.L, std::ceil(std::hypot(.5L, root) - .5L));
+  const long double speed = (travel / count) / dt + .5L * (count - 1) * change;
+  return static_cast<double>(std::min(speed, travel / dt));
+}
 double ulp(double value) {
   const double next = std::nextafter(value, INFINITY);
   return std::isfinite(next) ? next - value : value - std::nextafter(value, -INFINITY);
@@ -54,6 +66,14 @@ std::pair<Vector, Vector> JointLimits::velocity_bounds(const RobotState& state, 
   if (acceleration.size()) {
     lo = lo.cwiseMax(state.v - acceleration * dt);
     hi = hi.cwiseMin(state.v + acceleration * dt);
+    for (Eigen::Index i = 0; i < lo.size(); ++i) {
+      lo[i] = std::max(lo[i], -braking_speed(state.q[i] - lower[i], acceleration[i], dt));
+      hi[i] = std::min(hi[i], braking_speed(upper[i] - state.q[i], acceleration[i], dt));
+      const double scale = std::max({std::abs(lower[i]), std::abs(upper[i]), std::abs(state.q[i])});
+      if (std::isfinite(lo[i]) && std::isfinite(hi[i]) && lo[i] > hi[i] &&
+          lo[i] - hi[i] <= 16 * std::numeric_limits<double>::epsilon() * scale / dt)
+        lo[i] = hi[i] = .5 * lo[i] + .5 * hi[i];
+    }
   }
   return {lo, hi};
 }
@@ -75,6 +95,8 @@ void QuadraticProgram::validate_against(const Matrix* previous) const {
   require((hessian - hessian.transpose()).cwiseAbs().maxCoeff() <= 1e-10, "nonsymmetric Hessian");
   if (previous && previous->rows() == n && previous->cols() == n && (previous->array() == hessian.array()).all())
     return;  // Exact values only: caller mutation always triggers convexity validation.
+  Eigen::LLT<Matrix> cholesky(hessian);
+  if (cholesky.info() == Eigen::Success) return;
   Eigen::SelfAdjointEigenSolver<Matrix> eig(hessian, Eigen::EigenvaluesOnly);
   require(eig.info() == Eigen::Success && eig.eigenvalues().minCoeff() >= -1e-10, "nonconvex QP");
 }
@@ -101,8 +123,16 @@ QuadraticProgram KinematicWBC::formulate(const RobotState& state, const std::vec
   return {h, g, Matrix::Identity(n, n), bounds.first, bounds.second};
 }
 ControlResult KinematicWBC::step(const RobotState& state, const std::vector<LinearTask>& tasks, double dt) {
-  auto result = solver_->solve(formulate(state, tasks, dt));
+  const auto problem = formulate(state, tasks, dt);
+  auto result = solver_->solve(problem);
   if (!result.success()) return {result, std::nullopt};
+  if (result.x.size() != state.q.size() || !result.x.allFinite())
+    return {{"error", {}, result.iterations, INFINITY, "invalid WBC solution"}, std::nullopt};
+  const Vector velocity = result.x.cwiseMax(problem.lower).cwiseMin(problem.upper);
+  const double correction = (velocity - result.x).cwiseAbs().maxCoeff();
+  if (correction > 1e-6)
+    return {{"error", {}, result.iterations, correction, "WBC solution exceeds velocity bounds"}, std::nullopt};
+  if (correction > 0) { result.x = velocity; result.violation = 0; }
   return {result, VelocityCommand{result.x, state.stamp, state.stamp + dt}};
 }
 

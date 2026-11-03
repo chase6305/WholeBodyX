@@ -1,0 +1,52 @@
+name: checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  OPENBLAS_NUM_THREADS: "1"
+  OMP_NUM_THREADS: "1"
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-suffix: python-${{ matrix.python }}
+      - run: uv sync --locked
+      - run: uv run --locked pytest -q
+      - run: uv build --python .venv/bin/python
+
+  native-and-urdf:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: "3.11"
+          enable-cache: true
+          cache-suffix: native-urdf
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y gcc-12 g++-12 cmake
+      - run: uv sync --locked --all-extras
+      - run: uv run --locked --all-extras --with conan==2.31.2 bash scripts/build.sh --python
+      - run: uv run --locked --all-extras pytest -q
+        env:
+          WBX_REQUIRE_NATIVE: "1"
+          PYTHONPATH: ${{ github.workspace }}/build/native
+      - run: uv run --locked --all-extras --with conan==2.31.2 conan create . -pr:h profiles/linux-gcc12-release -pr:b profiles/linux-gcc12-release --lockfile=conan.lock

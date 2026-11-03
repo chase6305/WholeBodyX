@@ -1,11 +1,36 @@
 import numpy as np
 import pytest
 
-from wholebodyx import JointLimits, JointPlan, LinearTask, OSQPSolver, QuadraticProgram, RobotState
+from wholebodyx import JointLimits, JointPlan, LinearTask, OSQPSolver, QuadraticProgram, RobotState, VelocityCommand
 
 
 def limits(n=2, acceleration=None):
     return JointLimits(np.full(n, -2.0), np.full(n, 2.0), np.ones(n), acceleration)
+
+
+def test_command_mixed_precision_clock_is_validated_after_conversion():
+    start = np.float32(1e8)
+    command = VelocityCommand([0.], start, float(start) + .1)
+    assert type(command.stamp) is float and type(command.valid_until) is float
+    assert command.valid_until > command.stamp
+    with pytest.raises(ValueError):
+        VelocityCommand([0.], start, start)
+
+
+@pytest.mark.skipif(np.finfo(np.longdouble).max <= np.finfo(float).max,
+                    reason="requires a wider floating-point input type")
+@pytest.mark.parametrize("value", ["1e400", "1e-400"])
+def test_regularization_must_remain_positive_and_finite_after_conversion(backend, value):
+    with pytest.raises(ValueError, match="regularization"):
+        backend[0](limits(), regularization=np.longdouble(value))
+
+
+@pytest.mark.skipif(np.finfo(np.longdouble).max <= np.finfo(float).max,
+                    reason="requires a wider floating-point input type")
+@pytest.mark.parametrize("stamp", ["1e400", "-1e-400"])
+def test_robot_state_rejects_unrepresentable_or_negative_extended_clock(stamp):
+    with pytest.raises(ValueError, match="stamp"):
+        RobotState([0.], [0.], np.longdouble(stamp))
 
 
 def test_coupled_qp_is_not_post_clipped(backend):
@@ -39,16 +64,90 @@ def test_velocity_bounds_match_independent_intersection_and_own_buffers(accelera
             if acceleration is not None:
                 lower.append(state.v[k] - acceleration[k] * dt)
                 upper.append(state.v[k] + acceleration[k] * dt)
+                # Independent rollout + bisection oracle, without the closed
+                # form used by JointLimits.velocity_bounds().
+                changes = np.arange(int(np.ceil(bounds.velocity[k] / (acceleration[k] * dt)))) * acceleration[k] * dt
+                for distance, target in ((state.q[k] - bounds.lower[k], lower),
+                                         (bounds.upper[k] - state.q[k], upper)):
+                    left, right = 0., bounds.velocity[k]
+                    for _ in range(55):
+                        speed = (left + right) / 2
+                        travel = dt * np.maximum(speed - changes, 0).sum()
+                        if travel <= max(0., distance):
+                            left = speed
+                        else:
+                            right = speed
+                    target.append(-left if target is lower else left)
             expected_lo.append(max(lower))
             expected_hi.append(min(upper))
         lo, hi = bounds.velocity_bounds(state, dt)
-        np.testing.assert_array_equal(lo, expected_lo)
-        np.testing.assert_array_equal(hi, expected_hi)
+        np.testing.assert_allclose(lo, expected_lo, atol=1e-12, rtol=0)
+        np.testing.assert_allclose(hi, expected_hi, atol=1e-12, rtol=0)
         lo[:] = 99
         hi[:] = -99
         again = bounds.velocity_bounds(state, dt)
-        np.testing.assert_array_equal(again[0], expected_lo)
-        np.testing.assert_array_equal(again[1], expected_hi)
+        np.testing.assert_allclose(again[0], expected_lo, atol=1e-12, rtol=0)
+        np.testing.assert_allclose(again[1], expected_hi, atol=1e-12, rtol=0)
+
+
+@pytest.mark.parametrize("direction", [-1., 1.])
+def test_wbc_brakes_before_joint_limit_without_losing_next_step_feasibility(backend, direction):
+    bounds = JointLimits([-1.], [1.], [1.], [1.])
+    controller = backend[0](bounds)
+    state = RobotState([direction * .96], [direction * .3])
+    for _ in range(30):
+        result = controller.step(state, [LinearTask([[1.]], [direction * .4])], .1)
+        assert result.solver.success
+        state = RobotState(state.q + .1 * result.command.velocity, result.command.velocity, state.stamp + .1)
+        assert abs(state.q[0]) <= 1 + 1e-7
+        lo, hi = bounds.velocity_bounds(state, .1)
+        assert lo[0] <= hi[0] + 1e-7
+    assert abs(state.q[0]) == pytest.approx(1., abs=1e-6)
+
+
+def test_braking_bounds_remain_finite_for_extreme_time_and_acceleration_scales():
+    for acceleration, dt in ((1e-300, 1e-100), (1e300, 1e300), (1e300, 1.), (1e-300, 1.)):
+        bounds = JointLimits([-1.], [1.], [1.], [acceleration])
+        with np.errstate(over="ignore", under="ignore"):
+            lo, hi = bounds.velocity_bounds(RobotState([0.], [0.]), dt)
+        assert np.isfinite(lo).all() and np.isfinite(hi).all()
+        assert lo[0] <= 0 <= hi[0]
+
+
+@pytest.mark.parametrize("direction", [-1., 1.])
+def test_solver_feasibility_residual_does_not_accumulate_into_braking_failure(direction):
+    from wholebodyx import KinematicWBC, QPResult
+
+    class ResidualSolver(OSQPSolver):
+        def solve(self, problem, warm_start=None):
+            result = super().solve(problem, warm_start)
+            if result.success:
+                return QPResult("solved", result.x + direction * 5e-7,
+                                result.iterations, 5e-7, "injected feasibility residual")
+            return result
+
+    bounds = JointLimits([-1.], [1.], [1.], [1.])
+    controller = KinematicWBC(bounds, solver=ResidualSolver())
+    state = RobotState([direction * .96], [direction * .3])
+    for _ in range(30):
+        result = controller.step(state, [LinearTask([[1.]], [direction * .4])], .1)
+        assert result.command is not None
+        np.testing.assert_array_equal(result.solver.x, result.command.velocity)
+        state = RobotState(state.q + .1 * result.command.velocity, result.command.velocity, state.stamp + .1)
+        assert abs(state.q[0]) <= 1 + 1e-12
+
+
+@pytest.mark.parametrize("solution", [[np.nan], [0, 0], [100.]])
+def test_wbc_rejects_invalid_injected_solver_solutions(solution):
+    from types import SimpleNamespace
+    from wholebodyx import KinematicWBC, QPResult
+
+    solver = SimpleNamespace(solve=lambda problem: QPResult("solved", np.array(solution), iterations=7, violation=0))
+    result = KinematicWBC(limits(1), solver=solver).step(RobotState([0], [0]), [], .1)
+    assert result.solver.status == "error" and result.command is None and result.solver.x is None
+    assert result.solver.iterations == 7
+    if solution == [100.]:
+        assert result.solver.violation == 99.
 
 
 def test_failure_has_no_command_and_solver_recovers(backend):
@@ -66,6 +165,16 @@ def test_failure_has_no_command_and_solver_recovers(backend):
 def test_invalid_dt(backend, dt):
     with pytest.raises(ValueError):
         backend[0](limits()).step(RobotState([0, 0], [0, 0]), [], dt)
+
+
+def test_numpy_float32_clock_and_dt_keep_double_precision_command_time(backend):
+    state = RobotState([0, 0], [0, 0], np.float32(1e8))
+    dt = np.float32(.005)
+    result = backend[0](limits()).step(state, [], dt)
+    assert isinstance(state.stamp, float)
+    assert result.command is not None
+    assert result.command.valid_until == state.stamp + float(dt)
+    assert result.command.valid_until > state.stamp
 
 
 def test_invalid_task_dimension(backend):

@@ -30,7 +30,7 @@ class JointIntegrator:
         self._state = candidate
 
     def write(self, command, dt):
-        positive(dt, "simulation dt")
+        dt = positive(dt, "simulation dt")
         state = self._state
         if command.mode != "velocity" or command.velocity.shape != state.q.shape:
             raise ValueError("command mode or dimensions do not match backend")

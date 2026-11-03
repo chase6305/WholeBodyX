@@ -139,6 +139,16 @@ def test_backend_rejects_stale_and_invalid_commands():
     np.testing.assert_array_equal(plant.read().q, np.zeros(6))
 
 
+def test_integrator_keeps_time_progress_with_numpy_period_at_large_clock():
+    model = PlanarDualArm()
+    state = RobotState(np.zeros(6), np.zeros(6), np.float32(1e8))
+    plant = JointIntegrator(model.limits, state)
+    dt = np.float32(.005)
+    plant.write(VelocityCommand(np.zeros(6), state.stamp, state.stamp + float(dt)), dt)
+    assert plant.read().stamp == state.stamp + float(dt)
+    assert plant.read().stamp > state.stamp
+
+
 def test_urdf_jacobian_result_isolated_from_workspace_and_borrowed_views(monkeypatch):
     pytest.importorskip("pinocchio")
     path = Path(__file__).resolve().parents[2] / "examples/models/planar_arm.urdf"

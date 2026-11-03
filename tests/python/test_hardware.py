@@ -70,6 +70,17 @@ def test_gate_rejects_out_of_range_sensor_values_before_command():
             CommandGate(limits(), .02).observe(state)
 
 
+@pytest.mark.parametrize("component", ["q", "v"])
+def test_gate_binds_command_to_observed_values_not_only_timestamp(component):
+    gate = CommandGate(limits(), .02)
+    state = RobotState([0, 0], [0, 0], 1.)
+    gate.observe(state)
+    getattr(state, component).setflags(write=True)
+    getattr(state, component)[0] = .1
+    with pytest.raises(ValueError, match="differs from the latest observed state"):
+        gate.validate(state, VelocityCommand([0, 0], 1., 1.02))
+
+
 def test_loop_executes_serial_cycles_with_real_wbc():
     backend = MockBackend(RobotState([0, 0], [0, 0]))
     loop = VelocityControlLoop(backend, limits(), KinematicWBC(limits()), .02)
@@ -77,6 +88,74 @@ def test_loop_executes_serial_cycles_with_real_wbc():
     assert backend.writes == 10 and backend.stops == 0 and backend.state.stamp == pytest.approx(.2)
     assert all(result.command is not None and result.control_ms >= 0 for result in results)
     assert results[-1].command.stamp == pytest.approx(.18)
+    assert all(result.cycle_ms >= result.control_ms for result in results)
+
+
+def test_numpy_period_and_large_state_clock_work_through_driver_gate():
+    dt = np.float32(.005)
+    backend = MockBackend(RobotState([0, 0], [0, 0], np.float32(1e8)), dt=float(dt))
+    loop = VelocityControlLoop(backend, limits(), KinematicWBC(limits()), dt)
+    assert isinstance(loop.control_dt, float)
+    assert loop.step(tasks).command is not None
+    assert backend.state.stamp == 1e8 + float(dt)
+
+
+@pytest.mark.parametrize("stage", ["read", "task", "control", "write"])
+def test_execution_deadline_covers_each_stage_and_latches_fault(monkeypatch, stage):
+    import wholebodyx.hardware as hardware
+
+    now = [0.]
+    monkeypatch.setattr(hardware, "perf_counter", lambda: now[0])
+    backend = MockBackend(RobotState([0, 0], [0, 0], 3))
+    controller = SimpleNamespace(reset=lambda: None,
+                                 step=lambda *args: solved(np.zeros(2), 3, 3.02))
+    factory = tasks
+    owner, name = ((backend, "read") if stage == "read" else
+                   (controller, "step") if stage == "control" else (backend, "write"))
+    if stage == "task":
+        def factory(state):
+            now[0] += .03
+            return tasks(state)
+    else:
+        original = getattr(owner, name)
+        def delayed(*args):
+            now[0] += .03
+            return original(*args)
+        setattr(owner, name, delayed)
+    loop = VelocityControlLoop(backend, limits(), controller, .02, max_cycle_time=.01)
+    with pytest.raises(RuntimeError, match="execution deadline"):
+        loop.step(factory)
+    assert backend.writes == (1 if stage == "write" else 0)
+    assert backend.stops == 1 and loop.fault
+    with pytest.raises(RuntimeError, match="faulted"):
+        loop.step(tasks)
+    assert backend.stops == 1
+
+
+def test_execution_budget_cannot_extend_command_validity_and_reset_recovers(monkeypatch):
+    import wholebodyx.hardware as hardware
+
+    now = [0.]
+    monkeypatch.setattr(hardware, "perf_counter", lambda: now[0])
+    backend = MockBackend(RobotState([0, 0], [0, 0], 3))
+    def step(*args):
+        now[0] += .03
+        return solved(np.zeros(2), 3, 3.02)
+    controller = SimpleNamespace(reset=lambda: None, step=step)
+    loop = VelocityControlLoop(backend, limits(), controller, .02, max_cycle_time=1.)
+    with pytest.raises(RuntimeError, match="execution deadline"):
+        loop.step(tasks)
+    assert backend.writes == 0
+    loop.reset()
+    controller.step = lambda *args: solved(np.zeros(2), 3, 3.02)
+    assert loop.step(tasks).cycle_ms == 0
+
+
+@pytest.mark.parametrize("budget", [0, -1., np.nan, np.inf])
+def test_execution_budget_rejects_invalid_values(budget):
+    with pytest.raises(ValueError, match="max cycle time"):
+        VelocityControlLoop(MockBackend(RobotState([0, 0], [0, 0])), limits(),
+                            KinematicWBC(limits()), .02, max_cycle_time=budget)
 
 
 @pytest.mark.parametrize("kind", ["solver", "command_stamp", "command_coverage", "command_limit", "write", "task", "state"])
@@ -112,6 +191,23 @@ def test_stop_failure_keeps_original_fault_and_prevents_retry():
     assert "WBC rejected command" in loop.fault and backend.stops == 1
 
 
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_cancellation_stops_once_and_preserves_interrupt(stop_fails):
+    backend = MockBackend(RobotState([0, 0], [0, 0]))
+    backend.fail_stop = stop_fails
+    loop = VelocityControlLoop(backend, limits(), KinematicWBC(limits()), .02)
+    interruption = KeyboardInterrupt()
+    def interrupt(state):
+        raise interruption
+    with pytest.raises(KeyboardInterrupt) as caught:
+        loop.step(interrupt)
+    assert caught.value is interruption
+    assert backend.writes == 0 and backend.stops == 1 and loop.fault == "KeyboardInterrupt"
+    with pytest.raises(RuntimeError, match="faulted"):
+        loop.step(tasks)
+    assert backend.stops == 1
+
+
 def test_reset_forwards_and_allows_only_a_fresh_state_after_recovery():
     backend = MockBackend(RobotState([0, 0], [0, 0], 3))
     resets = []
@@ -122,6 +218,67 @@ def test_reset_forwards_and_allows_only_a_fresh_state_after_recovery():
     controller.step = lambda *args: solved(np.zeros(2), 3, 3.02)
     loop.reset()
     assert loop.step(tasks).command is not None and resets == [1]
+
+
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_failed_controller_reset_stops_driver_and_blocks_further_io(stop_fails):
+    backend = MockBackend(RobotState([0, 0], [0, 0], 3))
+    def fail_reset():
+        raise RuntimeError("controller reset failed")
+    controller = SimpleNamespace(reset=fail_reset, step=lambda *args: solved(np.zeros(2), 3, 3.02))
+    loop = VelocityControlLoop(backend, limits(), controller, .02)
+    assert loop.step(tasks).command is not None
+    backend.fail_stop = stop_fails
+    with pytest.raises(RuntimeError, match="controller reset failed"):
+        loop.reset()
+    assert backend.stops == 1 and loop.fault
+    with pytest.raises(RuntimeError, match="faulted"):
+        loop.step(tasks)
+    assert backend.reads == backend.writes == 1 and backend.stops == 1
+    backend.fail_stop = False
+    controller.reset = lambda: None
+    controller.step = lambda *args: solved(np.zeros(2), 3.02, 3.04)
+    loop.reset()
+    assert loop.fault is None and loop.step(tasks).command is not None
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_cancelled_controller_reset_stops_and_preserves_interrupt(interrupt_type, stop_fails):
+    backend = MockBackend(RobotState([0, 0], [0, 0]))
+    backend.fail_stop = stop_fails
+    interruption = interrupt_type()
+    def interrupt():
+        raise interruption
+    controller = SimpleNamespace(reset=interrupt, step=lambda *args: pytest.fail("faulted loop solved again"))
+    loop = VelocityControlLoop(backend, limits(), controller, .02)
+    with pytest.raises(interrupt_type) as caught:
+        loop.reset()
+    assert caught.value is interruption
+    assert loop.fault == interrupt_type.__name__ and backend.stops == 1
+    with pytest.raises(RuntimeError, match="faulted"):
+        loop.step(tasks)
+    assert backend.reads == backend.writes == 0 and backend.stops == 1
+
+
+@pytest.mark.parametrize("operation", ["cycle", "reset"])
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("stop_type", [KeyboardInterrupt, SystemExit])
+def test_secondary_stop_cancellation_preserves_the_original_interrupt(operation, interrupt_type, stop_type):
+    backend = MockBackend(RobotState([0, 0], [0, 0]))
+    interruption, stop_failure = interrupt_type("original"), stop_type("secondary")
+    def interrupt(*args):
+        raise interruption
+    def stop():
+        backend.stops += 1
+        raise stop_failure
+    backend.stop = stop
+    controller = SimpleNamespace(reset=interrupt, step=interrupt)
+    loop = VelocityControlLoop(backend, limits(), controller, .02)
+    with pytest.raises(BaseException) as caught:
+        loop.reset() if operation == "reset" else loop.step(tasks)
+    assert caught.value is interruption and caught.value.__cause__ is stop_failure
+    assert loop.fault == interrupt_type.__name__ and backend.stops == 1
 
 
 def test_model_order_backend_maps_only_driver_state_and_command_data():

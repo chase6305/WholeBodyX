@@ -4,6 +4,8 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <chrono>
+#include <thread>
 
 using namespace wholebodyx;
 namespace {
@@ -39,7 +41,13 @@ class FixedController : public Controller {
  public:
   ControlResult result;
   int calls = 0, resets = 0;
-  void reset() override { ++resets; }
+  int reset_failure = 0;
+  void reset() override {
+    ++resets;
+    if (reset_failure == 1) throw std::runtime_error("controller reset failed");
+    if (reset_failure == 2) throw 7;
+    if (reset_failure == 3) throw std::runtime_error("");
+  }
   ControlResult step(const RobotState&, const std::vector<LinearTask>&, double) override { ++calls; return result; }
 };
 ControlResult solved(Vector velocity, double stamp, double until) {
@@ -61,6 +69,7 @@ int main() {
       const auto result = loop.step(tasks);
       check(result.control.command && result.control.solver.success(), "valid cycle did not write command");
       check(std::isfinite(result.control_ms), "invalid timing diagnostic");
+      check(result.cycle_ms >= result.control_ms, "cycle timing must include controller timing");
     }
     check(backend.writes == 10 && backend.stops == 0 && std::abs(backend.state.stamp - .2) < 1e-12, "normal loop accounting");
     check(std::abs(backend.last_command.stamp - .18) < 1e-12 && backend.last_command.valid_until >= .2 - 1e-12,
@@ -70,6 +79,12 @@ int main() {
     RobotState state{Vector::Zero(2), Vector::Zero(2), 1};
     gate.observe(state);
     check(gate.validate(state, {Vector::Zero(2), 1, 1.02}).velocity.norm() == 0, "valid gate command rejected");
+    RobotState changed = state;
+    changed.q[0] = .1;
+    rejected([&] { gate.validate(changed, {Vector::Zero(2), 1, 1.02}); });
+    changed = state;
+    changed.v[0] = .1;
+    rejected([&] { gate.validate(changed, {Vector::Zero(2), 1, 1.02}); });
     rejected([&] { gate.validate(state, {Vector::Zero(2), .9, 1.02}); });
     rejected([&] { gate.validate(state, {Vector::Zero(2), 1, 1.01}); });
     rejected([&] { gate.validate(state, {Vector::Ones(2), 1, 1.02}); });
@@ -88,6 +103,25 @@ int main() {
     fixed.result = solved(Vector::Zero(2), 3, 3.02);
     failing_loop.reset();
     check(failing_loop.step(tasks).control.command.has_value() && faulty.writes == 1 && fixed.resets == 1, "reset did not recover loop");
+
+    for (int failure : {1, 2, 3}) {
+      FixedController reset_failure;
+      MockBackend reset_backend{{Vector::Zero(2), Vector::Zero(2), 3}};
+      reset_failure.result = solved(Vector::Zero(2), 3, 3.02);
+      VelocityControlLoop reset_loop(reset_backend, reset_failure, limits, .02);
+      reset_loop.step(tasks);
+      reset_failure.reset_failure = failure;
+      rejected([&] { reset_loop.reset(); });
+      check(reset_backend.stops == 1 && !reset_loop.fault().empty(), "failed reset did not stop/latch");
+      rejected([&] { reset_loop.step(tasks); });
+      check(reset_backend.reads == 1 && reset_backend.writes == 1 && reset_backend.stops == 1,
+            "failed reset allowed more I/O");
+      reset_failure.reset_failure = 0;
+      reset_failure.result = solved(Vector::Zero(2), 3.02, 3.04);
+      reset_loop.reset();
+      check(reset_loop.step(tasks).control.command.has_value() && reset_backend.writes == 2,
+            "successful reset did not recover after reset failure");
+    }
 
     FixedController infeasible;
     infeasible.result = {{"infeasible", Vector(), 0, std::numeric_limits<double>::infinity(), "bounds"}, std::nullopt};
@@ -109,6 +143,29 @@ int main() {
     VelocityControlLoop state_loop(outside, unused, limits, .02);
     rejected([&] { state_loop.step(tasks); });
     check(outside.writes == 0 && outside.stops == 1, "invalid state wrote to driver");
+    MockBackend delayed{{Vector::Zero(2), Vector::Zero(2), 7}};
+    FixedController quick;
+    quick.result = solved(Vector::Zero(2), 7, 7.02);
+    VelocityControlLoop deadline(delayed, quick, limits, .02, .001);
+    rejected([&] { deadline.step([&](const RobotState& measured) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(3));
+      return tasks(measured);
+    }); });
+    check(delayed.writes == 0 && delayed.stops == 1 && !deadline.fault().empty(), "deadline wrote a late command");
+    rejected([&] { VelocityControlLoop invalid(delayed, quick, limits, .02, 0); });
+    MockBackend interrupted{{Vector::Zero(2), Vector::Zero(2), 8}};
+    VelocityControlLoop interrupted_loop(interrupted, quick, limits, .02);
+    rejected([&] { interrupted_loop.step([](const RobotState&) -> std::vector<LinearTask> { throw 7; }); });
+    check(interrupted.writes == 0 && interrupted.stops == 1 && !interrupted_loop.fault().empty(),
+          "non-standard exception bypassed stop");
+    MockBackend empty_error{{Vector::Zero(2), Vector::Zero(2), 9}};
+    VelocityControlLoop empty_error_loop(empty_error, quick, limits, .02);
+    rejected([&] { empty_error_loop.step([](const RobotState&) -> std::vector<LinearTask> {
+      throw std::runtime_error("");
+    }); });
+    rejected([&] { empty_error_loop.step(tasks); });
+    check(empty_error.reads == 1 && empty_error.stops == 1 && !empty_error_loop.fault().empty(),
+          "empty exception detail did not latch the fault");
     std::cout << "Runtime gate, fault latch, safe stop and recovery checks passed\n";
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

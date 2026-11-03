@@ -24,6 +24,8 @@ class CoMPlan:
     gravity: float
 
     def __post_init__(self):
+        for name in ("stamp", "dt", "height", "gravity"):
+            object.__setattr__(self, name, float(getattr(self, name)))
         states = array(self.states, 3, "CoM states")
         jerks = array(self.jerks, 2, "CoM jerks")
         if jerks.shape[1:] != (2,) or not len(jerks) or states.shape != (len(jerks) + 1, 3, 2):
@@ -41,6 +43,7 @@ class CoMPlan:
         object.__setattr__(self, "jerks", _immutable(jerks))
 
     def sample(self, stamp):
+        stamp = float(stamp)
         if not np.isfinite(stamp) or stamp < self.stamp or stamp >= self.stamp + self.dt * len(self.jerks):
             raise ValueError("CoM plan is future-dated or expired")
         elapsed = stamp - self.stamp

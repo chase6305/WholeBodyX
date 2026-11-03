@@ -84,9 +84,34 @@ KKT 求解采用秩判定，处理冗余约束；接触力在冗余情况下可�
 约束剪切力、压力中心和扭转力矩的耦合；测试使用独立角点力线性规划验证其可实现性。
 这仍是矩形刚性足底与线性化摩擦假设，没有接触顺应性或真实足底压力建模。
 
+## 动力学接口
+
+`FloatingBaseDynamics.terms(state)` 返回 `DynamicsTerms`，可通过 `terms.mass`、
+`terms.contact_jacobian`、`terms.com`、`terms.com_jacobian` 等字段访问。
+原来的九项元组解包、切片和下标访问保持兼容；结果数组与后续 Pinocchio 工作区计算隔离。
+浮动基座时间戳要求有限且非负；无法表示时间推进的积分区间会被拒绝。
+积分时先将时间戳和步长转为 Python `float`，支持 NumPy 单精度时间参数。
+计算产生非有限速度、位移或配置时抛出 `ValueError`，保留传入状态；正常积分不增加幅值裁剪。
+前向动力学也显式拒绝非有限解和残差，避免数值溢出产生的 NaN 绕过残差比较；
+仍使用原有的秩感知求解和 `1e-5` 残差阈值。
+
+`ContactWBC.formulate(state, target_com, dt, target_velocity=..., target_acceleration=...)`
+返回 `ContactFormulation(problem, terms, contact_rhs)`，其中 QP 使用物理单位，
+不含内部数值缩放。调用它不会推进 warm start、创建求解器或更新求解计数，
+返回的 QP 是独立快照，可用于检查问题或接入其他求解器。
+`solve()` 继续返回原有字典，不改变加速度、力矩、接触力和诊断字段。
+
+`ContactWBC.reset()` 清除求解工作区、warm start 和求解计数，保留标称姿态、
+接触锚点、摩擦和接触裕量；需要重设锚点时重新构造控制器。
+固定拓扑的矩阵块和变量缩放在实例内复用，修改 `contact_reserve` 会同步刷新约束模板，
+外部修改一次返回的 QP 不会污染后续构造。
+动力学接口仍独立于固定基座的 `Controller` / `VelocityCommand`。
+当前接触 QP 使用 `alpha=1.4`，绝对/相对求解容差为 `1e-8`，物理约束验收为 `1e-5`。
+参数交替对照见 [性能记录](performance.md)，最新源码与长测验收见 [验证记录](validation.md)。
+
 ## 验证结果与边界
 
-本轮 MPC、耦合接触约束、扰动交互及长测证据见 [2026-09-14 优化记录](h1_optimization_20260914.md)。
+早期 MPC、耦合接触约束、扰动交互及长测证据见 [2026-09-14 优化记录](h1_optimization_20260914.md)。
 后续数值求解精度细化与对比方法见 [2026-09-16 求解优化](h1_solver_20260916.md)。
 
 连续 3 轮（24 秒）重心转移，本机结果：质心横向范围约 5.55 cm，最小单脚法向力约 240.8 N，

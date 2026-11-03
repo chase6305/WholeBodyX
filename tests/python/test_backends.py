@@ -104,3 +104,120 @@ def test_bad_adapter_output_preserves_state_and_discards_plan(kind):
     with pytest.raises((ValueError, RuntimeError)):
         session.step()
     assert session.plant.read() is before and session.plan is None and session.failure
+
+
+@pytest.mark.parametrize("exception_type", [OSError, ZeroDivisionError, KeyboardInterrupt, SystemExit])
+def test_adapter_exception_discards_plan_and_preserves_original_error(exception_type):
+    session = TrackingSession()
+    session.step()
+    before = session.plant.read()
+    failure = exception_type("injected adapter failure")
+    def fail(*args):
+        raise failure
+    session.controller = SimpleNamespace(step=fail)
+    with pytest.raises(exception_type) as caught:
+        session.step()
+    assert caught.value is failure
+    assert session.plant.read() is before and session.plan is None and session.failure
+
+
+def test_cancelled_scenario_configuration_restores_previous_session(monkeypatch):
+    session = TrackingSession()
+    session.step()
+    before = session.controller, session.planner, session.plant.read(), session.plan, session.goal
+    failure = KeyboardInterrupt()
+    def interrupt(*args):
+        raise failure
+    monkeypatch.setattr(session.registry, "create_planner", interrupt)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        session.set_scenario("mpc_retargeting")
+    assert caught.value is failure
+    assert session.scenario == "tracking"
+    assert all(actual is original for actual, original in zip(
+        (session.controller, session.planner, session.plant.read(), session.plan, session.goal), before))
+
+
+def test_diagnostic_failure_preserves_an_already_committed_simulation_step(monkeypatch):
+    session = TrackingSession()
+    session.step()
+    before = session.plant.read()
+    def fail(*args):
+        raise OSError("diagnostics unavailable")
+    with monkeypatch.context() as patch:
+        patch.setattr(session, "reference", fail)
+        with pytest.raises(OSError, match="diagnostics unavailable"):
+            session.step()
+    assert session.plant.read().stamp == before.stamp + session.dt
+    assert session.steps == 2 and len(session.history) == 1
+    assert session.plan is None and session.failure
+    session.step()
+    assert session.steps == 3 and session.failure is None
+
+
+@pytest.mark.parametrize("component", ["controller", "planner"])
+@pytest.mark.parametrize("exception_type", [RuntimeError, KeyboardInterrupt])
+def test_failed_session_reset_keeps_simulation_and_discards_reference(monkeypatch, component, exception_type):
+    session = TrackingSession()
+    session.step()
+    before = session.plant.read()
+    history, trails = session.history, session.trails
+    steps, replans = session.steps, session.replans
+    session.prediction(session.frames[0])
+    failure = exception_type("reset interrupted")
+
+    def fail():
+        raise failure
+
+    with monkeypatch.context() as patch:
+        patch.setattr(getattr(session, component), "reset", fail)
+        with pytest.raises(exception_type) as caught:
+            session.reset()
+    assert caught.value is failure
+    assert session.plant.read() is before and session.steps == steps
+    assert session.history is history and session.trails is trails and session.replans == replans
+    assert session.plan is None and session.failure == "reset interrupted"
+    assert session.prediction(session.frames[0]).shape == (0, 3)
+    session.reset()
+    assert session.plant.read().stamp == 0 and session.steps == 0
+    assert session.plan is None and session.failure is None
+    session.step()
+    assert session.steps == 1 and session.plan is not None
+
+
+@pytest.mark.parametrize("component", ["controller", "planner"])
+@pytest.mark.parametrize("exception_type", [RuntimeError, KeyboardInterrupt])
+def test_scenario_switch_rolls_back_when_new_component_reset_fails(component, exception_type):
+    armed = False
+    failure = exception_type("new scenario reset failed")
+    base = KinematicWBC if component == "controller" else JointMPC
+
+    class Adapter(base):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.resets = 0
+
+        def reset(self):
+            self.resets += 1
+            if armed and self.resets == 2:
+                raise failure
+            super().reset()
+
+    registry = BackendRegistry().register("fragile", **{component: Adapter})
+    session = (TrackingSession("fragile", registry=registry) if component == "controller"
+               else TrackingSession(mpc_backend="fragile", registry=registry))
+    session.step()
+    session.prediction(session.frames[0])
+    before = session.__dict__.copy()
+    armed = True
+    with pytest.raises(exception_type) as caught:
+        session.set_scenario("mpc_retargeting")
+    assert caught.value is failure
+    assert session.__dict__.keys() == before.keys()
+    assert all(session.__dict__[key] is value for key, value in before.items())
+    session.step()
+    assert session.steps == 2 and session.failure is None
+    armed = False
+    session.set_scenario("mpc_retargeting")
+    assert session.scenario == "mpc_retargeting" and session.steps == 0
+    session.step()
+    assert session.steps == 1

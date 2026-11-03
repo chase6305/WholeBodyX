@@ -51,6 +51,7 @@ class MPCReferenceManager:
         self._pending_reason = "initial"
 
     def reset(self):
+        self.invalidate()
         self.planner.reset()
         self._clear()
 
@@ -61,6 +62,7 @@ class MPCReferenceManager:
 
     def discard_outdated(self, stamp, goal):
         """Hide outdated references at a display boundary without running a solver."""
+        stamp = float(stamp)
         if self.plan is not None:
             if not np.array_equal(goal, self._goal):
                 self.invalidate("goal_changed")

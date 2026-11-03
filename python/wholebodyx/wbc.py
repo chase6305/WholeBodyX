@@ -1,11 +1,11 @@
 """Weighted velocity-level task control with hard joint bounds."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
 from .qp import OSQPSolver, QPResult, QuadraticProgram, _FixedQP
-from .types import VelocityCommand, positive
+from .types import VelocityCommand, array, positive
 
 
 @dataclass(frozen=True)
@@ -52,6 +52,21 @@ class KinematicWBC:
         return self._template.problem(g, lo, hi)
 
     def step(self, state, tasks, dt):
-        result = self.solver.solve(self.formulate(state, tasks, dt))
+        dt = positive(dt, "dt")
+        problem = self.formulate(state, tasks, dt)
+        result = self.solver.solve(problem)
+        if result.success:
+            if np.shape(result.x) != state.q.shape or not np.isfinite(result.x).all():
+                return ControlResult(QPResult("error", iterations=result.iterations, detail="invalid WBC solution"))
+            # OSQP accepts tiny feasibility residuals. Normalize only those
+            # residuals to the exact box before integrating a command, so an
+            # active braking bound remains feasible on the next cycle.
+            velocity = np.clip(result.x, problem.lower, problem.upper)
+            correction = float(np.max(np.abs(velocity - result.x)))
+            if correction > 1e-6:
+                return ControlResult(QPResult("error", iterations=result.iterations, violation=correction,
+                                              detail="WBC solution exceeds velocity bounds"))
+            if not np.array_equal(velocity, result.x):
+                result = replace(result, x=array(velocity, 1, "velocity"), violation=0.)
         command = VelocityCommand(result.x, state.stamp, state.stamp + dt) if result.success else None
         return ControlResult(result, command)
