@@ -63,7 +63,7 @@ class DynamicsState:
         if abs(np.linalg.norm(q[3:7]) - 1.) > 1e-8:
             raise ValueError("floating-base state quaternion must be normalized")
         stamp = float(self.stamp)
-        if not np.isfinite(stamp) or stamp < 0:
+        if not isfinite(stamp) or stamp < 0:
             raise ValueError("dynamics state stamp must be finite and nonnegative")
         object.__setattr__(self, "q", q)
         object.__setattr__(self, "v", v)
@@ -86,7 +86,7 @@ class CoMState:
                 raise ValueError("CoM state requires three-dimensional vectors")
             object.__setattr__(self, name, value)
         stamp = float(self.stamp)
-        if not np.isfinite(stamp) or stamp < 0:
+        if not isfinite(stamp) or stamp < 0:
             raise ValueError("CoM state stamp must be finite and nonnegative")
         object.__setattr__(self, "stamp", stamp)
 
@@ -181,7 +181,7 @@ class DynamicsControlResult(Mapping):
             raise ValueError("dynamics result dimensions differ")
         for name in ("dynamics_residual", "contact_residual", "violation"):
             value = float(getattr(self, name))
-            if not np.isfinite(value) or value < 0:
+            if not isfinite(value) or value < 0:
                 raise ValueError("dynamics residuals must be finite and nonnegative")
             if name != "violation":
                 object.__setattr__(self, name, value)

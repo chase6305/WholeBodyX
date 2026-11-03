@@ -136,27 +136,27 @@ CycleResult VelocityControlLoop::step(const TaskFactory& task_factory) {
   require(static_cast<bool>(task_factory), "task factory must be callable");
   const auto cycle_started = std::chrono::steady_clock::now();
   const auto check_deadline = [&](const VelocityCommand* command = nullptr) {
-    const double elapsed =
+    const double elapsed_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - cycle_started).count();
     if (max_cycle_time_) {
       const double budget = command
                                 ? std::min(*max_cycle_time_, command->valid_until - command->stamp)
                                 : *max_cycle_time_;
-      if (elapsed >= budget)
+      if (elapsed_seconds >= budget)
         throw std::runtime_error("velocity control cycle exceeded its execution deadline");
     }
-    return elapsed * 1000;
+    return elapsed_seconds * 1000;
   };
   try {
-    const RobotState state = gate_.observe(backend_.read());
+    RobotState state = gate_.observe(backend_.read());
     check_deadline();
     const auto tasks = task_factory(state);
     for (const auto& task : tasks) task.validate(state.q.size());
     check_deadline();
-    const auto started = std::chrono::steady_clock::now();
+    const auto control_started = std::chrono::steady_clock::now();
     ControlResult control = controller_.step(state, tasks, control_dt_);
-    const double elapsed =
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
+    const double control_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - control_started)
             .count();
     validate_control(control);
     const VelocityCommand command = gate_.validate(state, *control.command);
@@ -164,7 +164,7 @@ CycleResult VelocityControlLoop::step(const TaskFactory& task_factory) {
     backend_.write(command);
     const double cycle_ms = check_deadline(&command);
     control.command = command;
-    return {state, std::move(control), elapsed, cycle_ms};
+    return {std::move(state), std::move(control), control_ms, cycle_ms};
   } catch (const std::exception& exc) {
     fail(exc);
   } catch (...) {
