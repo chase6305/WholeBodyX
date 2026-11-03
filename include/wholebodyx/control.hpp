@@ -98,6 +98,8 @@ class Controller {
   virtual ControlResult step(const RobotState&, const std::vector<LinearTask>&, double dt) = 0;
 };
 
+// Weighted velocity least squares with hard bounds. Smoothing penalizes
+// deviation from the measured state.v.
 class KinematicWBC final : public Controller {
  public:
   KinematicWBC(JointLimits, double regularization = 1e-6, double smoothing = 0.0,
