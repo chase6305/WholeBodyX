@@ -433,14 +433,16 @@ def run(seconds, output, *, backends, joints=3, horizon=60, control_dt=.02, look
         report.update(status="failed", error=f"{type(exc).__name__}: {exc}")
         raise
     finally:
-        events.close()
-        report["wall_s"] = time.monotonic() - started
-        close_errors = []
-        for case in cases:
-            try:
-                case.close_worker()
-            except Exception as exc:
-                close_errors.append(f"{case.name}: {type(exc).__name__}: {exc}")
+        try:
+            events.close()
+        finally:
+            report["wall_s"] = time.monotonic() - started
+            close_errors = []
+            for case in cases:
+                try:
+                    case.close_worker()
+                except Exception as exc:
+                    close_errors.append(f"{case.name}: {type(exc).__name__}: {exc}")
         if close_errors:
             report.update(status="failed", close_errors=close_errors)
         report.update(cases={c.name: c.snapshot() for c in cases}, final_parent_rss_kib=rss(os.getpid()),

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from test_async_runtime import _diagnostic_runtime, state
+from test_async_runtime import _diagnostic_runtime, _soak_tool, state
 
 
 def auditor():
@@ -50,6 +50,37 @@ def test_audit_recomputes_tracking_and_adoption_from_captured_plans(evidence):
     result = auditor().audit(write_evidence(evidence))
     assert result["status"] == "passed" and result["events"] == 1
     assert result["cases"]["sparse"]["uninjected_tracking"] == 1
+
+
+def test_event_stream_close_failure_still_closes_all_workers(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    module = _soak_tool()
+    failure = OSError("event stream close failed")
+    closed = []
+
+    class BrokenStream:
+        def close(self):
+            raise failure
+
+    open_path = Path.open
+
+    def open_stream(path, *args, **kwargs):
+        if path.suffix == ".jsonl":
+            return BrokenStream()
+        return open_path(path, *args, **kwargs)
+
+    def case(name, *args, **kwargs):
+        return SimpleNamespace(name=name, close_worker=lambda: closed.append(name))
+
+    clock = iter([0., 0., 1., 1.])  # Finish after startup without stepping a fake case.
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    monkeypatch.setattr(module, "Case", case)
+    monkeypatch.setattr(Path, "open", open_stream)
+    with pytest.raises(OSError, match="event stream close failed") as caught:
+        module.run(.001, tmp_path / "soak.json", backends=("python", "sparse"))
+    assert caught.value is failure
+    assert closed == ["python", "sparse"]
 
 
 @pytest.mark.parametrize("corruption,message", [
