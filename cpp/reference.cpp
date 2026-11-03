@@ -101,6 +101,8 @@ ReferenceUpdate MPCReferenceManager::update(const RobotState& state, const Vecto
   const double end = state.stamp + control_dt;
   require(std::isfinite(end) && end > state.stamp, "control interval cannot be represented");
   ReferenceUpdate update;
+  // Reused plans return the same sample used to measure tracking error.
+  std::pair<Vector, Vector> sampled;
   if (clock_invalid_ || (last_stamp_ && state.stamp < *last_stamp_)) {
     clock_invalid_ = true;
     invalidate("clock_rollback");
@@ -115,7 +117,8 @@ ReferenceUpdate MPCReferenceManager::update(const RobotState& state, const Vecto
   else if (end > plan_->valid_until())
     update.reason = "coverage";
   else {
-    update.tracking_error = (state.q - plan_->sample(state.stamp).first).cwiseAbs().maxCoeff();
+    sampled = plan_->sample(state.stamp);
+    update.tracking_error = (state.q - sampled.first).cwiseAbs().maxCoeff();
     if (*update.tracking_error > tracking_tolerance_)
       update.reason = "tracking_error";
     else if (deadline_reached(state.stamp, *next_replan_, plan_->stamp, control_dt))
@@ -157,8 +160,8 @@ ReferenceUpdate MPCReferenceManager::update(const RobotState& state, const Vecto
       return failure(exc);
     }
     update.solve_ms = elapsed();
+    sampled = plan_->sample(state.stamp);
   }
-  auto sampled = plan_->sample(state.stamp);
   update.position = std::move(sampled.first);
   update.velocity = std::move(sampled.second);
   return update;

@@ -51,21 +51,25 @@ std::pair<Vector, Vector> JointLimits::velocity_bounds(const RobotState& state, 
   state.validate();
   positive(dt, "dt must be positive and finite");
   require(state.q.size() == lower.size(), "state and limits dimensions differ");
-  Vector lo = (-velocity).cwiseMax((lower - state.q) / dt);
-  Vector hi = velocity.cwiseMin((upper - state.q) / dt);
+  Vector velocity_lower = (-velocity).cwiseMax((lower - state.q) / dt);
+  Vector velocity_upper = velocity.cwiseMin((upper - state.q) / dt);
   if (acceleration.size()) {
-    lo = lo.cwiseMax(state.v - acceleration * dt);
-    hi = hi.cwiseMin(state.v + acceleration * dt);
-    for (Eigen::Index i = 0; i < lo.size(); ++i) {
-      lo[i] = std::max(lo[i], -braking_speed(state.q[i] - lower[i], acceleration[i], dt));
-      hi[i] = std::min(hi[i], braking_speed(upper[i] - state.q[i], acceleration[i], dt));
+    velocity_lower = velocity_lower.cwiseMax(state.v - acceleration * dt);
+    velocity_upper = velocity_upper.cwiseMin(state.v + acceleration * dt);
+    for (Eigen::Index i = 0; i < velocity_lower.size(); ++i) {
+      velocity_lower[i] = std::max(
+          velocity_lower[i], -braking_speed(state.q[i] - lower[i], acceleration[i], dt));
+      velocity_upper[i] = std::min(
+          velocity_upper[i], braking_speed(upper[i] - state.q[i], acceleration[i], dt));
       const double scale = std::max({std::abs(lower[i]), std::abs(upper[i]), std::abs(state.q[i])});
-      if (std::isfinite(lo[i]) && std::isfinite(hi[i]) && lo[i] > hi[i] &&
-          lo[i] - hi[i] <= 16 * std::numeric_limits<double>::epsilon() * scale / dt)
-        lo[i] = hi[i] = .5 * lo[i] + .5 * hi[i];
+      if (std::isfinite(velocity_lower[i]) && std::isfinite(velocity_upper[i]) &&
+          velocity_lower[i] > velocity_upper[i] &&
+          velocity_lower[i] - velocity_upper[i] <=
+              16 * std::numeric_limits<double>::epsilon() * scale / dt)
+        velocity_lower[i] = velocity_upper[i] = .5 * velocity_lower[i] + .5 * velocity_upper[i];
     }
   }
-  return {lo, hi};
+  return {std::move(velocity_lower), std::move(velocity_upper)};
 }
 void LinearTask::validate(Eigen::Index joints) const {
   require(jacobian.cols() == joints && jacobian.rows() > 0 &&
@@ -87,7 +91,7 @@ void QuadraticProgram::validate_against(const Matrix* previous) const {
   require((hessian - hessian.transpose()).cwiseAbs().maxCoeff() <= 1e-10, "nonsymmetric Hessian");
   if (previous && previous->rows() == n && previous->cols() == n &&
       (previous->array() == hessian.array()).all())
-    return;  // Exact values only: caller mutation always triggers convexity validation.
+    return;  // Only an exactly equal Hessian reuses the previous convexity check.
   Eigen::LLT<Matrix> cholesky(hessian);
   if (cholesky.info() == Eigen::Success) return;
   Eigen::SelfAdjointEigenSolver<Matrix> eig(hessian, Eigen::EigenvaluesOnly);
@@ -130,6 +134,7 @@ ControlResult KinematicWBC::step(const RobotState& state, const std::vector<Line
   if ((problem.lower.array() > problem.upper.array()).any())
     return {{"error", {}, result.iterations, INFINITY, "inconsistent WBC velocity bounds"},
             std::nullopt};
+  // Normalize tiny residuals so active braking bounds remain exact on the next cycle.
   const Vector velocity = result.x.cwiseMax(problem.lower).cwiseMin(problem.upper);
   const double correction = (velocity - result.x).cwiseAbs().maxCoeff();
   if (correction > 1e-6)
