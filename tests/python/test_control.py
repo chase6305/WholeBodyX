@@ -42,6 +42,22 @@ def test_wbc_rejects_a_custom_solver_complex_decision(imaginary):
     assert result.solver.iterations == 7
 
 
+@pytest.mark.parametrize("position", [-2., 2.])
+@pytest.mark.parametrize("endpoint", ["lower", "upper"])
+def test_wbc_rejects_custom_solver_success_with_inconsistent_bounds(position, endpoint):
+    from types import SimpleNamespace
+    from wholebodyx import KinematicWBC, QPResult
+
+    solver = SimpleNamespace(solve=lambda problem: QPResult(
+        "solved", getattr(problem, endpoint).copy(), iterations=7, violation=0.))
+    bounds = JointLimits([-1.], [1.], [.5], [.1])
+    result = KinematicWBC(bounds, solver=solver).step(RobotState([position], [0.]), [], .1)
+    assert result.command is None and not result.solver.success
+    assert result.solver.status == "error" and result.solver.x is None
+    assert result.solver.iterations == 7
+    assert "inconsistent WBC velocity bounds" in result.solver.detail
+
+
 def test_command_mixed_precision_clock_is_validated_after_conversion():
     start = np.float32(1e8)
     command = VelocityCommand([0.], start, float(start) + .1)

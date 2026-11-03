@@ -127,6 +127,9 @@ ControlResult KinematicWBC::step(const RobotState& state, const std::vector<Line
   if (!result.success()) return {std::move(result), std::nullopt};
   if (result.x.size() != state.q.size() || !result.x.allFinite())
     return {{"error", {}, result.iterations, INFINITY, "invalid WBC solution"}, std::nullopt};
+  if ((problem.lower.array() > problem.upper.array()).any())
+    return {{"error", {}, result.iterations, INFINITY, "inconsistent WBC velocity bounds"},
+            std::nullopt};
   const Vector velocity = result.x.cwiseMax(problem.lower).cwiseMin(problem.upper);
   const double correction = (velocity - result.x).cwiseAbs().maxCoeff();
   if (correction > 1e-6)

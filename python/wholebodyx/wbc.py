@@ -123,6 +123,14 @@ class KinematicWBC:
                 return ControlResult(
                     QPResult("error", iterations=result.iterations, detail="invalid WBC solution")
                 )
+            if np.any(problem.lower > problem.upper):
+                return ControlResult(
+                    QPResult(
+                        "error",
+                        iterations=result.iterations,
+                        detail="inconsistent WBC velocity bounds",
+                    )
+                )
             # OSQP accepts tiny feasibility residuals. Normalize only those
             # residuals to the exact box before integrating a command, so an
             # active braking bound remains feasible on the next cycle.

@@ -2,11 +2,28 @@
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 
 using namespace wholebodyx;
 void check(bool condition, const char* message) {
   if (!condition) throw std::runtime_error(message);
 }
+
+class EndpointSolver final : public QPSolver {
+ public:
+  explicit EndpointSolver(bool return_lower) : return_lower_(return_lower) {}
+  double outward_residual = 0.;
+  void reset() override {}
+  QPResult solve(const QuadraticProgram& problem, const Vector&) override {
+    Vector solution = return_lower_ ? problem.lower : problem.upper;
+    solution.array() += return_lower_ ? -outward_residual : outward_residual;
+    return {"solved", std::move(solution), 7, 0., "injected endpoint result"};
+  }
+
+ private:
+  bool return_lower_;
+};
+
 int main() {
   try {
     JointLimits limits{Vector::Constant(2, -2), Vector::Constant(2, 2), Vector::Ones(2), {}};
@@ -42,6 +59,36 @@ int main() {
     check(!wbc.step(state, {task}, 0.1).command, "infeasible WBC must not emit command");
     state.q.setZero();
     check(wbc.step(state, {task}, 0.1).solver.success(), "solver recovers after failure");
+
+    // A custom solver cannot make a reversed velocity interval executable.
+    JointLimits bounded{Vector::Constant(1, -1.), Vector::Ones(1),
+                         Vector::Constant(1, .5), Vector::Constant(1, .1)};
+    KinematicWBC checked_solver(bounded);
+    const RobotState healthy{Vector::Zero(1), Vector::Zero(1), 0.};
+    for (bool return_lower : {false, true}) {
+      auto endpoint = std::make_shared<EndpointSolver>(return_lower);
+      KinematicWBC injected(bounded, 1e-6, 0., endpoint);
+      for (double position : {-2., 2.}) {
+        const RobotState outside{Vector::Constant(1, position), Vector::Zero(1), 0.};
+        const auto rejected = injected.step(outside, {}, .1);
+        check(!rejected.command && rejected.solver.status == "error" &&
+                  rejected.solver.x.size() == 0 && rejected.solver.iterations == 7 &&
+                  rejected.solver.detail == "inconsistent WBC velocity bounds",
+              "custom solved result bypassed inconsistent WBC bounds");
+        const auto infeasible = checked_solver.step(outside, {}, .1);
+        check(!infeasible.command && infeasible.solver.status == "infeasible",
+              "built-in inconsistent bounds must remain infeasible");
+      }
+      endpoint->outward_residual = 5e-7;
+      const auto roundoff = injected.step(healthy, {}, .1);
+      const auto bounds = bounded.velocity_bounds(healthy, .1);
+      check(roundoff.command && roundoff.command->velocity[0] ==
+                  (return_lower ? bounds.first[0] : bounds.second[0]),
+            "tiny WBC residual must still normalize to the exact bound");
+      endpoint->outward_residual = 2e-6;
+      check(!injected.step(healthy, {}, .1).command,
+            "WBC must still reject excessive velocity corrections");
+    }
 
     JointLimits single{Vector::Constant(1, -10), Vector::Constant(1, 10), Vector::Constant(1, 10), {}};
     JointMPC mpc(single, 1, 0.2, 2, 0.5, 3);
