@@ -21,8 +21,9 @@ struct FixedQP {
 
  private:
   friend class wholebodyx::JointMPC;
-  FixedQP(Eigen::SparseMatrix<double> h, Eigen::SparseMatrix<double> a)
-      : hessian(std::move(h)), constraint(std::move(a)) {
+  FixedQP(Eigen::SparseMatrix<double> hessian_matrix,
+          Eigen::SparseMatrix<double> constraint_matrix)
+      : hessian(std::move(hessian_matrix)), constraint(std::move(constraint_matrix)) {
     if (!(hessian.rows() > 0 && hessian.cols() == hessian.rows() &&
           constraint.cols() == hessian.cols() &&
           Eigen::Map<const Vector>(hessian.valuePtr(), hessian.nonZeros()).allFinite() &&

@@ -1,7 +1,7 @@
 """Backend-independent convex QP and an OSQP adapter."""
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 import numpy as np
 import osqp
@@ -13,6 +13,12 @@ from ._solver_execution import OSQP_EXECUTION_LOCK
 
 @dataclass(frozen=True)
 class QuadraticProgram:
+    """Minimize 1/2 x'Hx + g'x subject to lower <= A x <= upper.
+
+    Construction copies caller data. Infinite bounds are allowed; inconsistent
+    bound intervals are reported as infeasible by the solver.
+    """
+
     hessian: np.ndarray
     gradient: np.ndarray
     constraint: np.ndarray
@@ -32,7 +38,7 @@ class QuadraticProgram:
         if self.hessian.dtype == np.dtype(float):
             # Finite float64 inputs need only the existing absolute tolerance.
             # Keep allclose for caller-replaced dtypes to avoid integer overflow.
-            symmetric = np.max(np.abs(self.hessian - self.hessian.T), initial=0) <= 1e-10
+            symmetric = np.abs(self.hessian - self.hessian.T).max(initial=0) <= 1e-10
         else:
             symmetric = np.allclose(self.hessian, self.hessian.T, rtol=0, atol=1e-10)
         if not symmetric:
@@ -52,7 +58,9 @@ class QuadraticProgram:
 
     def _remember_matrix_validation(self):
         object.__setattr__(self, "_validated_hessian_key", _immutable_matrix_key(self.hessian))
-        object.__setattr__(self, "_validated_constraint_key", _immutable_matrix_key(self.constraint))
+        object.__setattr__(
+            self, "_validated_constraint_key", _immutable_matrix_key(self.constraint)
+        )
 
     def _validate_vectors(self):
         object.__setattr__(self, "gradient", array(self.gradient, 1, "gradient"))
@@ -62,30 +70,66 @@ class QuadraticProgram:
                 raise ValueError("bounds must be vectors without NaNs")
             value.setflags(write=False)
             object.__setattr__(self, name, value)
-        # The copies above already certify real storage, a finite gradient,
+        # The new vectors already have real storage, a finite gradient,
         # and NaN-free bounds. Only dimensions remain to be checked here.
         # solve() still checks the public buffers again before every update.
         self._check_dimensions()
 
     def _check_dimensions(self):
-        n, m = self.gradient.size, self.lower.size
-        if (self.gradient.ndim != 1 or self.lower.ndim != 1 or not n or
-                self.hessian.shape != (n, n) or self.constraint.shape != (m, n) or self.upper.shape != (m,)):
+        variable_count = self.gradient.size
+        constraint_count = self.lower.size
+        if (
+            self.gradient.ndim != 1
+            or self.lower.ndim != 1
+            or not variable_count
+            or self.hessian.shape != (variable_count, variable_count)
+            or self.constraint.shape != (constraint_count, variable_count)
+            or self.upper.shape != (constraint_count,)
+        ):
             raise ValueError("QP dimensions do not match")
 
     def _check_vectors(self):
         self._check_dimensions()
-        if any(np.iscomplexobj(value) for value in
-               (self.hessian, self.gradient, self.constraint, self.lower, self.upper)):
+        if any(
+            np.iscomplexobj(value)
+            for value in (self.hessian, self.gradient, self.constraint, self.lower, self.upper)
+        ):
             raise ValueError("QP storage must remain real-valued")
-        if not np.isfinite(self.gradient).all() or np.isnan(self.lower).any() or np.isnan(self.upper).any():
+        if (
+            not np.isfinite(self.gradient).all()
+            or np.isnan(self.lower).any()
+            or np.isnan(self.upper).any()
+        ):
             raise ValueError("QP vectors must contain a finite gradient and bounds without NaNs")
 
 
 def _immutable(value):
     """Bytes-backed arrays cannot be made writable via setflags()."""
-    a = np.asarray(value, dtype=float)
-    return np.frombuffer(a.tobytes(), dtype=float).reshape(a.shape)
+    matrix = np.asarray(value, dtype=float)
+    return np.frombuffer(matrix.tobytes(), dtype=float).reshape(matrix.shape)
+
+
+class _DenseMatrixKey(NamedTuple):
+    storage: bytes
+    shape: tuple[int, ...]
+    strides: tuple[int, ...]
+    dtype: str
+    address: int
+
+    def matches(self, other):
+        """Equal values alone do not certify ownership or view metadata."""
+        return (
+            self.storage is other.storage
+            and self.shape == other.shape
+            and self.strides == other.strides
+            and self.dtype == other.dtype
+            and self.address == other.address
+        )
+
+
+class _SparseMatrixKey(NamedTuple):
+    shape: tuple[int, int]
+    buffers: tuple[_DenseMatrixKey, ...]
 
 
 def _immutable_matrix_key(value):
@@ -97,35 +141,48 @@ def _immutable_matrix_key(value):
     if sparse.issparse(value):
         if not sparse.isspmatrix_csc(value):
             return None
-        keys = tuple(_immutable_matrix_key(part) for part in (value.data, value.indices, value.indptr))
-        return (value.shape, keys) if all(key is not None for key in keys) else None
+        buffers = tuple(
+            _immutable_matrix_key(part) for part in (value.data, value.indices, value.indptr)
+        )
+        return (
+            _SparseMatrixKey(value.shape, buffers)
+            if all(key is not None for key in buffers)
+            else None
+        )
     base = value
     while isinstance(base, np.ndarray):
         base = base.base
     if not isinstance(base, bytes):
         return None
-    return (base, value.shape, value.strides, value.dtype.str,
-            value.__array_interface__["data"][0])
+    return _DenseMatrixKey(
+        base, value.shape, value.strides, value.dtype.str, value.__array_interface__["data"][0]
+    )
 
 
 def _same_immutable_key(previous, current):
-    if previous is None or current is None:
+    if previous is None or type(previous) is not type(current):
         return False
-    if isinstance(previous[0], bytes):
-        return previous[0] is current[0] and previous[1:] == current[1:]
-    return (previous[0] == current[0] and
-            all(a[0] is b[0] and a[1:] == b[1:] for a, b in zip(previous[1], current[1])))
+    if isinstance(previous, _DenseMatrixKey):
+        return previous.matches(current)
+    return previous.shape == current.shape and all(
+        old.matches(new) for old, new in zip(previous.buffers, current.buffers)
+    )
 
 
 def _same_matrix(snapshot, value, previous_key, key):
+    """Reuse certified storage identity or compare against owned values."""
     if sparse.issparse(value):
         if not sparse.issparse(snapshot) or snapshot.shape != value.shape:
             return False
         if _same_immutable_key(previous_key, key):
             return True
-        return all(np.array_equal(a, b) for a, b in
-                   zip((snapshot.data, snapshot.indices, snapshot.indptr),
-                       (value.data, value.indices, value.indptr)))
+        return all(
+            np.array_equal(old, new)
+            for old, new in zip(
+                (snapshot.data, snapshot.indices, snapshot.indptr),
+                (value.data, value.indices, value.indptr),
+            )
+        )
     if sparse.issparse(snapshot):
         return False
     if _same_immutable_key(previous_key, key):
@@ -149,16 +206,19 @@ class _UpperCSC:
             values = triangle[self.rows, self.columns]
             # Equal nnz and all old positions still nonzero prove that no
             # position was removed or added, including same-count exchanges.
-            if np.count_nonzero(triangle) == values.size and np.all(values != 0):
-                return sparse.csc_matrix((values, self.rows.view(), self.indptr.view()),
-                                         shape=hessian.shape)
+            if np.count_nonzero(triangle) == values.size and (values != 0).all():
+                return sparse.csc_matrix(
+                    (values, self.rows.view(), self.indptr.view()), shape=hessian.shape
+                )
         result = sparse.csc_matrix(triangle)
-        columns = np.repeat(np.arange(hessian.shape[1], dtype=result.indices.dtype),
-                            np.diff(result.indptr))
+        columns = np.repeat(
+            np.arange(hessian.shape[1], dtype=result.indices.dtype), np.diff(result.indptr)
+        )
         # Own bytes, not mutable arrays shared with the returned CSC object.
         self.rows, self.columns, self.indptr = (
             np.frombuffer(value.tobytes(), dtype=value.dtype)
-            for value in (result.indices, columns, result.indptr))
+            for value in (result.indices, columns, result.indptr)
+        )
         self.shape = hessian.shape
         return result
 
@@ -197,59 +257,75 @@ class _FixedQP:
     _view_matrix = staticmethod(np.ndarray.view)
 
     def __init__(self, hessian, constraint):
-        _, problem = self.with_problem(hessian, np.zeros(np.shape(hessian)[0]), constraint,
-                                       np.zeros(np.shape(constraint)[0]), np.zeros(np.shape(constraint)[0]))
+        _, problem = self.with_problem(
+            hessian,
+            np.zeros(np.shape(hessian)[0]),
+            constraint,
+            np.zeros(np.shape(constraint)[0]),
+            np.zeros(np.shape(constraint)[0]),
+        )
         self._remember(problem)
 
     @classmethod
     def with_problem(cls, hessian, gradient, constraint, lower, upper):
         """Validate actual vectors once and retain the certified immutable model."""
-        p = object.__new__(cls._problem_type)
-        for name, value in (("hessian", cls._freeze_matrix(hessian, "hessian")),
-                            ("constraint", cls._freeze_matrix(constraint, "constraint")),
-                            ("gradient", gradient), ("lower", lower), ("upper", upper)):
-            object.__setattr__(p, name, value)
-        p._validate_vectors()
-        p._validate_hessian()
-        p._validate_constraint()
-        p._remember_matrix_validation()
-        return cls._from_problem(p)
+        problem = object.__new__(cls._problem_type)
+        for name, value in (
+            ("hessian", cls._freeze_matrix(hessian, "hessian")),
+            ("constraint", cls._freeze_matrix(constraint, "constraint")),
+            ("gradient", gradient),
+            ("lower", lower),
+            ("upper", upper),
+        ):
+            object.__setattr__(problem, name, value)
+        problem._validate_vectors()
+        problem._validate_hessian()
+        problem._validate_constraint()
+        problem._remember_matrix_validation()
+        return cls._from_problem(problem)
 
     def with_hessian(self, hessian, gradient, lower, upper):
         """Keep certified A storage and validate a replacement H and vectors."""
         hessian = self._freeze_matrix(hessian, "hessian")
         if hessian.shape != self._hessian.shape:
             raise ValueError("QP dimensions do not match")
-        p = self.problem(gradient, lower, upper)
-        object.__setattr__(p, "hessian", hessian)
-        p._validate_hessian()
-        object.__setattr__(p, "_validated_hessian_key", _immutable_matrix_key(hessian))
+        problem = self.problem(gradient, lower, upper)
+        object.__setattr__(problem, "hessian", hessian)
+        problem._validate_hessian()
+        object.__setattr__(problem, "_validated_hessian_key", _immutable_matrix_key(hessian))
         # Retain A's original certificate; changed metadata is checked by the solver.
-        return type(self)._from_problem(p)
+        return type(self)._from_problem(problem)
 
     @classmethod
-    def _from_problem(cls, p):
+    def _from_problem(cls, problem):
         template = object.__new__(cls)
-        template._remember(p)
-        return template, p
+        template._remember(problem)
+        return template, problem
 
-    def _remember(self, p):
+    def _remember(self, problem):
         # Share certified bytes, never mutable matrix metadata or a new trust token.
-        self._hessian, self._constraint = self._view_matrix(p.hessian), self._view_matrix(p.constraint)
-        self._hessian_key = p._validated_hessian_key
-        self._constraint_key = p._validated_constraint_key
+        self._hessian, self._constraint = (
+            self._view_matrix(problem.hessian),
+            self._view_matrix(problem.constraint),
+        )
+        self._hessian_key = problem._validated_hessian_key
+        self._constraint_key = problem._validated_constraint_key
 
     def problem(self, gradient, lower, upper):
-        p = object.__new__(self._problem_type)
+        problem = object.__new__(self._problem_type)
         # Share immutable buffers, not ndarray metadata (shape/dtype/strides).
-        for name, value in (("hessian", self._view_matrix(self._hessian)),
-                            ("constraint", self._view_matrix(self._constraint)),
-                            ("gradient", gradient), ("lower", lower), ("upper", upper)):
-            object.__setattr__(p, name, value)
-        p._validate_vectors()
-        object.__setattr__(p, "_validated_hessian_key", self._hessian_key)
-        object.__setattr__(p, "_validated_constraint_key", self._constraint_key)
-        return p
+        for name, value in (
+            ("hessian", self._view_matrix(self._hessian)),
+            ("constraint", self._view_matrix(self._constraint)),
+            ("gradient", gradient),
+            ("lower", lower),
+            ("upper", upper),
+        ):
+            object.__setattr__(problem, name, value)
+        problem._validate_vectors()
+        object.__setattr__(problem, "_validated_hessian_key", self._hessian_key)
+        object.__setattr__(problem, "_validated_constraint_key", self._constraint_key)
+        return problem
 
 
 @dataclass(frozen=True)
@@ -277,29 +353,50 @@ class OSQPSolver:
     Instances own mutable solver state; use one instance per control/planning loop.
     """
 
-    def __init__(self, *, eps_abs=1e-8, eps_rel=1e-8, eps_prim_inf=1e-8, eps_dual_inf=1e-8,
-                 max_iter=20000, polishing=False,
-                 variable_scaling=None, adaptive_rho_interval=0):
+    def __init__(
+        self,
+        *,
+        eps_abs=1e-8,
+        eps_rel=1e-8,
+        eps_prim_inf=1e-8,
+        eps_dual_inf=1e-8,
+        max_iter=20000,
+        polishing=False,
+        variable_scaling=None,
+        adaptive_rho_interval=0,
+    ):
         tolerances = [eps_abs, eps_rel, eps_prim_inf, eps_dual_inf]
         if not np.isfinite(tolerances).all() or min(tolerances) <= 0:
             raise ValueError("solver tolerances must be finite and positive")
-        if isinstance(max_iter, bool) or not isinstance(max_iter, (int, np.integer)) or max_iter < 1:
+        if (
+            isinstance(max_iter, bool)
+            or not isinstance(max_iter, (int, np.integer))
+            or max_iter < 1
+        ):
             raise ValueError("max_iter must be a positive integer")
         if not isinstance(polishing, bool):
             raise ValueError("polishing must be boolean")
-        if (isinstance(adaptive_rho_interval, bool) or
-                not isinstance(adaptive_rho_interval, (int, np.integer)) or adaptive_rho_interval < 0):
+        if (
+            isinstance(adaptive_rho_interval, bool)
+            or not isinstance(adaptive_rho_interval, (int, np.integer))
+            or adaptive_rho_interval < 0
+        ):
             raise ValueError("adaptive_rho_interval must be a nonnegative integer")
         self._variable_scaling = None
         if variable_scaling is not None:
             scale = array(variable_scaling, 1, "variable scaling")
-            if not scale.size or np.any(scale <= 0):
+            if not scale.size or (scale <= 0).any():
                 raise ValueError("variable scaling must be nonempty and positive")
             self._variable_scaling = _immutable(scale)
-        self._settings = dict(eps_abs=float(eps_abs), eps_rel=float(eps_rel),
-                              eps_prim_inf=float(eps_prim_inf), eps_dual_inf=float(eps_dual_inf),
-                              max_iter=int(max_iter), polishing=polishing,
-                              adaptive_rho_interval=int(adaptive_rho_interval))
+        self._settings = dict(
+            eps_abs=float(eps_abs),
+            eps_rel=float(eps_rel),
+            eps_prim_inf=float(eps_prim_inf),
+            eps_dual_inf=float(eps_dual_inf),
+            max_iter=int(max_iter),
+            polishing=polishing,
+            adaptive_rho_interval=int(adaptive_rho_interval),
+        )
         self.reset()
 
     @property
@@ -318,46 +415,86 @@ class OSQPSolver:
         self._upper_cache = _UpperCSC()
 
     def solve(self, problem, warm_start=None):
-        p = problem
-        p._check_vectors()
+        problem._check_vectors()
         scale = self._variable_scaling
-        if scale is not None and scale.shape != p.gradient.shape:
+        if scale is not None and scale.shape != problem.gradient.shape:
             raise ValueError("variable scaling and QP dimensions differ")
-        if np.any(p.lower > p.upper) or np.isposinf(p.lower).any() or np.isneginf(p.upper).any():
+        if (
+            (problem.lower > problem.upper).any()
+            or np.isposinf(problem.lower).any()
+            or np.isneginf(problem.upper).any()
+        ):
             return QPResult("infeasible", detail="inconsistent constraint bounds")
         if warm_start is not None:
             warm_start = array(warm_start, 1, "warm_start")
-            if warm_start.shape != p.gradient.shape:
+            if warm_start.shape != problem.gradient.shape:
                 raise ValueError("warm start dimensions differ")
-        keys = (_immutable_matrix_key(p.hessian), _immutable_matrix_key(p.constraint))
-        same_h = (self._solver is not None
-                  and _same_matrix(self._hessian, p.hessian, self._matrix_keys[0], keys[0]))
-        same_a = (self._solver is not None
-                  and _same_matrix(self._constraint, p.constraint, self._matrix_keys[1], keys[1]))
-        same_matrices = same_h and same_a
-        # Public read-only flags can be reversed and sparse metadata can be
-        # replaced. Revalidate changed inputs before touching the workspace.
-        # Only the exact immutable view certified at construction may bypass
-        # matrix validation; solver-owned value snapshots protect reuse later.
-        if not same_h and not _same_immutable_key(getattr(p, "_validated_hessian_key", None), keys[0]):
-            p._validate_hessian()
-        if not same_a and not _same_immutable_key(getattr(p, "_validated_constraint_key", None), keys[1]):
-            p._validate_constraint()
+        try:
+            warm_start = self._update_workspace(problem, warm_start)
+            if warm_start is not None:
+                self._solver.warm_start(x=warm_start)
+            with OSQP_EXECUTION_LOCK:
+                result = self._solver.solve(raise_error=False)
+        except osqp.OSQPException as exc:
+            self.reset()
+            return QPResult("error", detail=str(exc))
+        return self._validate_result(problem, result)
+
+    def _update_workspace(self, problem, warm_start):
+        """Validate changed inputs, update OSQP, and retain matrix snapshots.
+
+        Matrix identity, sparsity, and numeric values have separate reuse rules:
+        unchanged matrices need only new vectors; the same sparsity permits a
+        numeric update; changed sparsity requires a fresh OSQP workspace.
+        """
+        scale = self._variable_scaling
+        keys = (_immutable_matrix_key(problem.hessian), _immutable_matrix_key(problem.constraint))
+        same_hessian = self._solver is not None and _same_matrix(
+            self._hessian, problem.hessian, self._matrix_keys[0], keys[0]
+        )
+        same_constraint = self._solver is not None and _same_matrix(
+            self._constraint, problem.constraint, self._matrix_keys[1], keys[1]
+        )
+        same_matrices = same_hessian and same_constraint
+
+        # A reversible read-only flag is not a validation certificate. Only
+        # matching immutable storage and view metadata can bypass a new check.
+        if not same_hessian and not _same_immutable_key(
+            getattr(problem, "_validated_hessian_key", None), keys[0]
+        ):
+            problem._validate_hessian()
+        if not same_constraint and not _same_immutable_key(
+            getattr(problem, "_validated_constraint_key", None), keys[1]
+        ):
+            problem._validate_constraint()
+
         if not same_matrices:
-            h = self._sparse_hessian if same_h else _upper_csc(p.hessian, self._upper_cache)
-            a = self._sparse_constraint if same_a else sparse.csc_matrix(p.constraint)
-            if not same_a:
-                physical_a = a
+            hessian = (
+                self._sparse_hessian
+                if same_hessian
+                else _upper_csc(problem.hessian, self._upper_cache)
+            )
+            constraint = (
+                self._sparse_constraint
+                if same_constraint
+                else sparse.csc_matrix(problem.constraint)
+            )
+            if not same_constraint:
+                physical_constraint = constraint
             if scale is not None:
-                if not same_h:
-                    h = _scaled_csc(h, scale, rows=True)
-                if not same_a:
-                    physical_a = a.copy()
-                    a = _scaled_csc(a, scale)
-                if not np.isfinite(h.data).all() or not np.isfinite(a.data).all():
+                if not same_hessian:
+                    hessian = _scaled_csc(hessian, scale, rows=True)
+                if not same_constraint:
+                    physical_constraint = constraint.copy()
+                    constraint = _scaled_csc(constraint, scale)
+                if not np.isfinite(hessian.data).all() or not np.isfinite(constraint.data).all():
                     raise ValueError("nonfinite scaled QP matrices")
-            pattern = tuple((v.shape, v.indptr.tobytes(), v.indices.tobytes()) for v in (h, a))
-        gradient = p.gradient
+            pattern = tuple(
+                (matrix.shape, matrix.indptr.tobytes(), matrix.indices.tobytes())
+                for matrix in (hessian, constraint)
+            )
+
+        gradient = problem.gradient
         if scale is not None:
             with np.errstate(over="raise", invalid="raise", divide="raise"):
                 try:
@@ -366,38 +503,44 @@ class OSQPSolver:
                         warm_start = warm_start / scale
                 except FloatingPointError as exc:
                     raise ValueError("nonfinite scaled QP vectors") from exc
-        try:
-            if same_matrices:
-                self._solver.update(q=gradient, l=p.lower, u=p.upper)
-            elif pattern != self._pattern:
-                self._solver = osqp.OSQP()
-                self._solver.setup(P=h, q=gradient, A=a, l=p.lower, u=p.upper,
-                                   verbose=False, warm_starting=True, **self._settings)
-                self._pattern = pattern
-            else:
-                updates = dict(q=gradient, l=p.lower, u=p.upper)
-                if not same_h:
-                    updates["Px"] = h.data
-                if not same_a:
-                    updates["Ax"] = a.data
-                self._solver.update(**updates)
-            # Own snapshots: caller mutations must invalidate reuse. Retain
-            # each unchanged matrix independently of the other matrix.
-            if not same_h:
-                self._hessian = p.hessian.copy()
-                self._sparse_hessian = h
-            if not same_a:
-                self._constraint = p.constraint.copy()
-                self._sparse_constraint = a
-                self._physical_constraint = physical_a
-            self._matrix_keys = keys
-            if warm_start is not None:
-                self._solver.warm_start(x=warm_start)
-            with OSQP_EXECUTION_LOCK:
-                result = self._solver.solve(raise_error=False)
-        except osqp.OSQPException as exc:
-            self.reset()
-            return QPResult("error", detail=str(exc))
+
+        if same_matrices:
+            self._solver.update(q=gradient, l=problem.lower, u=problem.upper)
+        elif pattern != self._pattern:
+            self._solver = osqp.OSQP()
+            self._solver.setup(
+                P=hessian,
+                q=gradient,
+                A=constraint,
+                l=problem.lower,
+                u=problem.upper,
+                verbose=False,
+                warm_starting=True,
+                **self._settings,
+            )
+            self._pattern = pattern
+        else:
+            updates = dict(q=gradient, l=problem.lower, u=problem.upper)
+            if not same_hessian:
+                updates["Px"] = hessian.data
+            if not same_constraint:
+                updates["Ax"] = constraint.data
+            self._solver.update(**updates)
+
+        # Record snapshots after setup/update returns. Preserve the original A
+        # independently of solver scaling for physical residual validation.
+        if not same_hessian:
+            self._hessian = problem.hessian.copy()
+            self._sparse_hessian = hessian
+        if not same_constraint:
+            self._constraint = problem.constraint.copy()
+            self._sparse_constraint = constraint
+            self._physical_constraint = physical_constraint
+        self._matrix_keys = keys
+        return warm_start
+
+    def _validate_result(self, problem, result):
+        """Map solver coordinates to physical units and enforce acceptance."""
         status = result.info.status.lower()
         if result.info.status_val != 1 or result.x is None:
             if "infeasible" in status:
@@ -407,23 +550,35 @@ class OSQPSolver:
             else:
                 status = "error"
             return QPResult(status, iterations=result.info.iter, detail=result.info.status)
-        if np.shape(result.x) != p.gradient.shape or not np.isfinite(result.x).all():
-            return QPResult("error", iterations=result.info.iter, detail="invalid or nonfinite solution")
+        if np.shape(result.x) != problem.gradient.shape or not np.isfinite(result.x).all():
+            return QPResult(
+                "error", iterations=result.info.iter, detail="invalid or nonfinite solution"
+            )
         solution = result.x
-        if scale is not None:
+        if self._variable_scaling is not None:
             with np.errstate(over="ignore", invalid="ignore"):
-                solution = result.x * scale
+                solution = result.x * self._variable_scaling
             if not np.isfinite(solution).all():
-                return QPResult("error", iterations=result.info.iter, detail="nonfinite physical solution")
-        x = array(solution, 1, "solution")
-        # Evaluate the original A in physical coordinates. Cached CSC storage
-        # avoids scanning dense zeros; numerical scaling never changes the
-        # independent absolute feasibility threshold.
-        ax = self._physical_constraint @ x
-        if not np.isfinite(ax).all():
-            return QPResult("error", iterations=result.info.iter, detail="nonfinite constraint evaluation")
-        violation = float(max(np.max(p.lower - ax, initial=0), np.max(ax - p.upper, initial=0)))
+                return QPResult(
+                    "error", iterations=result.info.iter, detail="nonfinite physical solution"
+                )
+        solution = array(solution, 1, "solution")
+        constraint_values = self._physical_constraint @ solution
+        if not np.isfinite(constraint_values).all():
+            return QPResult(
+                "error", iterations=result.info.iter, detail="nonfinite constraint evaluation"
+            )
+        violation = float(
+            max(
+                (problem.lower - constraint_values).max(initial=0),
+                (constraint_values - problem.upper).max(initial=0),
+            )
+        )
         if violation > 1e-6:
-            return QPResult("error", iterations=result.info.iter, violation=violation,
-                            detail="solution exceeds absolute constraint tolerance")
-        return QPResult("solved", x, result.info.iter, violation, result.info.status)
+            return QPResult(
+                "error",
+                iterations=result.info.iter,
+                violation=violation,
+                detail="solution exceeds absolute constraint tolerance",
+            )
+        return QPResult("solved", solution, result.info.iter, violation, result.info.status)
