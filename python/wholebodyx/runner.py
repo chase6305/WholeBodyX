@@ -11,17 +11,18 @@ from .experiments import SCENARIOS
 from .session import TrackingSession
 
 
-def run(scenario, backend="python", mpc_backend=None, steps=None, csv_path=None, *, mode=None, registry=None):
+def run(scenario, backend="python", mpc_backend=None, steps=None, csv_path=None, *,
+        mode=None, registry=None):
     if scenario not in SCENARIOS:
         raise ValueError(f"unknown scenario: {scenario}")
-    required = SCENARIOS[scenario].mode
-    if mode is not None and required is not None and mode != required:
-        raise ValueError(f"{scenario} requires {required}")
-    count = SCENARIOS[scenario].steps if steps is None else steps
-    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+    required_mode = SCENARIOS[scenario].mode
+    if mode is not None and required_mode is not None and mode != required_mode:
+        raise ValueError(f"{scenario} requires {required_mode}")
+    step_count = SCENARIOS[scenario].steps if steps is None else steps
+    if isinstance(step_count, bool) or not isinstance(step_count, int) or step_count < 1:
         raise ValueError("steps must be a positive integer")
     session = TrackingSession(backend=backend, scenario=scenario, mpc_backend=mpc_backend,
-                              mode=mode or required or "MPC + WBC", registry=registry)
+                              mode=mode or required_mode or "MPC + WBC", registry=registry)
     squared_error = max_position = max_orientation = max_relative = max_violation = 0.0
     with ExitStack() as stack:
         stream, writer = None, None
@@ -29,7 +30,7 @@ def run(scenario, backend="python", mpc_backend=None, steps=None, csv_path=None,
             path = Path(csv_path)
             path.parent.mkdir(parents=True, exist_ok=True)
             stream = stack.enter_context(path.open("w", newline="", encoding="utf-8"))
-        for _ in range(count):
+        for _ in range(step_count):
             sample = session.step()
             # Only export needs an expanded row. Keep the session's history
             # untouched and avoid creating dozens of unused scalar fields.
@@ -64,9 +65,9 @@ def run(scenario, backend="python", mpc_backend=None, steps=None, csv_path=None,
     return {
         "scenario": scenario, "mode": session.mode, "control_dt_s": session.dt,
         "wbc_backend": session.backend, "mpc_backend": session.mpc_backend,
-        "steps": count, "duration_s": row["time"],
+        "steps": step_count, "duration_s": row["time"],
         "final_position_error_m": final_position,
-        "rms_position_error_m": float(np.sqrt(squared_error / (2 * count))),
+        "rms_position_error_m": float(np.sqrt(squared_error / (2 * step_count))),
         "max_position_error_m": max_position,
         "max_orientation_error_rad": max_orientation,
         "orientation_controlled": scenario != "coordination",
