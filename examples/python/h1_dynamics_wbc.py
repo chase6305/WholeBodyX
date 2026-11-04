@@ -11,6 +11,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from wholebodyx.dynamics import ContactWBC, DynamicsState, FloatingBaseDynamics
+from wholebodyx import CoMReference, CoMState, CoMReferenceManager
 from wholebodyx.centroidal import CoMPreviewMPC
 
 DEFAULT_URDF = Path(__file__).resolve().parents[3] / "HumanoidAssets/UnitreeH1/robot.urdf"
@@ -49,7 +50,9 @@ class DynamicsDemo:
         self.controller = ContactWBC(r, self.state)
         if self.push_force:
             self.controller.contact_reserve = .5
-        self.initial_com = r.terms(self.state)[5].copy()
+        self._terms_state = self.state
+        self._terms = r.terms(self.state)
+        self.initial_com = self._terms.com.copy()
         self.max_dynamics_residual = self.max_contact_error = self.max_violation = 0.
         self.steps = 0
         self._manual_push_until = 0.
@@ -58,10 +61,12 @@ class DynamicsDemo:
         self.last_mpc_ms = 0.
         self.mpc_continuity_fallbacks = 0
         self.planner = None
+        self.reference_manager = None
         if self.controller_mode == "mpc":
-            support = np.array([(pose.translation + pose.rotation @ [x, y, 0.])[:2]
-                                for pose in self.controller.anchors for x in (-.10, .10) for y in (-.035, .035)])
+            support = np.concatenate([(pose.translation + spec.corners() @ pose.rotation.T)[:, :2]
+                                      for pose, spec in zip(self.controller.anchors, r.contact_specs)])
             self.planner = CoMPreviewMPC(support, self.initial_com[2])
+            self.reference_manager = CoMReferenceManager(self.planner)
 
     def target(self, stamp):
         target = self.initial_com.copy()
@@ -86,49 +91,53 @@ class DynamicsDemo:
         self._manual_push_until = self.state.stamp + duration
 
     def _replan_com(self, terms, targets, target_velocities):
-        """Keep reference acceleration continuous while feeding back measured p/v.
+        """Explicit refresh retained for diagnostics and application experiments."""
+        velocity, acceleration = self.target_derivatives(self.state.stamp)
+        desired = CoMReference(self.target(self.state.stamp), self.state.stamp,
+                                self.state.stamp + self.dt, velocity, acceleration)
+        update = self.reference_manager.update(
+            CoMState(terms.com, terms.com_velocity, self.com_acceleration, self.state.stamp),
+            desired, self.dt, preview=lambda stamps: (targets, target_velocities), force=True)
+        self.mpc_continuity_fallbacks = self.reference_manager.continuity_fallbacks
+        if not update.success:
+            raise RuntimeError(f"CoM MPC failed: {update.detail}")
+        return self.reference_manager.plan
 
-        Acceleration is the preview's command state, not a measured state to
-        overwrite every 100 ms. If it is incompatible with measured p/v and
-        support constraints, retry once from the plant acceleration instead.
-        Both plans go through the same MPC feasibility checks.
-        """
-        planner = self.planner
-        previous = planner.last_plan
-        measured = self.com_acceleration[:2]
-        seed = measured if previous is None else previous.sample(self.state.stamp)[2]
-
-        def solve(acceleration):
-            return planner.plan(terms[5][:2], terms[6][:2], acceleration, targets, self.state.stamp,
-                                target_velocities=target_velocities)
-
-        try:
-            return solve(seed)
-        except RuntimeError:
-            if previous is None:
-                raise
-            self.mpc_continuity_fallbacks += 1
-            return solve(measured)
+    def _preview_com(self, stamps):
+        return (np.array([self.target(stamp)[:2] for stamp in stamps]),
+                np.array([self.target_derivatives(stamp)[0][:2] for stamp in stamps]))
 
     def step(self):
+        try:
+            return self._step()
+        except BaseException:
+            if self.reference_manager is not None:
+                self.reference_manager.invalidate("retry")
+            raise
+
+    def _step(self):
         target = self.target(self.state.stamp)
         velocity, acceleration = self.target_derivatives(self.state.stamp)
         mpc_ms = 0.
+        reference = CoMReference(target, self.state.stamp, self.state.stamp + self.dt,
+                                  velocity=velocity, acceleration=acceleration)
         if self.planner is not None:
-            if self.steps % 20 == 0:
-                before = time.perf_counter()
-                terms = self.robot.terms(self.state)
-                targets = np.array([self.target(self.state.stamp + (k + 1) * self.planner.dt)[:2]
-                                    for k in range(self.planner.horizon)])
-                target_velocities = np.array([self.target_derivatives(self.state.stamp + (k + 1) * self.planner.dt)[0][:2]
-                                              for k in range(self.planner.horizon)])
-                self._replan_com(terms, targets, target_velocities)
-                mpc_ms = (time.perf_counter() - before) * 1000
+            # The preceding integration already evaluated this measured state.
+            # Re-evaluate if an application explicitly replaced the state.
+            terms = self._terms if self._terms_state is self.state else self.robot.terms(self.state)
+            update = self.reference_manager.update(
+                CoMState(terms.com, terms.com_velocity, self.com_acceleration, self.state.stamp),
+                reference, self.dt, preview=self._preview_com)
+            self.mpc_continuity_fallbacks = self.reference_manager.continuity_fallbacks
+            if not update.success:
+                raise RuntimeError(f"CoM MPC failed: {update.detail}")
+            if update.replanned:
+                mpc_ms = update.solve_ms
                 self.last_mpc_ms = mpc_ms
-            target[:2], velocity[:2], acceleration[:2] = self.planner.last_plan.sample(self.state.stamp)
+            reference = update.reference
+        target = reference.position
         started = time.perf_counter()
-        command = self.controller.solve(self.state, target, self.dt,
-                                        target_velocity=velocity, target_acceleration=acceleration)
+        command = self.controller.step(self.state, reference, self.dt)
         solve_ms = (time.perf_counter() - started) * 1000
         # Apply a world-Y force at the pelvis origin only in the plant. WBC
         # receives measured state on the next step, not the disturbance itself.
@@ -138,17 +147,18 @@ class DynamicsDemo:
             push = max(push, self._manual_push_force)
         external_force = np.zeros(self.robot.nv)
         external_force[:3] = Rotation.from_quat(self.state.q[3:7]).as_matrix().T @ [0., push, 0.]
-        acceleration, wrench = self.robot.forward(self.state, command["torque"], command["contact_rhs"], command["terms"],
+        acceleration, wrench = self.robot.forward(self.state, command.torque, command.contact_rhs, command.terms,
                                                    external_force=external_force)
-        mass, bias, jac = command["terms"][:3]
+        mass, bias, jac = command.terms[:3]
         forward_residual = float(np.max(np.abs(mass @ acceleration + bias -
-            self.robot.selection @ command["torque"] - jac.T @ wrench - external_force)))
-        agreement = float(np.max(np.abs(acceleration - command["acceleration"])))
+            self.robot.selection @ command.torque - jac.T @ wrench - external_force)))
+        agreement = float(np.max(np.abs(acceleration - command.acceleration)))
         contact_violation = self.controller.contact_violation(wrench)
         if contact_violation > 1e-5:
             raise RuntimeError(f"forward contact wrench violates support bounds: {contact_violation}")
         self.state = self.robot.integrate(self.state, acceleration, self.dt)
         terms = self.robot.terms(self.state)
+        self._terms_state, self._terms = self.state, terms
         self.steps += 1
         self.com_acceleration = terms[8] @ acceleration + terms[7]
         error = max(np.linalg.norm(p.translation - a.translation) for p, a in zip(terms[4], self.controller.anchors))
@@ -302,7 +312,7 @@ def view(urdf, motion, amplitude, host, port, autoplay=True, loop=True, controll
                 projected_target.position = [*demo.target(demo.state.stamp)[:2], .018]
                 projected_com.visible = projected_target.visible = overlays.value
                 if preview_marker is not None:
-                    plan = demo.planner.last_plan
+                    plan = demo.reference_manager.plan
                     preview_marker.visible = preview_path.visible = overlays.value and plan is not None
                     support_outline.visible = overlays.value
                     if plan is not None:

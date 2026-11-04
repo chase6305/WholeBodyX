@@ -70,6 +70,22 @@ def test_gate_rejects_out_of_range_sensor_values_before_command():
             CommandGate(limits(), .02).observe(state)
 
 
+@pytest.mark.parametrize("stamp", [1e8, 1e12, 1e13])
+def test_gate_rejects_short_or_shifted_commands_on_coarse_clocks(stamp):
+    dt = .01
+    gate = CommandGate(limits(), dt)
+    state = RobotState([0, 0], [0, 0], stamp)
+    gate.observe(state)
+    assert gate.validate(state, VelocityCommand([0, 0], stamp, stamp + dt)) is not None
+    with pytest.raises(ValueError, match="cover"):
+        gate.validate(state, VelocityCommand([0, 0], stamp, np.nextafter(stamp + dt, stamp)))
+    with pytest.raises(ValueError, match="timestamp"):
+        gate.validate(state, VelocityCommand([0, 0], np.nextafter(stamp, np.inf), stamp + dt))
+    changed = RobotState(state.q, state.v, np.nextafter(stamp, np.inf))
+    with pytest.raises(ValueError, match="latest observed state"):
+        gate.validate(changed, VelocityCommand([0, 0], changed.stamp, stamp + dt))
+
+
 @pytest.mark.parametrize("component", ["q", "v"])
 def test_gate_binds_command_to_observed_values_not_only_timestamp(component):
     gate = CommandGate(limits(), .02)
@@ -123,8 +139,15 @@ def test_execution_deadline_covers_each_stage_and_latches_fault(monkeypatch, sta
             return original(*args)
         setattr(owner, name, delayed)
     loop = VelocityControlLoop(backend, limits(), controller, .02, max_cycle_time=.01)
-    with pytest.raises(RuntimeError, match="execution deadline"):
+    with pytest.raises(RuntimeError, match="execution deadline") as caught:
         loop.step(factory)
+    reason = caught.value.__cause__
+    assert isinstance(reason, hardware.ExecutionDeadlineError)
+    assert reason.mode == "velocity"
+    assert reason.stage == {"read": "after_read", "task": "after_tasks",
+                            "control": "before_write", "write": "after_write"}[stage]
+    assert reason.elapsed_s == .03 and reason.budget_s == .01
+    assert reason.write_completed == (stage == "write")
     assert backend.writes == (1 if stage == "write" else 0)
     assert backend.stops == 1 and loop.fault
     with pytest.raises(RuntimeError, match="faulted"):
@@ -143,12 +166,39 @@ def test_execution_budget_cannot_extend_command_validity_and_reset_recovers(monk
         return solved(np.zeros(2), 3, 3.02)
     controller = SimpleNamespace(reset=lambda: None, step=step)
     loop = VelocityControlLoop(backend, limits(), controller, .02, max_cycle_time=1.)
-    with pytest.raises(RuntimeError, match="execution deadline"):
+    with pytest.raises(RuntimeError, match="execution deadline") as caught:
         loop.step(tasks)
+    assert caught.value.__cause__.budget_s == pytest.approx(.02)
+    assert caught.value.__cause__.stage == "before_write"
     assert backend.writes == 0
     loop.reset()
     controller.step = lambda *args: solved(np.zeros(2), 3, 3.02)
     assert loop.step(tasks).cycle_ms == 0
+
+
+@pytest.mark.parametrize("elapsed", [np.nan, np.inf, -1.])
+def test_invalid_wall_clock_keeps_safe_stop_and_json_deadline_details(monkeypatch, elapsed):
+    import json
+    import wholebodyx.hardware as hardware
+
+    now = [0.]
+    monkeypatch.setattr(hardware, "perf_counter", lambda: now[0])
+    backend = MockBackend(RobotState([0., 0.], [0., 0.]))
+    original = backend.read
+    def read():
+        now[0] = elapsed
+        return original()
+    backend.read = read
+    loop = VelocityControlLoop(backend, limits(), KinematicWBC(limits()), .02, max_cycle_time=.01)
+    with pytest.raises(RuntimeError, match="execution deadline") as caught:
+        loop.step(tasks)
+    reason = caught.value.__cause__
+    assert isinstance(reason, hardware.ExecutionDeadlineError) and reason.stage == "after_read"
+    assert not reason.write_completed and backend.writes == 0 and backend.stops == 1
+    details = reason.as_dict()
+    assert details["elapsed_finite"] == bool(np.isfinite(elapsed))
+    assert details["elapsed_s"] == (-1. if elapsed == -1. else None)
+    json.dumps(details, allow_nan=False)
 
 
 @pytest.mark.parametrize("budget", [0, -1., np.nan, np.inf])

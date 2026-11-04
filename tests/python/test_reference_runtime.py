@@ -184,3 +184,13 @@ def test_single_precision_display_stamp_keeps_a_current_plan():
 def test_invalid_runtime_settings(period, tolerance):
     with pytest.raises(ValueError):
         MPCReferenceManager(HoldPlanner(), bounds(), period, tolerance)
+
+
+def test_clock_roundoff_allowance_cannot_advance_replan_by_half_a_period():
+    runtime = MPCReferenceManager(HoldPlanner(), bounds())
+    origin = 1e8
+    tick = float(np.spacing(origin))
+    assert runtime.update(at(origin), [0], tick).replanned
+    update = runtime.update(at(origin + .05), [0], tick)
+    assert update.success and update.reason == "reused"
+    assert runtime.update(at(origin + .1), [0], tick).reason == "periodic"

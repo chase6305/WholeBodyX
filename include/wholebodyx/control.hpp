@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Eigen/Core>
+#include <cstddef>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -8,6 +9,7 @@
 #include <vector>
 
 namespace wholebodyx {
+namespace detail { struct FixedQP; }
 using Vector = Eigen::VectorXd;
 using Matrix = Eigen::MatrixXd;
 
@@ -70,6 +72,12 @@ class OSQPSolver final : public QPSolver {
   QPResult solve(const QuadraticProgram&, const Vector& warm_start = Vector()) override;
 
  private:
+  friend class JointMPC;
+  QPResult solve_fixed(std::shared_ptr<const detail::FixedQP>, const Vector& gradient,
+                       const Vector& lower, const Vector& upper, const Vector& warm_start);
+  QPResult solve_impl(const Matrix& hessian, const Vector& gradient, const Matrix& constraint,
+                      const Vector& lower, const Vector& upper, const Vector& warm_start);
+  QPResult run(const Vector& lower, const Vector& upper, const Vector& warm_start);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
@@ -90,6 +98,8 @@ class Controller {
   virtual ControlResult step(const RobotState&, const std::vector<LinearTask>&, double dt) = 0;
 };
 
+// Weighted velocity least squares with hard bounds. Smoothing penalizes
+// deviation from the measured state.v.
 class KinematicWBC final : public Controller {
  public:
   KinematicWBC(JointLimits, double regularization = 1e-6, double smoothing = 0.0,
@@ -131,6 +141,7 @@ class JointMPC final : public Planner {
   void reset() override;
   QuadraticProgram formulate(const RobotState&, const Vector& goal) const;
   PlanResult solve(const RobotState&, const Vector& goal) override;
+  std::size_t fixed_matrix_bytes() const;
 
  private:
   JointLimits limits_;
@@ -138,7 +149,9 @@ class JointMPC final : public Planner {
   double dt_, tracking_weight_, control_weight_, terminal_weight_;
   std::shared_ptr<QPSolver> solver_;
   std::optional<JointPlan> last_plan_;
-  Matrix hessian_, constraint_, gradient_map_;
+  void vectors(const RobotState&, const Vector& goal, Vector& gradient, Vector& lower, Vector& upper) const;
+  std::shared_ptr<const detail::FixedQP> fixed_;
+  Vector gradient_weights_;
   Vector lower_, upper_;
 };
 }  // namespace wholebodyx

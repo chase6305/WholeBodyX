@@ -9,23 +9,8 @@ from wholebodyx.dynamics import ContactWBC, DynamicsState, DynamicsTerms, Floati
 
 
 @pytest.fixture
-def robot_state(tmp_path):
-    path = tmp_path / "standing.urdf"
-    path.write_text('''<robot name="standing">
-      <link name="base"><inertial><origin xyz="0 0 0.3"/>
-        <mass value="10"/><inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/>
-      </inertial></link>
-      <link name="arm"><inertial><origin xyz="0 0 0.1"/>
-        <mass value="1"/><inertia ixx="0.1" ixy="0" ixz="0" iyy="0.1" iyz="0" izz="0.1"/>
-      </inertial></link>
-      <joint name="shoulder" type="revolute"><parent link="base"/><child link="arm"/>
-        <origin xyz="0 0 0.5"/><axis xyz="0 0 1"/>
-        <limit lower="-1" upper="1" velocity="2" effort="10"/>
-      </joint></robot>''', encoding="utf-8")
-    robot = FloatingBaseDynamics(path, feet=("base",))
-    q = robot.pin.neutral(robot.model)
-    q[2] = .07
-    return robot, DynamicsState(q, np.zeros(robot.nv))
+def robot_state(floating_robot):
+    return floating_robot
 
 
 def test_named_terms_are_independent_snapshots_with_tuple_compatibility(robot_state):
@@ -37,6 +22,20 @@ def test_named_terms_are_independent_snapshots_with_tuple_compatibility(robot_st
     moved = DynamicsState(robot.pin.integrate(robot.model, state.q, np.full(robot.nv, .001)), state.v)
     robot.terms(moved)
     np.testing.assert_array_equal(terms.mass, original)
+
+
+@pytest.mark.parametrize("field", ["mass", "contact_jacobian"])
+def test_forward_dynamics_rejects_broadcastable_model_terms(robot_state, field, monkeypatch):
+    robot, state = robot_state
+    terms = robot.terms(state)
+    malformed = terms._replace(**{field: getattr(terms, field)[:, :1]})
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("malformed model terms must not reach the linear solver")
+
+    monkeypatch.setattr(np.linalg, "lstsq", forbidden)
+    with pytest.raises(ValueError, match="dynamics term dimensions"):
+        robot.forward(state, np.zeros(robot.na), np.zeros(len(terms.contact_jacobian)), malformed)
 
 
 def test_formulation_does_not_advance_solver_and_owns_its_qp(robot_state):
@@ -162,3 +161,44 @@ def test_forward_dynamics_rejects_overflowed_solution(robot_state):
             robot.forward(state, np.full(robot.na, np.finfo(float).max),
                           np.zeros(6 * len(robot.contacts)), terms)
     assert np.isfinite(state.q).all() and np.isfinite(state.v).all() and state.stamp == 0
+
+
+def test_typed_reference_produces_a_time_bounded_result_and_preserves_legacy_reads(robot_state):
+    from wholebodyx import CoMReference, DynamicsControlResult
+
+    robot, state = robot_state
+    controller = ContactWBC(robot, state)
+    reference = CoMReference(robot.terms(state).com, state.stamp, state.stamp + .005)
+    result = controller.step(state, reference, .005)
+    assert isinstance(result, DynamicsControlResult)
+    assert result.command.stamp == state.stamp and result.command.valid_until == .005
+    assert result.solver.success and result.violation < 1e-5
+    np.testing.assert_array_equal(result.torque, result["torque"])
+    previous = controller.previous.copy()
+    with pytest.raises(ValueError):
+        result.solver.x[:] = 99
+    np.testing.assert_array_equal(controller.previous, previous)
+    for stale in (CoMReference(reference.position, .01, .02),
+                  CoMReference(reference.position, 0, .004)):
+        with pytest.raises(ValueError, match="cover"):
+            controller.step(state, stale, .005)
+    np.testing.assert_array_equal(controller.previous, previous)
+
+
+def test_explicit_contact_geometry_controls_model_placement_and_physical_bounds(robot_state, tmp_path):
+    from wholebodyx import ContactSpec
+
+    _, state = robot_state
+    specs = (ContactSpec("base", translation=[.02, 0, -.12], half_length=.2, half_width=.06),
+             ContactSpec("arm", translation=[0, 0, 0], half_length=.05, half_width=.02))
+    robot = FloatingBaseDynamics(tmp_path / "standing.urdf", contact_specs=specs)
+    terms = robot.terms(state)
+    np.testing.assert_allclose(terms.contact_poses[0].translation, [.02, 0, -.05], atol=1e-15)
+    controller = ContactWBC(robot, state)
+    force = np.array([0, 0, 100, 0, 15, 0] + [0, 0, 100, 0, 0, 0], dtype=float)
+    assert controller.contact_violation(force) <= 1e-8
+    force[4] = 0
+    force[10] = 15
+    assert controller.contact_violation(force) > 0
+    with pytest.raises(ValueError, match="distinct"):
+        FloatingBaseDynamics(tmp_path / "standing.urdf", contact_specs=[specs[0], specs[0]])

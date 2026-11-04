@@ -1,14 +1,28 @@
 """Synchronous MPC reference scheduling, independent of robot geometry and UI."""
 
 from dataclasses import dataclass
-from math import ulp
+from math import isfinite, ulp
 from time import perf_counter
 
 import numpy as np
 
-from .mpc import JointPlan, PlanResult
+from .mpc import PlanResult, _validated_joint_plan
 from .qp import QPResult
 from .types import array, positive
+
+
+def _deadline_reached(stamp, deadline, origin, control_dt):
+    """Allow roundoff from repeated clock additions across a planning period.
+
+    A low-rate plan may span many high-rate ticks. Four ULPs of the final
+    timestamp alone do not cover those additions (for example 20 x 5 ms).
+    The interval count is local to this plan, not the lifetime of the process.
+    Cap the allowance below one control tick so poor clock resolution cannot
+    turn rounding tolerance into a materially early replan.
+    """
+    ticks = max(1.0, np.ceil(max(0.0, stamp - origin) / control_dt))
+    tolerance = min((4 + ticks) * max(ulp(stamp), ulp(deadline)), 0.25 * control_dt)
+    return stamp >= deadline - tolerance
 
 
 @dataclass(frozen=True)
@@ -18,7 +32,7 @@ class ReferenceUpdate:
     reason: str
     solver: QPResult | None = None
     solve_ms: float | None = None
-    tracking_error: float | None = None  # Max joint error against the previous plan.
+    tracking_error: float | None = None  # Max joint-position error from the latest tracking check.
 
     @property
     def success(self):
@@ -69,53 +83,38 @@ class MPCReferenceManager:
             elif stamp < self.plan.stamp or stamp >= self.plan.valid_until:
                 self.invalidate("expired")
 
-    def _validate_plan(self, plan, state, control_dt):
-        if not isinstance(plan, JointPlan):
-            raise ValueError("planner must return a JointPlan value")
-        # Own a validated snapshot, independent of the adapter's arrays/workspace.
-        plan = JointPlan(plan.positions, plan.velocities, plan.stamp, plan.dt)
-        if plan.stamp != state.stamp:
-            raise ValueError("planner returned a stale or future-dated plan")
-        if plan.positions.shape[1] != state.q.size or not np.allclose(plan.positions[0], state.q, atol=1e-6, rtol=0):
-            raise ValueError("plan does not start at the supplied measured state")
-        if plan.valid_until < state.stamp + control_dt:
-            raise ValueError("plan does not cover the complete control interval")
-        tol, limits = 1e-6, self.limits
-        if (np.any(plan.positions[1:] < limits.lower - tol) or np.any(plan.positions[1:] > limits.upper + tol)
-                or np.any(np.abs(plan.velocities) > limits.velocity + tol)):
-            raise ValueError("plan violates position or velocity limits")
-        if limits.acceleration is not None:
-            change = np.diff(np.vstack((state.v, plan.velocities)), axis=0)
-            if np.any(np.abs(change) > limits.acceleration * plan.dt + tol):
-                raise ValueError("plan violates velocity-slew limits")
-        return plan
-
     def update(self, state, goal, control_dt):
         self.limits.check_state(state)
         control_dt = positive(control_dt, "control dt")
         goal = array(goal, 1, "goal")
         if goal.shape != state.q.shape:
             raise ValueError("goal and state dimensions differ")
-        if not np.isfinite(state.stamp + control_dt) or state.stamp + control_dt <= state.stamp:
+        control_end = state.stamp + control_dt
+        if not isfinite(control_end) or control_end <= state.stamp:
             raise ValueError("control interval cannot be represented")
         if self._clock_invalid or (self._last_stamp is not None and state.stamp < self._last_stamp):
             self._clock_invalid = True
             self.invalidate("clock_rollback")
-            return ReferenceUpdate(None, None, "clock_rollback", QPResult("error", detail="clock moved backward; reset the runtime"))
+            return ReferenceUpdate(
+                None,
+                None,
+                "clock_rollback",
+                QPResult("error", detail="clock moved backward; reset the runtime"),
+            )
         self._last_stamp = state.stamp
         self.discard_outdated(state.stamp, goal)
         error = None
         if self.plan is None:
             reason = self._pending_reason
-        elif state.stamp + control_dt > self.plan.valid_until:
+        elif control_end > self.plan.valid_until:
             reason = "coverage"
         else:
-            predicted, _ = self.plan.sample(state.stamp)
+            sampled = self.plan.sample(state.stamp)
+            predicted = sampled[0]
             error = float(np.max(np.abs(state.q - predicted)))
-            tolerance = 4 * max(ulp(state.stamp), ulp(self._next_replan))
             if error > self.tracking_tolerance:
                 reason = "tracking_error"
-            elif state.stamp >= self._next_replan - tolerance:
+            elif _deadline_reached(state.stamp, self._next_replan, self.plan.stamp, control_dt):
                 reason = "periodic"
             else:
                 reason = "reused"
@@ -130,18 +129,35 @@ class MPCReferenceManager:
                 result = outcome.solver
                 if not result.success or outcome.plan is None:
                     if result.status == "solved":
-                        result = QPResult("error", detail="solved result has no valid solution or plan")
-                    return ReferenceUpdate(None, None, reason, result, (perf_counter() - started) * 1000, error)
-                plan = self._validate_plan(outcome.plan, state, control_dt)
+                        result = QPResult(
+                            "error", detail="solved result has no valid solution or plan"
+                        )
+                    return ReferenceUpdate(
+                        None, None, reason, result, (perf_counter() - started) * 1000, error
+                    )
+                plan = _validated_joint_plan(outcome.plan, state, self.limits, control_dt)
                 next_replan = state.stamp + self.replan_period
-                if not np.isfinite(next_replan) or next_replan <= state.stamp:
+                if not isfinite(next_replan) or next_replan <= state.stamp:
                     raise ValueError("replan deadline cannot be represented")
             except (ValueError, RuntimeError) as exc:
-                return ReferenceUpdate(None, None, reason, QPResult("error", detail=str(exc)),
-                                       (perf_counter() - started) * 1000, error)
+                return ReferenceUpdate(
+                    None,
+                    None,
+                    reason,
+                    QPResult("error", detail=str(exc)),
+                    (perf_counter() - started) * 1000,
+                    error,
+                )
             solve_ms = (perf_counter() - started) * 1000
             self.plan, self._goal = plan, goal
             self._next_replan = next_replan
-        position, velocity = self.plan.sample(state.stamp)
-        return ReferenceUpdate(array(position, 1, "reference position"), array(velocity, 1, "reference velocity"),
-                               reason, result, solve_ms, error)
+            sampled = plan.sample(state.stamp)
+        position, velocity = sampled
+        return ReferenceUpdate(
+            array(position, 1, "reference position"),
+            array(velocity, 1, "reference velocity"),
+            reason,
+            result,
+            solve_ms,
+            error,
+        )

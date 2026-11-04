@@ -1,4 +1,8 @@
-"""Task descriptions linearized into backend-neutral least-squares terms."""
+"""Task descriptions linearized into backend-neutral least-squares terms.
+
+Tasks remain mutable so callers can update targets and gains between cycles.
+Linearization constructs independent LinearTask arrays for the controller.
+"""
 
 from dataclasses import dataclass
 
@@ -21,10 +25,10 @@ class PostureTask:
             raise ValueError("posture target dimensions differ")
         velocity = positive(self.gain, "gain") * (target - state.q)
         if self.feedforward is not None:
-            ff = array(self.feedforward, 1, "posture feedforward")
-            if ff.shape != target.shape:
+            feedforward = array(self.feedforward, 1, "posture feedforward")
+            if feedforward.shape != target.shape:
                 raise ValueError("feedforward dimensions differ")
-            velocity += ff
+            velocity += feedforward
         return LinearTask(np.eye(state.q.size), velocity, self.weight)
 
 
@@ -40,7 +44,11 @@ class FramePositionTask:
         if target.shape != (3,):
             raise ValueError("position target must have three elements")
         error = target - model.pose(state.q, self.frame).translation
-        return LinearTask(model.jacobian(state.q, self.frame)[:3], positive(self.gain, "gain") * error, self.weight)
+        return LinearTask(
+            model.jacobian(state.q, self.frame)[:3],
+            positive(self.gain, "gain") * error,
+            self.weight,
+        )
 
 
 @dataclass
@@ -53,14 +61,14 @@ class FramePoseTask:
 
     def linearize(self, model, state):
         current = model.pose(state.q, self.frame)
-        angular = Rotation.from_matrix(self.target.rotation @ current.rotation.T).as_rotvec()
-        error = np.concatenate((self.target.translation - current.translation, angular))
+        angular_error = Rotation.from_matrix(self.target.rotation @ current.rotation.T).as_rotvec()
+        error = np.concatenate((self.target.translation - current.translation, angular_error))
         velocity = positive(self.gain, "gain") * error
         if self.feedforward is not None:
-            ff = array(self.feedforward, 1, "pose feedforward")
-            if ff.shape != (6,):
+            feedforward = array(self.feedforward, 1, "pose feedforward")
+            if feedforward.shape != (6,):
                 raise ValueError("pose feedforward must have six elements")
-            velocity += ff
+            velocity += feedforward
         return LinearTask(model.jacobian(state.q, self.frame), velocity, self.weight)
 
 
@@ -81,6 +89,11 @@ class RelativePositionTask:
         target = array(self.target, 1, "relative position target")
         if target.shape != (3,):
             raise ValueError("relative position target must have three elements")
-        relative = model.pose(state.q, self.second).translation - model.pose(state.q, self.first).translation
-        jacobian = model.jacobian(state.q, self.second)[:3] - model.jacobian(state.q, self.first)[:3]
+        relative = (
+            model.pose(state.q, self.second).translation
+            - model.pose(state.q, self.first).translation
+        )
+        jacobian = (
+            model.jacobian(state.q, self.second)[:3] - model.jacobian(state.q, self.first)[:3]
+        )
         return LinearTask(jacobian, positive(self.gain, "gain") * (target - relative), self.weight)

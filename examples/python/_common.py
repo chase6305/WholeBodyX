@@ -11,7 +11,7 @@ from wholebodyx.session import TrackingSession
 def main(scenario):
     parser = argparse.ArgumentParser(description=SCENARIOS[scenario].description)
     parser.add_argument("--backend", choices=("python", "native"), default="python", help="WBC backend")
-    parser.add_argument("--mpc-backend", choices=("python", "native"), default=None)
+    parser.add_argument("--mpc-backend", choices=("python", "native", "sparse", "native-sparse"), default=None)
     parser.add_argument("--steps", type=int)
     parser.add_argument("--csv", type=Path, help="Write every headless step, including q/v and errors")
     parser.add_argument("--viewer", action="store_true")

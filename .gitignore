@@ -6,3 +6,9 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 CMakeUserPresets.json
+
+# Local benchmark and endurance evidence
+docs/assets/optimization_*
+docs/optimization_*
+docs/architecture_*
+docs/assets/architecture_*

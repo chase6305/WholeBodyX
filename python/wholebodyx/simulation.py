@@ -6,14 +6,17 @@ from .types import RobotState, array, positive
 
 
 class JointIntegrator:
-    def __init__(self, limits, initial):
+    def __init__(self, limits, initial, *, control_dt=None):
         limits.check_state(initial)
         if np.any(initial.q < limits.lower) or np.any(initial.q > limits.upper):
             raise ValueError("initial configuration is outside joint limits")
         if np.any(np.abs(initial.v) > limits.velocity):
             raise ValueError("initial velocity exceeds limits")
         self.limits = limits
+        self._control_dt = None if control_dt is None else positive(control_dt, "simulation control dt")
         self._state = initial
+
+    control_dt = property(lambda self: self._control_dt)
 
     def read(self):
         return self._state
@@ -29,7 +32,13 @@ class JointIntegrator:
             raise ValueError("configuration offset exceeds joint limits")
         self._state = candidate
 
-    def write(self, command, dt):
+    def write(self, command, dt=None):
+        if dt is None:
+            if self.control_dt is None:
+                raise ValueError("provide simulation dt or configure control_dt at construction")
+            dt = self.control_dt
+        elif self.control_dt is not None and float(dt) != self.control_dt:
+            raise ValueError("simulation dt differs from configured control_dt")
         dt = positive(dt, "simulation dt")
         state = self._state
         if command.mode != "velocity" or command.velocity.shape != state.q.shape:

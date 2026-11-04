@@ -11,7 +11,7 @@ from .experiments import SCENARIOS
 
 def _control_arguments(parser):
     parser.add_argument("--backend", choices=("python", "native"), default="python", help="WBC backend")
-    parser.add_argument("--mpc-backend", choices=("python", "native"))
+    parser.add_argument("--mpc-backend", choices=("python", "native", "sparse", "native-sparse"))
     parser.add_argument("--mode", choices=("WBC", "MPC + WBC"), help="tracking defaults to MPC + WBC")
 
 
@@ -30,7 +30,7 @@ def main(argv=None):
     viewer_parser.add_argument("--host", default="127.0.0.1")
     viewer_parser.add_argument("--port", type=int, default=8080)
     doctor_parser = commands.add_parser("doctor", help="Check optional imports and both control implementations")
-    doctor_parser.add_argument("--require", nargs="+", choices=("native", "urdf", "viz"), default=[])
+    doctor_parser.add_argument("--require", nargs="+", choices=("native", "sparse", "native-sparse", "urdf", "viz"), default=[])
     args = parser.parse_args(argv)
     try:
         if args.command == "list":

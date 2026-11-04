@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from scipy.optimize import linprog
 
-from wholebodyx.contact import rectangular_wrench_cone
+from wholebodyx.contact import ContactSpec, rectangular_wrench_cone
 
 
 def rays(mu=.6, x=.10, y=.035):
@@ -51,3 +51,26 @@ def test_facet_classification_matches_nonnegative_corner_forces():
 def test_invalid_contact_geometry(args):
     with pytest.raises(ValueError):
         rectangular_wrench_cone(*args)
+
+
+def test_contact_spec_owns_geometry_and_cone_uses_the_configured_surface():
+    translation = np.array([.01, 0, -.05])
+    spec = ContactSpec("foot", translation=translation, half_length=.2, half_width=.06,
+                       torsional_friction=.03)
+    translation[:] = 9
+    np.testing.assert_array_equal(spec.translation, [.01, 0, -.05])
+    corners = spec.corners()
+    np.testing.assert_allclose(np.max(np.abs(corners), axis=0), [.2, .06, 0])
+    force = np.array([0., 0., 100., 5., 15., 0.])
+    assert np.max(spec.wrench_cone() @ force) <= 1e-8
+    assert np.max(ContactSpec("foot").wrench_cone() @ force) > 0
+    corners[:] = 0
+    assert np.any(spec.corners())
+
+
+@pytest.mark.parametrize("kwargs", [dict(frame=""), dict(frame=" foot"), dict(half_length=0),
+                                    dict(torsional_friction=np.nan), dict(translation=[0]),
+                                    dict(rotation=np.zeros((3, 3)))])
+def test_contact_spec_rejects_ambiguous_or_invalid_geometry(kwargs):
+    with pytest.raises(ValueError):
+        ContactSpec(**(dict(frame="foot") | kwargs))

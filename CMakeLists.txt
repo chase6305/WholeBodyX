@@ -9,14 +9,15 @@ option(WBX_BUILD_EXAMPLES "Build C++ examples" ON)
 
 find_package(Eigen3 3.4 CONFIG REQUIRED)
 find_package(osqp CONFIG REQUIRED)
+find_package(Threads REQUIRED)
 
-add_library(wholebodyx cpp/control.cpp cpp/osqp_solver.cpp cpp/joint_order.cpp cpp/runtime.cpp)
+add_library(wholebodyx cpp/control.cpp cpp/osqp_solver.cpp cpp/joint_order.cpp cpp/runtime.cpp cpp/reference.cpp cpp/sparse_mpc.cpp)
 add_library(wholebodyx::wholebodyx ALIAS wholebodyx)
 target_compile_features(wholebodyx PUBLIC cxx_std_17)
 target_include_directories(wholebodyx PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(wholebodyx PUBLIC Eigen3::Eigen PRIVATE osqp::osqp)
+target_link_libraries(wholebodyx PUBLIC Eigen3::Eigen PRIVATE osqp::osqp Threads::Threads)
 set_target_properties(wholebodyx PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(WBX_BUILD_PYTHON)
@@ -37,15 +38,11 @@ if(WBX_BUILD_EXAMPLES)
   endforeach()
 endif()
 if(BUILD_TESTING)
-  add_executable(wbx_control_tests tests/cpp/control_tests.cpp)
-  target_link_libraries(wbx_control_tests PRIVATE wholebodyx)
-  add_test(NAME control COMMAND wbx_control_tests)
-  add_executable(wbx_joint_order_tests tests/cpp/joint_order_tests.cpp)
-  target_link_libraries(wbx_joint_order_tests PRIVATE wholebodyx)
-  add_test(NAME joint_order COMMAND wbx_joint_order_tests)
-  add_executable(wbx_runtime_tests tests/cpp/runtime_tests.cpp)
-  target_link_libraries(wbx_runtime_tests PRIVATE wholebodyx)
-  add_test(NAME runtime COMMAND wbx_runtime_tests)
+  foreach(test control joint_order runtime reference sparse_mpc fixed_mpc concurrency)
+    add_executable(wbx_${test}_tests tests/cpp/${test}_tests.cpp)
+    target_link_libraries(wbx_${test}_tests PRIVATE wholebodyx)
+    add_test(NAME ${test} COMMAND wbx_${test}_tests)
+  endforeach()
 endif()
 
 install(TARGETS wholebodyx EXPORT WholeBodyXTargets

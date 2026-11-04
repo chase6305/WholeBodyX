@@ -18,8 +18,12 @@ def _names(values, label):
     if isinstance(values, str):
         raise ValueError(f"{label} must be a sequence of joint names")
     values = tuple(values)
-    if not values or any(not isinstance(name, str) or not name or name.strip() != name for name in values):
-        raise ValueError(f"{label} must contain nonempty joint names without surrounding whitespace")
+    if not values or any(
+        not isinstance(name, str) or not name or name.strip() != name for name in values
+    ):
+        raise ValueError(
+            f"{label} must contain nonempty joint names without surrounding whitespace"
+        )
     if len(set(values)) != len(values):
         raise ValueError(f"{label} contains duplicate joint names")
     return values
@@ -41,15 +45,24 @@ class JointOrder:
         indices = {name: i for i, name in enumerate(model)}
         forward = tuple(indices[name] for name in backend)
         inverse = tuple(int(i) for i in np.argsort(forward))
-        for name, value in (("model_names", model), ("backend_names", backend),
-                            ("_forward", forward), ("_inverse", inverse)):
+        for name, value in (
+            ("model_names", model),
+            ("backend_names", backend),
+            ("_forward", forward),
+            ("_inverse", inverse),
+        ):
             object.__setattr__(self, name, value)
 
     def _map(self, values, indices):
         values = np.asarray(values, dtype=float)
         if values.ndim not in (1, 2) or values.shape[-1] != len(indices):
             raise ValueError("expected a joint vector or matrix with joints along its last axis")
-        return array(np.take(values, indices, axis=-1), values.ndim, "joint values")
+        # np.take already gives the mapped values an independent buffer.
+        mapped = np.take(values, indices, axis=-1)
+        if not np.isfinite(mapped).all():
+            raise ValueError(f"joint values must be a finite {values.ndim}-D array")
+        mapped.setflags(write=False)
+        return mapped
 
     def to_backend(self, values):
         """Map a model-order vector or joint columns to backend order; returns a copy."""
@@ -65,9 +78,15 @@ class JointOrder:
         return RobotState(self.to_model(state.q), self.to_model(state.v), state.stamp)
 
     def limits_to_backend(self, limits):
-        acceleration = self.to_backend(limits.acceleration) if limits.acceleration is not None else None
-        return JointLimits(self.to_backend(limits.lower), self.to_backend(limits.upper),
-                           self.to_backend(limits.velocity), acceleration)
+        acceleration = (
+            self.to_backend(limits.acceleration) if limits.acceleration is not None else None
+        )
+        return JointLimits(
+            self.to_backend(limits.lower),
+            self.to_backend(limits.upper),
+            self.to_backend(limits.velocity),
+            acceleration,
+        )
 
     def task_to_backend(self, task):
         return LinearTask(self.to_backend(task.jacobian), task.target_velocity, task.weight)
@@ -76,7 +95,9 @@ class JointOrder:
         return VelocityCommand(self.to_model(command.velocity), command.stamp, command.valid_until)
 
     def plan_to_model(self, plan):
-        return JointPlan(self.to_model(plan.positions), self.to_model(plan.velocities), plan.stamp, plan.dt)
+        return JointPlan(
+            self.to_model(plan.positions), self.to_model(plan.velocities), plan.stamp, plan.dt
+        )
 
 
 def _solver_snapshot(result):
@@ -102,8 +123,11 @@ class ReorderedController:
         self.controller.reset()
 
     def step(self, state, tasks, dt):
-        result = self.controller.step(self.order.state_to_backend(state),
-                                      [self.order.task_to_backend(task) for task in tasks], dt)
+        result = self.controller.step(
+            self.order.state_to_backend(state),
+            [self.order.task_to_backend(task) for task in tasks],
+            dt,
+        )
         if not isinstance(result, ControlResult):
             raise ValueError("wrapped controller must return ControlResult")
         solver = _solver_snapshot(result.solver)

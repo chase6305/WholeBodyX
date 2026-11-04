@@ -13,6 +13,7 @@ import sys
 import time
 
 import numpy as np
+from wholebodyx import ContactSpec
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -23,6 +24,42 @@ def module_at(name, path):
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+class _LegacyResult(dict):
+    """Permit the same demo to consume older dictionary-only controllers."""
+
+    def __getattr__(self, name):
+        return self[name]
+
+
+def _compatible_classes(implementation):
+    robot_class = implementation.FloatingBaseDynamics
+    supports_force = "external_force" in inspect.signature(robot_class.forward).parameters
+
+    class CompatibleRobot(robot_class):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            if not hasattr(self, "contact_specs"):
+                self.contact_specs = tuple(ContactSpec(name) for name in
+                                           ("left_ankle_link", "right_ankle_link"))
+
+        def forward(self, state, torque, contact_acceleration, terms, *, external_force=None):
+            if supports_force:
+                return super().forward(state, torque, contact_acceleration, terms, external_force=external_force)
+            if external_force is not None and np.any(external_force):
+                raise ValueError("reference benchmark does not support external forces")
+            return super().forward(state, torque, contact_acceleration, terms)
+
+    controller_class = implementation.ContactWBC
+    if not hasattr(controller_class, "step"):
+        class CompatibleController(controller_class):
+            def step(self, state, reference, dt):
+                return _LegacyResult(self.solve(state, reference.position, dt,
+                                                 target_velocity=reference.velocity,
+                                                 target_acceleration=reference.acceleration))
+        controller_class = CompatibleController
+    return CompatibleRobot, controller_class
 
 
 def benchmark(steps=1600, repeats=3, reference=None, *, controller="wbc", amplitude=.035, push_force=0.):
@@ -40,16 +77,7 @@ def benchmark(steps=1600, repeats=3, reference=None, *, controller="wbc", amplit
         order = list(implementations) if repeat % 2 == 0 else list(reversed(implementations))
         for name in order:
             implementation = implementations[name]
-            robot_class = implementation.FloatingBaseDynamics
-            if "external_force" not in inspect.signature(robot_class.forward).parameters:
-                class CompatibleReference(robot_class):
-                    def forward(self, state, torque, contact_acceleration, terms, *, external_force=None):
-                        if external_force is not None and np.any(external_force):
-                            raise ValueError("reference benchmark does not support external forces")
-                        return super().forward(state, torque, contact_acceleration, terms)
-                robot_class = CompatibleReference
-            demo.FloatingBaseDynamics = robot_class
-            demo.ContactWBC = implementation.ContactWBC
+            demo.FloatingBaseDynamics, demo.ContactWBC = _compatible_classes(implementation)
             session = demo.DynamicsDemo(controller=controller, amplitude=amplitude, push_force=push_force)
             latency, torque, configurations = [], [], []
             started = time.perf_counter()

@@ -23,11 +23,13 @@ def _version(name):
 def _solve_check(registry, name):
     limits = JointLimits([-2], [2], [1], [4])
     state = RobotState([0], [0])
-    planner = registry.create_planner(name, limits)
+    planner_name = name if name in registry.names("planner") else "python"
+    controller_name = name if name in registry.names("controller") else "python"
+    planner = registry.create_planner(planner_name, limits)
     reference = MPCReferenceManager(planner, limits).update(state, [.3], .02)
     if not reference.success:
         raise RuntimeError(f"MPC failed: {reference.solver.detail}")
-    controller = registry.create_controller(name, limits)
+    controller = registry.create_controller(controller_name, limits)
     result = controller.step(state, [LinearTask([[1]], reference.velocity)], .02)
     if not result.solver.success or result.command is None:
         raise RuntimeError(f"WBC failed: {result.solver.detail}")
@@ -35,6 +37,7 @@ def _solve_check(registry, name):
     plant.write(result.command, .02)
     if not np.isfinite(plant.read().q).all() or plant.read().q[0] <= 0:
         raise RuntimeError("WBC did not move toward the test goal")
+    return planner_name, controller_name
 
 
 def diagnose():
@@ -43,12 +46,14 @@ def diagnose():
     checks = {}
     for status in registry.status():
         detail = status.detail
+        check = "MPC + WBC solve"
         if status.available:
             try:
-                _solve_check(registry, status.name)
+                planner, controller = _solve_check(registry, status.name)
+                check = f"{planner} MPC + {controller} WBC solve"
             except Exception as exc:
                 detail = f"{type(exc).__name__}: {exc}"
-        checks[status.name] = {"available": not detail, "check": "MPC + WBC solve", "detail": detail}
+        checks[status.name] = {"available": not detail, "check": check, "detail": detail}
     for name, module in (("urdf", "pinocchio"), ("viz", "viser.uplot")):
         detail = ""
         try:

@@ -2,11 +2,28 @@
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 
 using namespace wholebodyx;
 void check(bool condition, const char* message) {
   if (!condition) throw std::runtime_error(message);
 }
+
+class EndpointSolver final : public QPSolver {
+ public:
+  explicit EndpointSolver(bool return_lower) : return_lower_(return_lower) {}
+  double outward_residual = 0.;
+  void reset() override {}
+  QPResult solve(const QuadraticProgram& problem, const Vector&) override {
+    Vector solution = return_lower_ ? problem.lower : problem.upper;
+    solution.array() += return_lower_ ? -outward_residual : outward_residual;
+    return {"solved", std::move(solution), 7, 0., "injected endpoint result"};
+  }
+
+ private:
+  bool return_lower_;
+};
+
 int main() {
   try {
     JointLimits limits{Vector::Constant(2, -2), Vector::Constant(2, 2), Vector::Ones(2), {}};
@@ -42,6 +59,36 @@ int main() {
     check(!wbc.step(state, {task}, 0.1).command, "infeasible WBC must not emit command");
     state.q.setZero();
     check(wbc.step(state, {task}, 0.1).solver.success(), "solver recovers after failure");
+
+    // A custom solver cannot make a reversed velocity interval executable.
+    JointLimits bounded{Vector::Constant(1, -1.), Vector::Ones(1),
+                         Vector::Constant(1, .5), Vector::Constant(1, .1)};
+    KinematicWBC checked_solver(bounded);
+    const RobotState healthy{Vector::Zero(1), Vector::Zero(1), 0.};
+    for (bool return_lower : {false, true}) {
+      auto endpoint = std::make_shared<EndpointSolver>(return_lower);
+      KinematicWBC injected(bounded, 1e-6, 0., endpoint);
+      for (double position : {-2., 2.}) {
+        const RobotState outside{Vector::Constant(1, position), Vector::Zero(1), 0.};
+        const auto rejected = injected.step(outside, {}, .1);
+        check(!rejected.command && rejected.solver.status == "error" &&
+                  rejected.solver.x.size() == 0 && rejected.solver.iterations == 7 &&
+                  rejected.solver.detail == "inconsistent WBC velocity bounds",
+              "custom solved result bypassed inconsistent WBC bounds");
+        const auto infeasible = checked_solver.step(outside, {}, .1);
+        check(!infeasible.command && infeasible.solver.status == "infeasible",
+              "built-in inconsistent bounds must remain infeasible");
+      }
+      endpoint->outward_residual = 5e-7;
+      const auto roundoff = injected.step(healthy, {}, .1);
+      const auto bounds = bounded.velocity_bounds(healthy, .1);
+      check(roundoff.command && roundoff.command->velocity[0] ==
+                  (return_lower ? bounds.first[0] : bounds.second[0]),
+            "tiny WBC residual must still normalize to the exact bound");
+      endpoint->outward_residual = 2e-6;
+      check(!injected.step(healthy, {}, .1).command,
+            "WBC must still reject excessive velocity corrections");
+    }
 
     JointLimits single{Vector::Constant(1, -10), Vector::Constant(1, 10), Vector::Constant(1, 10), {}};
     JointMPC mpc(single, 1, 0.2, 2, 0.5, 3);
@@ -82,6 +129,22 @@ int main() {
       bool rejected = false;
       try { semidefinite.validate(); } catch (const std::invalid_argument&) { rejected = true; }
       check(rejected == (eigenvalue < -1e-10), "semidefinite validation tolerance changed");
+    }
+    // Same four-step weak-constraint fixture as tests/data/scaled_qp_weak_constraint.json.
+    {
+      Matrix h(3,3),a(6,3);Vector scale(3);
+      h << 1.2433763372515545,-0.16175143146111184,-0.21466110675384828,-0.16175143146111184,2.026322680540485,0.8041543979203117,-0.21466110675384828,0.8041543979203117,1.669587122259462;
+      a << 1.458659270914995,-2.763093111109902,0.0,-1.0296005948033065,0.0,0.0,-1.970444552908006,-0.6729936510544398,-2.2883669697364195,-0.00031125791256597006,0.0,0.0,0.9037960599240652,-1.8562610356027633,0.0,0.7475220929175335,-0.546122769528383,1.1220224780325383;
+      scale << 0.2,0.7745966692414834,3.0;
+      h=scale.asDiagonal()*h*scale.asDiagonal();a=a*scale.asDiagonal();OSQPSolver solver;
+      {Vector g(3),l(6),u(6),expected(3);g << 0.47998123768084644,0.14538261224098162,-0.05555037747317496;l << -0.9459868401907392,-0.2964974282306695,-1.6519618543106929,-0.23627180180858728,-1.518478577838124,-0.11664991148582748;u << 2.2335714851102706,-0.16255673705166876,-0.03550413888149129,0.22326569487456205,1.6005040123669656,0.40783705644242196;expected << 0.15788329753512176,-0.09940451431226416,0.10144924811598355;
+      QuadraticProgram p{h,scale.asDiagonal()*g,a,l,u};auto result=solver.solve(p);check(result.success(), "weak feasible constraint falsely rejected");check((scale.asDiagonal()*result.x-expected).cwiseAbs().maxCoeff()<1e-6, "weak constraint optimum differs");}
+      {Vector g(3),l(6),u(6),expected(3);g << -0.5879845173471125,0.4915763679643912,0.037819269113322104;l << -0.8084267778259446,-1.7790799327945461,-1.863368038569567,-1.9149533580716698,-1.3722100423423238,-1.7627663221178576;u << -0.5108042500046339,1.8122285607224133,1.8357466227630037,0.2985813514652814,1.6179885694555267,0.6188601932676275;expected << 0.1142603497536735,0.2451857904269782,-0.12605466636070084;
+      QuadraticProgram p{h,scale.asDiagonal()*g,a,l,u};auto result=solver.solve(p);check(result.success(), "weak feasible constraint falsely rejected");check((scale.asDiagonal()*result.x-expected).cwiseAbs().maxCoeff()<1e-6, "weak constraint optimum differs");}
+      {Vector g(3),l(6),u(6),expected(3);g << -1.3049406807806103,-0.5246186691369124,-0.5698605830817992;l << -1.4051202096341793,-0.448183145558937,-2.3306030192063916,-1.9693995205800034,-1.104587715339929,-0.3458017528477981;u << 1.2461109939561215,0.9291983919762273,-1.269084420415561,0.7630023951141159,0.9774484123506015,2.475767785787792;expected << 0.4352980639493097,0.16812061925432942,0.31631006544170015;
+      QuadraticProgram p{h,scale.asDiagonal()*g,a,l,u};auto result=solver.solve(p);check(result.success(), "weak feasible constraint falsely rejected");check((scale.asDiagonal()*result.x-expected).cwiseAbs().maxCoeff()<1e-6, "weak constraint optimum differs");}
+      {Vector g(3),l(6),u(6),expected(3);g << 0.21975164252926815,-0.065107587766042,0.29864143101368096;l << -1.2967724727028047,-1.3800644763515526,0.32205216100183365,6.434087411578278e-05,-0.6575402352070576,-0.8893372939183116;u << -0.45642909719444846,1.5000252190101708,1.0851801699356176,1.3844532004156456,1.1079259275909874,1.0294019104673555;expected << -0.20671241281985386,0.12012429509775968,-0.2633064310740245;
+      QuadraticProgram p{h,scale.asDiagonal()*g,a,l,u};auto result=solver.solve(p);check(result.success(), "weak feasible constraint falsely rejected");check((scale.asDiagonal()*result.x-expected).cwiseAbs().maxCoeff()<1e-6, "weak constraint optimum differs");}
     }
     std::cout << "C++ constrained optimum, infeasibility, MPC and reference checks passed\n";
   } catch (const std::exception& e) {

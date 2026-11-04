@@ -21,13 +21,16 @@ class TrackingSession:
     dt = 0.02
     frames = FRAMES
 
-    def __init__(self, backend="python", mode="MPC + WBC", scenario="tracking", mpc_backend=None, *, registry=None):
+    def __init__(self, backend="python", mode="MPC + WBC", scenario="tracking",
+                 mpc_backend=None, *, registry=None):
         if scenario not in SCENARIOS:
             raise ValueError("unknown scenario")
         self.model = PlanarDualArm()
         self.registry = (registry if registry is not None else BackendRegistry()).copy()
         self.scenario = scenario
-        self.goal = array(INITIAL_Q if scenario in ("cartesian_circle", "coordination") else DEFAULT_GOAL, 1, "goal")
+        self.goal = array(
+            INITIAL_Q if scenario in ("cartesian_circle", "coordination") else DEFAULT_GOAL,
+            1, "goal")
         self.configure(backend, SCENARIOS[scenario].mode or mode, mpc_backend)
         self.reset()
 
@@ -40,9 +43,10 @@ class TrackingSession:
         if required_mode is not None and mode != required_mode:
             raise ValueError(f"{self.scenario} requires {required_mode}")
         controller = self.registry.create_controller(backend, self.model.limits)
-        planner = self.registry.create_planner(mpc_backend, self.model.limits) if mode == "MPC + WBC" else None
+        planner = (self.registry.create_planner(mpc_backend, self.model.limits)
+                   if mode == "MPC + WBC" else None)
         manager = MPCReferenceManager(planner, self.model.limits) if planner is not None else None
-        # Commit only after every selected factory has succeeded.
+        # Keep existing components until factory creation and reset both succeed.
         controller.reset()
         if manager is not None:
             manager.reset()
@@ -72,7 +76,9 @@ class TrackingSession:
         try:
             self.scenario = scenario
             self.configure(self.backend, SCENARIOS[scenario].mode or self.mode, self.mpc_backend)
-            self.goal = array(INITIAL_Q if scenario in ("cartesian_circle", "coordination") else DEFAULT_GOAL, 1, "goal")
+            self.goal = array(
+                INITIAL_Q if scenario in ("cartesian_circle", "coordination") else DEFAULT_GOAL,
+                1, "goal")
             self.reset()
         except BaseException:
             self.__dict__ = previous
@@ -104,7 +110,8 @@ class TrackingSession:
     def set_goal(self, goal):
         goal = array(goal, 1, "goal")
         bounds = self.model.limits
-        if goal.shape != bounds.lower.shape or np.any(goal < bounds.lower) or np.any(goal > bounds.upper):
+        if (goal.shape != bounds.lower.shape
+                or np.any(goal < bounds.lower) or np.any(goal > bounds.upper)):
             raise ValueError("goal is outside joint limits or has wrong dimensions")
         if not np.array_equal(goal, self.goal):
             self.goal = goal
@@ -129,7 +136,8 @@ class TrackingSession:
 
     def _step(self):
         disturbance = np.zeros(6)
-        if self.scenario == "disturbance_recovery" and self.disturbances < len(CONFIGURATION_OFFSETS):
+        if (self.scenario == "disturbance_recovery"
+                and self.disturbances < len(CONFIGURATION_OFFSETS)):
             stamp, offset = CONFIGURATION_OFFSETS[self.disturbances]
             if self.plant.read().stamp >= stamp - 1e-9:
                 self.plant.inject_configuration_offset(offset)
@@ -139,7 +147,8 @@ class TrackingSession:
         mpc_ms = None
         update = None
         if self.mode == "MPC + WBC":
-            update = self.reference_manager.update(state, self._reference_goal(state.stamp), self.dt)
+            update = self.reference_manager.update(
+                state, self._reference_goal(state.stamp), self.dt)
             mpc_ms = update.solve_ms
             if not update.success:
                 raise RuntimeError(f"MPC: {update.solver.status} — {update.solver.detail}")
@@ -148,7 +157,8 @@ class TrackingSession:
                 self.goal_changes += int(update.reason == "goal_changed")
                 self.tracking_replans += int(update.reason == "tracking_error")
                 self.replan_stamps.append(state.stamp)
-            tasks = [PostureTask(update.position, feedforward=update.velocity).linearize(self.model, state)]
+            tasks = [PostureTask(update.position, feedforward=update.velocity).linearize(
+                self.model, state)]
         else:
             target = self.reference(state.stamp)
             tasks = wbc_tasks(self.model, state, self.scenario, target)
@@ -163,7 +173,8 @@ class TrackingSession:
             raise ValueError("WBC adapter must return a VelocityCommand")
         if result.command.stamp != state.stamp:
             raise ValueError("WBC command stamp must match the input state")
-        if not np.isfinite(result.solver.violation) or result.solver.violation > 1e-6 or result.solver.violation < 0:
+        if (not np.isfinite(result.solver.violation)
+                or result.solver.violation > 1e-6 or result.solver.violation < 0):
             raise ValueError("WBC adapter reported an invalid constraint violation")
         self.plant.write(result.command, self.dt)
         self.steps += 1
@@ -212,5 +223,6 @@ class TrackingSession:
     def links(self, q, frame):
         theta, offset = self.model._chain(q, frame)
         base = np.array([0.0, 0.4 if offset == 0 else -0.4, 0.0])
-        delta = np.column_stack((self.model.lengths * np.cos(theta), self.model.lengths * np.sin(theta), np.zeros(3)))
-        return np.vstack((base, base + np.cumsum(delta, axis=0)))
+        link_vectors = np.column_stack((self.model.lengths * np.cos(theta),
+                                        self.model.lengths * np.sin(theta), np.zeros(3)))
+        return np.vstack((base, base + np.cumsum(link_vectors, axis=0)))

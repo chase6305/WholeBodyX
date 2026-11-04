@@ -77,3 +77,9 @@ def test_doctor_retains_binary_load_error(monkeypatch):
     assert report["checks"]["python"]["available"]
     assert not report["checks"]["urdf"]["available"]
     assert "liburdfdom_model.so.4" in report["checks"]["urdf"]["detail"]
+
+
+def test_planner_only_backend_diagnostics_use_a_real_controller():
+    report = diagnostics.diagnose()
+    assert report["checks"]["sparse"]["available"]
+    assert report["checks"]["sparse"]["check"] == "sparse MPC + python WBC solve"

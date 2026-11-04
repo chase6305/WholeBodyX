@@ -30,6 +30,7 @@ MPC + WBC 示例，支持原始网格浏览器显示、WBC 单独运行和 CSV �
 | 9 | [disturbance_recovery.py](python/disturbance_recovery.py) | 状态偏移、预测偏差检测、提前重规划 | 8 s；2.06 s、4.14 s 偏移后恢复 |
 | 10 | [custom_backends.py](python/custom_backends.py) | 独立注册 WBC/MPC 工厂，共用运行器与 GUI | 8 s；使用自定义参数，检查两次偏移恢复 |
 | 11 | [joint_order_adapter.py](python/joint_order_adapter.py) | 模型、WBC、MPC 使用不同关节排列 | 8 s；逐步比较转换前后的关节/末端轨迹和恢复事件 |
+| 12 | [process_mpc_wbc.py](python/process_mpc_wbc.py) | 独立进程 MPC、未来状态预测、显式种子与 WBC 接续 | 按墙钟运行 6 s；规划与控制分别计时并回收 worker |
 
 第 4–6、9 个示例支持 `--viewer`、`--steps`、`--csv`、`--backend`、`--mpc-backend`。
 `--steps` 和 `--csv` 用于无界面运行。其他示例的参数以各自 `--help` 为准。
@@ -91,6 +92,11 @@ PYTHONPATH=build/native uv run --extra viz python -m wholebodyx.visualization \
   --scenario mpc_retargeting --backend python --mpc-backend native
 ```
 
+MPC 菜单和上述命令也接受 `--mpc-backend sparse` 与 `--mpc-backend native-sparse`。
+后者使用新 C++ 稀疏规划器，需要重建原生扩展；WBC 后端仍单独选择。
+不同预测规模的测量见 [性能说明](../docs/performance.md)，
+数值验收和并发限制见 [验证方法](../docs/validation.md) 与 [执行接口](../docs/execution.md)。
+
 ## 算法配方
 
 动态场景的参考生成与任务组合集中在 [experiments.py](../python/wholebodyx/experiments.py)，
@@ -147,7 +153,7 @@ ctest --test-dir build/native --output-on-failure
 | [joint_control.cpp](cpp/joint_control.cpp) | 6 关节 MPC → WBC 静态收敛 |
 | [task_weight_tradeoff.cpp](cpp/task_weight_tradeoff.cpp) | 四组加权解与解析结果一致 |
 | [joint_limit_handling.cpp](cpp/joint_limit_handling.cpp) | 边界收敛、失败不发命令、恢复 |
-| [mpc_retargeting.cpp](cpp/mpc_retargeting.cpp) | 2.06 s、4.14 s 非周期换目标；总计 82 次重规划 |
+| [mpc_retargeting.cpp](cpp/mpc_retargeting.cpp) | 2.06 s、4.14 s 非周期换目标；参考管理器按新目标重新计时，总计 81 次重规划 |
 | [joint_order_adapter.cpp](cpp/joint_order_adapter.cpp) | 不同 WBC/MPC 排列、不对称限位、完整预测节点与命令比较 |
 
 这些可执行程序都有数值验收条件，失败返回非零；构建时启用 `BUILD_TESTING` 后自动加入 CTest。
@@ -158,6 +164,7 @@ ctest --test-dir build/native --output-on-failure
 uv run --extra urdf python examples/python/urdf_tracking.py \
   --urdf /path/to/robot.urdf --frame tool \
   --q0 0.2 0.6 -0.4 --goal 0.5 0.4 -0.3
+uv run --extra urdf python examples/python/urdf_tracking.py --mpc --mpc-backend sparse
 ```
 
 关节数组使用 `model.joint_names` 的顺序。当前 adapter 支持固定基座、单自由度欧氏关节和有限限位。
@@ -169,6 +176,17 @@ uv run --extra urdf python examples/python/urdf_tracking.py \
 初始姿态/目标仍按模型顺序输入。C++/Python 映射、注册方式和不同排列的浏览器示例见
 [关节顺序说明](../docs/joint_order.md)。第 11 个示例支持 `--viewer`，同样使用内置双臂几何。
 
+## 自包含力矩闭环
+
+```bash
+uv run --extra urdf python examples/python/torque_control.py --csv /tmp/torque.csv
+```
+
+使用 [standing_robot.urdf](models/standing_robot.urdf) 的惯性数据，经 `TorqueControlLoop`
+下发力矩到独立正向动力学后端，施加短时关节外力矩并观察恢复。无需相邻 H1 资产。
+接触为预先固定的刚性接触，不模拟脱离、冲击或滑动；接口与边界见
+[执行组件](../docs/execution.md)。
+
 ## 后续示例设计
 
 下列场景需要新的算法或运行组件，目前没有放置占位脚本：
@@ -176,10 +194,10 @@ uv run --extra urdf python examples/python/urdf_tracking.py \
 | 场景 | 先补齐的功能 | 计划验收 |
 | --- | --- | --- |
 | 双臂搬运刚性物体 | 相对位姿/闭链约束、物体模型、碰撞约束 | 闭链误差与碰撞距离 |
-| 重力补偿与末端受力 | 逆动力学 WBC、力矩接口、动力学仿真 | 动力学残差、力矩边界、受力跟踪 |
-| 推扰恢复 | 状态估计/扰动注入、接触动力学 | 恢复时间、接触可行性 |
-| 人形双足站立与接触切换 | 浮动基座状态、摩擦锥、接触调度 | 接触滑移、质心和角动量误差 |
-| 质心 MPC → 动力学 WBC | 质心预测模型、力参考和多频率运行层 | 预测可行性、超时/失效后的处理 |
+| 末端受力跟踪 | 已有力矩接口与固定接触仿真；仍需受力目标和估计 | 动力学残差、力矩边界、受力跟踪 |
+| 实机推扰恢复 | 已有模型扰动示例；仍需实机状态估计和驱动 | 恢复时间、接触可行性 |
+| 人形接触切换 | 已有固定双脚站立；仍需接触调度与冲击模型 | 接触滑移、质心和角动量误差 |
+| 全身非线性 MPC → 动力学 WBC | 已有恒高质心 MPC；仍需全身预测和力参考 | 预测可行性、超时/失效后的处理 |
 
 先通过现有场景验证自有控制器适配，再按上述依赖顺序增加新的动力学示例。
 

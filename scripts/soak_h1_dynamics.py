@@ -1,14 +1,17 @@
 """Bounded-memory endurance check of the H1 fixed-contact dynamics demo."""
 import argparse
-import hashlib
+from collections.abc import Mapping
 import heapq
 import importlib.util
 import json
 from pathlib import Path
 import resource
+import sys
 import time
 
 import numpy as np
+
+from _measurement import rss_kib as current_rss_kib, source_hashes, sources_unchanged
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,16 +24,21 @@ def run(seconds, amplitude, output, controller="wbc", push_force=0., *, cpu_timi
     spec.loader.exec_module(module)
     demo = module.DynamicsDemo(amplitude=amplitude, controller=controller, push_force=push_force)
     steps = int(np.ceil(seconds / demo.dt))
-    sources = {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest() for path in
-               (ROOT / "python/wholebodyx/dynamics.py", ROOT / "examples/python/h1_dynamics_wbc.py",
-                ROOT / "python/wholebodyx/centroidal.py", ROOT / "python/wholebodyx/qp.py",
-                ROOT / "python/wholebodyx/contact.py")}
+    # Fingerprint the actual loaded library modules and robot model. Optional
+    # native/visualization modules that this headless path never imports do not
+    # form part of its implementation; the manifest states this exact scope.
+    paths = [Path(value.__file__).resolve() for name, value in list(sys.modules.items())
+             if (name == "wholebodyx" or name.startswith("wholebodyx.")) and getattr(value, "__file__", None)]
+    paths += [ROOT / "examples/python/h1_dynamics_wbc.py", Path(__file__).resolve(), demo.urdf.resolve()]
+    sources = source_hashes(ROOT, paths)
     started = heartbeat = time.monotonic()
     report = dict(status="running", controller=controller, push_force_n=push_force, requested_seconds=seconds, amplitude=amplitude,
                   source_sha256=sources, steps=0, min_force_n=float("inf"), max_com_error_m=0.,
                   max_contact_position_error_m=0., max_forward_contact_violation=0.,
                   max_constraint_violation=0., max_forward_dynamics_residual=0., max_quaternion_norm_error=0., max_wbc_ms=0.,
                   initial_peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    report.update(initial_rss_kib=current_rss_kib(), max_sampled_rss_kib=current_rss_kib(),
+                  rss_sample_period_s=30.)
     slowest, slowest_cpu = [], []
     if cpu_timing:
         timing = dict(samples=0, wall_total_ms=0., thread_total_ms=0., process_total_ms=0., max_iterations=0)
@@ -38,7 +46,6 @@ def run(seconds, amplitude, output, controller="wbc", push_force=0., *, cpu_timi
         usage_scope = getattr(resource, "RUSAGE_THREAD", resource.RUSAGE_SELF)
         timing["resource_scope"] = "thread" if hasattr(resource, "RUSAGE_THREAD") else "process"
         usage_fields = ("ru_nvcsw", "ru_nivcsw", "ru_minflt", "ru_majflt")
-        report["source_sha256"][str(Path(__file__).resolve().relative_to(ROOT))] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         original_solve = demo.controller.solve
 
         def timed_solve(*args, **kwargs):
@@ -60,7 +67,7 @@ def run(seconds, amplitude, output, controller="wbc", push_force=0., *, cpu_timi
                 timing["wall_total_ms"] += wall_ms
                 timing["thread_total_ms"] += thread_ms
                 timing["process_total_ms"] += process_ms
-                iterations = result.get("iterations") if isinstance(result, dict) else None
+                iterations = result.get("iterations") if isinstance(result, Mapping) else None
                 if iterations is not None:
                     timing["max_iterations"] = max(timing["max_iterations"], int(iterations))
                 sample = (wall_ms, timing["samples"], thread_ms, process_ms, iterations, unix_start, resources)
@@ -97,8 +104,11 @@ def run(seconds, amplitude, output, controller="wbc", push_force=0., *, cpu_timi
                     raise AssertionError("joint position limit exceeded")
                 if time.monotonic() - heartbeat >= 30:
                     heartbeat = time.monotonic()
+                    rss = current_rss_kib()
+                    report["max_sampled_rss_kib"] = max(report["max_sampled_rss_kib"] or 0, rss or 0) or None
                     print(json.dumps(dict(simulation_s=demo.state.stamp, wall_s=heartbeat - started,
                                           contact_error_m=demo.max_contact_error,
+                                          current_rss_kib=rss,
                                           peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)), flush=True)
         report["status"] = "passed"
     except Exception as exc:
@@ -119,6 +129,8 @@ def run(seconds, amplitude, output, controller="wbc", push_force=0., *, cpu_timi
                       mpc_continuity_fallbacks=demo.mpc_continuity_fallbacks,
                       solver_setups=demo.controller.solver_setups, solver_recoveries=demo.controller.solver_recoveries, mpc_replans=0 if demo.planner is None else demo.planner.replans,
                       peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        report["source_unchanged"] = sources_unchanged(ROOT, report["source_sha256"])
+        report["final_rss_kib"] = current_rss_kib()
         output = Path(output)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, indent=2) + "\n")

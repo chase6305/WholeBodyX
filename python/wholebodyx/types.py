@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
@@ -14,15 +15,23 @@ if TYPE_CHECKING:
 
 def array(value, ndim, name):
     result = np.array(value, dtype=float, copy=True)
-    if result.ndim != ndim or not np.all(np.isfinite(result)):
+    if result.ndim != ndim or not np.isfinite(result).all():
         raise ValueError(f"{name} must be a finite {ndim}-D array")
     result.setflags(write=False)
     return result
 
 
+def _snapshot(value, ndim, name):
+    """Return a finite float64 snapshot backed by immutable bytes."""
+    value = np.asarray(value, dtype=float)
+    if value.ndim != ndim or not np.isfinite(value).all():
+        raise ValueError(f"{name} must be a finite {ndim}-D array")
+    return np.frombuffer(value.tobytes(), dtype=float).reshape(value.shape)
+
+
 def positive(value, name):
     value = float(value)
-    if not np.isfinite(value) or value <= 0:
+    if not isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be positive and finite")
     return value
 
@@ -35,18 +44,18 @@ def _braking_speed(distance, acceleration, dt):
     dt * (k * velocity - acceleration * dt * k * (k - 1) / 2).
     Continuous sqrt(2*a*distance) bounds omit that first held interval.
     """
-    distance = np.maximum(distance, 0.)
+    distance = np.maximum(distance, 0.0)
     with np.errstate(over="ignore", under="ignore", divide="ignore", invalid="ignore"):
         slew = acceleration * dt
-        root = np.sqrt(2.) * (np.sqrt(distance) / np.sqrt(acceleration)) / dt
-        count = np.maximum(1., np.ceil(np.hypot(.5, root) - .5))
-        speed = (distance / count) / dt + .5 * (count - 1.) * slew
+        root = np.sqrt(2.0) * (np.sqrt(distance) / np.sqrt(acceleration)) / dt
+        count = np.maximum(1.0, np.ceil(np.hypot(0.5, root) - 0.5))
+        speed = (distance / count) / dt + 0.5 * (count - 1.0) * slew
         # At enormous interval counts the discrete correction is below float
         # resolution. Keep extreme finite inputs from producing inf/inf NaNs.
-        continuous = np.sqrt(2.) * np.sqrt(distance) * np.sqrt(acceleration)
+        continuous = np.sqrt(2.0) * np.sqrt(distance) * np.sqrt(acceleration)
         speed = np.where(np.isfinite(count), speed, continuous)
-        speed = np.where(count == 1., distance / dt, speed)
-        speed = np.where(slew == 0., 0., speed)
+        speed = np.where(count == 1.0, distance / dt, speed)
+        speed = np.where(slew == 0.0, 0.0, speed)
         return np.minimum(speed, distance / dt)
 
 
@@ -62,7 +71,9 @@ class RobotState:
         if self.q.size == 0 or self.q.shape != self.v.shape:
             raise ValueError("fixed-base q and v must have equal, nonzero dimensions")
         stamp = float(self.stamp)
-        if not np.isfinite(stamp) or self.stamp < 0:
+        # Check the original sign: an extended-precision negative timestamp
+        # can underflow to -0.0 when converted to a Python float.
+        if not isfinite(stamp) or self.stamp < 0:
             raise ValueError("stamp must be finite and nonnegative")
         object.__setattr__(self, "stamp", stamp)
 
@@ -79,13 +90,13 @@ class JointLimits:
             object.__setattr__(self, name, array(getattr(self, name), 1, name))
         if not self.lower.size or not (self.lower.shape == self.upper.shape == self.velocity.shape):
             raise ValueError("joint limit dimensions must match")
-        if np.any(self.lower >= self.upper) or np.any(self.velocity <= 0):
+        if (self.lower >= self.upper).any() or (self.velocity <= 0).any():
             raise ValueError("require lower < upper and positive velocity limits")
         if self.acceleration is not None:
-            a = array(self.acceleration, 1, "acceleration")
-            if a.shape != self.lower.shape or np.any(a <= 0):
+            acceleration = array(self.acceleration, 1, "acceleration")
+            if acceleration.shape != self.lower.shape or (acceleration <= 0).any():
                 raise ValueError("acceleration limits must be positive and match joint dimensions")
-            object.__setattr__(self, "acceleration", a)
+            object.__setattr__(self, "acceleration", acceleration)
 
     def check_state(self, state):
         if state.q.shape != self.lower.shape:
@@ -94,12 +105,12 @@ class JointLimits:
     def velocity_bounds(self, state, dt):
         self.check_state(state)
         positive(dt, "dt")
-        lo = np.maximum(-self.velocity, (self.lower - state.q) / dt)
-        hi = np.minimum(self.velocity, (self.upper - state.q) / dt)
+        lower_velocity = np.maximum(-self.velocity, (self.lower - state.q) / dt)
+        upper_velocity = np.minimum(self.velocity, (self.upper - state.q) / dt)
         if self.acceleration is not None:
             slew = self.acceleration * dt
-            np.maximum(lo, state.v - slew, out=lo)
-            np.minimum(hi, state.v + slew, out=hi)
+            np.maximum(lower_velocity, state.v - slew, out=lower_velocity)
+            np.minimum(upper_velocity, state.v + slew, out=upper_velocity)
             # This upper bound on stopping travel avoids square roots for
             # joints comfortably inside their limits. Only nearby joints need
             # the exact discrete envelope.
@@ -107,23 +118,34 @@ class JointLimits:
                 travel = self.velocity * (self.velocity / self.acceleration + dt)
             below = state.q - self.lower
             above = self.upper - state.q
-            near_lower = (lo < 0) & (below < travel)
-            near_upper = (hi > 0) & (above < travel)
-            if np.any(near_lower):
-                lo[near_lower] = np.maximum(lo[near_lower], -_braking_speed(
-                    below[near_lower], self.acceleration[near_lower], dt))
-            if np.any(near_upper):
-                hi[near_upper] = np.minimum(hi[near_upper], _braking_speed(
-                    above[near_upper], self.acceleration[near_upper], dt))
+            near_lower = (lower_velocity < 0) & (below < travel)
+            near_upper = (upper_velocity > 0) & (above < travel)
+            if near_lower.any():
+                lower_velocity[near_lower] = np.maximum(
+                    lower_velocity[near_lower],
+                    -_braking_speed(below[near_lower], self.acceleration[near_lower], dt),
+                )
+            if near_upper.any():
+                upper_velocity[near_upper] = np.minimum(
+                    upper_velocity[near_upper],
+                    _braking_speed(above[near_upper], self.acceleration[near_upper], dt),
+                )
             # At the braking boundary the interval can collapse to one value.
             # Subtracting joint positions can invert it by a few roundoff ULPs.
-            inverted = lo > hi
-            if np.any(inverted):
-                scale = np.maximum(np.maximum(np.abs(self.lower), np.abs(self.upper)), np.abs(state.q))
-                close = inverted & np.isfinite(lo) & np.isfinite(hi) & (lo - hi <= (16 * np.finfo(float).eps * scale) / dt)
-                midpoint = .5 * lo[close] + .5 * hi[close]
-                lo[close] = hi[close] = midpoint
-        return lo, hi
+            inverted = lower_velocity > upper_velocity
+            if inverted.any():
+                scale = np.maximum(
+                    np.maximum(np.abs(self.lower), np.abs(self.upper)), np.abs(state.q)
+                )
+                close = (
+                    inverted
+                    & np.isfinite(lower_velocity)
+                    & np.isfinite(upper_velocity)
+                    & (lower_velocity - upper_velocity <= (16 * np.finfo(float).eps * scale) / dt)
+                )
+                midpoint = 0.5 * lower_velocity[close] + 0.5 * upper_velocity[close]
+                lower_velocity[close] = upper_velocity[close] = midpoint
+        return lower_velocity, upper_velocity
 
 
 @dataclass(frozen=True)
@@ -133,27 +155,32 @@ class LinearTask:
     weight: np.ndarray | float = 1.0
 
     def __post_init__(self):
-        j = array(self.jacobian, 2, "jacobian")
-        b = array(self.target_velocity, 1, "target_velocity")
-        w = np.asarray(self.weight, dtype=float)
-        if w.ndim == 0:
-            scalar = w.item()
+        jacobian = array(self.jacobian, 2, "jacobian")
+        target_velocity = array(self.target_velocity, 1, "target_velocity")
+        weight = np.asarray(self.weight, dtype=float)
+        if weight.ndim == 0:
+            scalar = weight.item()
             if not np.isfinite(scalar):
                 raise ValueError("weight must be finite")
             if scalar < 0:
                 raise ValueError("task weights must be nonnegative")
             # full() already owns its buffer: do not copy it through array().
-            w = np.full(b.size, scalar)
-            w.setflags(write=False)
+            weight = np.full(target_velocity.size, scalar)
+            weight.setflags(write=False)
         else:
-            w = array(w, 1, "weight")
-            if np.any(w < 0):
+            weight = array(weight, 1, "weight")
+            if (weight < 0).any():
                 raise ValueError("task weights must be nonnegative")
-        if j.shape[0] != b.size or w.shape != b.shape or not b.size or not j.shape[1]:
+        if (
+            jacobian.shape[0] != target_velocity.size
+            or weight.shape != target_velocity.shape
+            or not target_velocity.size
+            or not jacobian.shape[1]
+        ):
             raise ValueError("task dimensions must match and be nonzero")
-        object.__setattr__(self, "jacobian", j)
-        object.__setattr__(self, "target_velocity", b)
-        object.__setattr__(self, "weight", w)
+        object.__setattr__(self, "jacobian", jacobian)
+        object.__setattr__(self, "target_velocity", target_velocity)
+        object.__setattr__(self, "weight", weight)
 
 
 @dataclass(frozen=True)
@@ -166,7 +193,7 @@ class VelocityCommand:
         object.__setattr__(self, "stamp", float(self.stamp))
         object.__setattr__(self, "valid_until", float(self.valid_until))
         object.__setattr__(self, "velocity", array(self.velocity, 1, "velocity"))
-        if not self.velocity.size or not np.isfinite([self.stamp, self.valid_until]).all():
+        if not self.velocity.size or not isfinite(self.stamp) or not isfinite(self.valid_until):
             raise ValueError("invalid command")
         if self.stamp < 0 or self.valid_until <= self.stamp:
             raise ValueError("invalid command validity interval")

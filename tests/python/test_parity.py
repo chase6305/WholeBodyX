@@ -1,4 +1,6 @@
 import numpy as np
+import os
+import pytest
 
 from wholebodyx import JointLimits, JointMPC, KinematicWBC, LinearTask, RobotState
 
@@ -44,3 +46,24 @@ def test_braking_boundary_formulations_and_commands_match(backend):
         assert actual.command is not None and expected.command is not None
         np.testing.assert_allclose(actual.command.velocity, expected.command.velocity, atol=2e-6, rtol=0)
         state = RobotState(state.q + .1 * expected.command.velocity, expected.command.velocity, state.stamp + .1)
+
+
+def test_native_condensed_storage_is_linear_in_joints_without_changing_dense_diagnostics(backend):
+    if backend[0] is KinematicWBC:
+        return
+    from wholebodyx.native import NativeMPC
+    sizes = []
+    for joints in (6, 12):
+        bounds = JointLimits([-2] * joints, [2] * joints, [1] * joints, [4] * joints)
+        planner = NativeMPC(bounds, horizon=30)
+        if planner.fixed_matrix_bytes is None:
+            if os.environ.get("WBX_REQUIRE_NATIVE") == "1":
+                pytest.fail("native storage diagnostics require a rebuilt extension")
+            pytest.skip("installed native wheel predates compressed MPC storage")
+        sizes.append(planner.fixed_matrix_bytes)
+        problem = planner.formulate(RobotState(np.zeros(joints), np.zeros(joints)), np.full(joints, .3))
+        assert isinstance(problem.hessian, np.ndarray) and isinstance(problem.constraint, np.ndarray)
+        # CSC stores row/column indices too; at six joints their overhead is
+        # material even though zero matrix values have been eliminated.
+        assert planner.fixed_matrix_bytes < .15 * (problem.hessian.nbytes + problem.constraint.nbytes)
+    assert sizes[1] < 2.001 * sizes[0]

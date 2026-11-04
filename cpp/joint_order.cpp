@@ -18,7 +18,8 @@ void validate_names(const std::vector<std::string>& names) {
   for (const auto& name : names) {
     require(!name.empty(), "joint names must not be empty");
     require(!std::isspace(static_cast<unsigned char>(name.front())) &&
-            !std::isspace(static_cast<unsigned char>(name.back())), "joint name has surrounding whitespace");
+                !std::isspace(static_cast<unsigned char>(name.back())),
+            "joint name has surrounding whitespace");
     require(seen.insert(name).second, "duplicate joint name");
   }
 }
@@ -38,7 +39,8 @@ Matrix permute_columns(const Matrix& value, const std::vector<Eigen::Index>& ind
 }
 void validate_solver(const QPResult& result) {
   require(result.x.allFinite(), "solver decision vector must be finite");
-  require(result.status != "solved" || result.x.size() > 0, "solved result must contain a decision vector");
+  require(result.status != "solved" || result.x.size() > 0,
+          "solved result must contain a decision vector");
 }
 }  // namespace
 
@@ -48,7 +50,8 @@ JointOrder::JointOrder(std::vector<std::string> model_names, std::vector<std::st
   validate_names(backend_names_);
   require(model_names_.size() == backend_names_.size(), "joint name sets differ");
   std::unordered_map<std::string, Eigen::Index> positions;
-  for (Eigen::Index i = 0; i < static_cast<Eigen::Index>(model_names_.size()); ++i) positions.emplace(model_names_[i], i);
+  for (Eigen::Index i = 0; i < static_cast<Eigen::Index>(model_names_.size()); ++i)
+    positions.emplace(model_names_[i], i);
   inverse_.resize(model_names_.size());
   for (Eigen::Index i = 0; i < static_cast<Eigen::Index>(backend_names_.size()); ++i) {
     const auto found = positions.find(backend_names_[i]);
@@ -59,8 +62,12 @@ JointOrder::JointOrder(std::vector<std::string> model_names, std::vector<std::st
 }
 Vector JointOrder::to_backend(const Vector& value) const { return permute(value, forward_); }
 Vector JointOrder::to_model(const Vector& value) const { return permute(value, inverse_); }
-Matrix JointOrder::columns_to_backend(const Matrix& value) const { return permute_columns(value, forward_); }
-Matrix JointOrder::columns_to_model(const Matrix& value) const { return permute_columns(value, inverse_); }
+Matrix JointOrder::columns_to_backend(const Matrix& value) const {
+  return permute_columns(value, forward_);
+}
+Matrix JointOrder::columns_to_model(const Matrix& value) const {
+  return permute_columns(value, inverse_);
+}
 RobotState JointOrder::state_to_backend(const RobotState& state) const {
   state.validate();
   return {to_backend(state.q), to_backend(state.v), state.stamp};
@@ -75,8 +82,9 @@ LinearTask JointOrder::task_to_backend(const LinearTask& task) const {
   return {columns_to_backend(task.jacobian), task.target_velocity, task.weight};
 }
 VelocityCommand JointOrder::command_to_model(const VelocityCommand& command) const {
-  require(std::isfinite(command.stamp) && command.stamp >= 0 && std::isfinite(command.valid_until)
-          && command.valid_until > command.stamp, "invalid command validity interval");
+  require(std::isfinite(command.stamp) && command.stamp >= 0 &&
+              std::isfinite(command.valid_until) && command.valid_until > command.stamp,
+          "invalid command validity interval");
   return {to_model(command.velocity), command.stamp, command.valid_until};
 }
 JointPlan JointOrder::plan_to_model(const JointPlan& plan) const {
@@ -89,7 +97,8 @@ ReorderedController::ReorderedController(std::unique_ptr<Controller> controller,
   require(controller_ != nullptr, "controller must not be null");
 }
 void ReorderedController::reset() { controller_->reset(); }
-ControlResult ReorderedController::step(const RobotState& state, const std::vector<LinearTask>& tasks, double dt) {
+ControlResult ReorderedController::step(const RobotState& state,
+                                        const std::vector<LinearTask>& tasks, double dt) {
   std::vector<LinearTask> converted;
   converted.reserve(tasks.size());
   for (const auto& task : tasks) converted.push_back(order_.task_to_backend(task));

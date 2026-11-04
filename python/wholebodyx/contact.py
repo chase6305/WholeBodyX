@@ -1,10 +1,50 @@
 """Linearized rectangular surface-contact wrench cones, local [force; moment]."""
 from functools import lru_cache
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.spatial import ConvexHull, QhullError
 
 from .qp import _immutable
+from .model import Pose
+from .types import positive
+
+
+@dataclass(frozen=True)
+class ContactSpec:
+    """A rectangular sole pose relative to a URDF frame, in SI units.
+
+    Defaults reproduce the H1 demo assumptions, not vendor data. Friction is a
+    controller parameter. Wrenches use the sole-local [force; moment] ordering
+    and +z normal. Each contact may have different geometry and placement.
+    """
+
+    frame: str
+    translation: np.ndarray = field(default_factory=lambda: np.array([0., 0., -.07]))
+    rotation: np.ndarray = field(default_factory=lambda: np.eye(3))
+    half_length: float = .10
+    half_width: float = .035
+    torsional_friction: float = .015
+
+    def __post_init__(self):
+        if not isinstance(self.frame, str) or not self.frame or self.frame.strip() != self.frame:
+            raise ValueError("contact frame must be a nonempty name without surrounding whitespace")
+        pose = Pose(self.translation, self.rotation)
+        object.__setattr__(self, "translation", pose.translation)
+        object.__setattr__(self, "rotation", pose.rotation)
+        for name in ("half_length", "half_width", "torsional_friction"):
+            object.__setattr__(self, name, positive(getattr(self, name), name))
+
+    def wrench_cone(self, friction=.6):
+        """Return H for H @ local_wrench <= 0, including the torsion bound."""
+        return np.vstack((rectangular_wrench_cone(friction, self.half_length, self.half_width),
+                          [0., 0., -self.torsional_friction, 0., 0., 1.],
+                          [0., 0., -self.torsional_friction, 0., 0., -1.]))
+
+    def corners(self):
+        """Four local sole corners for support-polygon construction or rendering."""
+        return np.array([(x, y, 0.) for x in (-self.half_length, self.half_length)
+                         for y in (-self.half_width, self.half_width)])
 
 
 @lru_cache(maxsize=16)

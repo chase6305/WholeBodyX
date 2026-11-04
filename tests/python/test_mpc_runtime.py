@@ -54,6 +54,26 @@ def test_native_and_python_reject_inconsistent_plan_dynamics(backend):
         plan_type(backend)(np.array([[0.], [1.]]), np.zeros((1, 1)), 0., .1)
 
 
+@pytest.mark.parametrize("velocity", [1e308, 1.5e308])
+def test_plan_dynamics_overflow_cannot_certify_equal_infinities(backend, velocity):
+    # Both finite inputs overflow during float64 displacement evaluation.
+    # Equality of infinities cannot establish the integrator invariant.
+    with pytest.raises(ValueError, match="integrator dynamics"):
+        plan_type(backend)(np.array([[-1e308], [1e308]]), np.array([[velocity]]), 0., 2.)
+
+
+def test_large_representable_plan_dynamics_remain_valid(backend):
+    plan = plan_type(backend)(np.array([[-1e307], [1e307]]), np.array([[1e307]]), 0., 2.)
+    np.testing.assert_allclose(plan.sample(1.)[0], [0.], atol=0, rtol=0)
+
+
+def test_overflowed_expected_displacement_cannot_relax_relative_tolerance(backend):
+    # The expected displacement and its relative tolerance both become inf;
+    # a finite measured displacement must still fail the dynamics check.
+    with pytest.raises(ValueError, match="integrator dynamics"):
+        plan_type(backend)(np.array([[0.], [1.]]), np.array([[1.5e308]]), 0., 2.)
+
+
 @pytest.mark.parametrize("horizon", [1, 6])
 @pytest.mark.parametrize("acceleration", [None, [2, 3]])
 def test_cached_mpc_matches_direct_rollout_cost(backend, horizon, acceleration):
@@ -141,15 +161,22 @@ def test_warm_start_after_large_forward_clock_jump(backend):
         planner.solve(RobotState([0, 0], [0, 0], 1e308), [.3, .3])
 
 
+@pytest.mark.parametrize("planner_name", ["JointMPC", "SparseJointMPC"])
 @pytest.mark.parametrize("elapsed,offset", [(0., 0), (.1, 1), (.2, 2), (.3, 3), (1e6, 3)])
-def test_shifted_warm_start_matches_plan_and_is_isolated(elapsed, offset):
+def test_shifted_warm_start_matches_plan_and_is_isolated(planner_name, elapsed, offset):
+    import wholebodyx
     from wholebodyx import QPResult
 
-    planner = JointMPC(bounds(), horizon=3)
+    planner = getattr(wholebodyx, planner_name)(bounds(), horizon=3)
     state = RobotState([0, 0], [0, 0])
     first = planner.solve(state, [.3, -.2]).plan
     original = first.velocities.copy()
-    expected = np.vstack((original[offset:], np.repeat(original[-1:], offset, axis=0))).reshape(-1)
+    expected = np.vstack((original[offset:], np.repeat(original[-1:], offset, axis=0)))
+    if planner_name == "SparseJointMPC":
+        positions = state.q + planner.dt * np.cumsum(expected, axis=0)
+        expected = np.r_[positions.ravel(), expected.ravel()]
+    else:
+        expected = expected.ravel()
 
     class InspectSolver:
         def solve(self, problem, warm_start=None):

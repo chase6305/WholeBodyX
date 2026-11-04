@@ -6,7 +6,7 @@ claim a hard real-time deadline.
 """
 
 from dataclasses import dataclass
-from math import ulp
+from math import isfinite, ulp
 from time import perf_counter
 from typing import Callable, Protocol
 
@@ -14,12 +14,54 @@ import numpy as np
 
 from .joint_order import JointOrder
 from .qp import QPResult
-from .types import JointLimits, LinearTask, RobotState, VelocityCommand, array, positive
+from .types import JointLimits, LinearTask, RobotState, VelocityCommand, positive
 from .wbc import ControlResult
 
 
-def _same_time(a, b):
-    return abs(a - b) <= 4 * max(ulp(a), ulp(b))
+def _time_tolerance(a, b, dt):
+    return min(4 * max(ulp(a), ulp(b)), 1e-6 * dt)
+
+
+def _same_time(a, b, dt):
+    return abs(a - b) <= _time_tolerance(a, b, dt)
+
+
+class ExecutionDeadlineError(RuntimeError):
+    """Wall-budget rejection at a checked boundary, not a phase profiler.
+
+    Loop faults retain this exception as their cause. write_completed means
+    the driver's write method returned; it does not acknowledge actuation.
+    """
+
+    def __init__(self, mode, stage, elapsed_s, budget_s, *, write_completed=False):
+        self.mode, self.stage = mode, stage
+        self.elapsed_s, self.budget_s = float(elapsed_s), float(budget_s)
+        self.write_completed = bool(write_completed)
+        super().__init__(f"{mode} control cycle exceeded its execution deadline")
+
+    def as_dict(self):
+        """Serialize diagnostics outside the cycle, including invalid clocks."""
+        finite = isfinite(self.elapsed_s)
+        return dict(
+            mode=self.mode,
+            stage=self.stage,
+            elapsed_s=self.elapsed_s if finite else None,
+            elapsed_finite=finite,
+            budget_s=self.budget_s,
+            write_completed=self.write_completed,
+        )
+
+
+def _check_cycle_budget(elapsed, budget, mode, stage, command=None):
+    """Check cumulative wall time and return milliseconds for cycle reporting."""
+    if budget is not None:
+        if command is not None:
+            budget = min(budget, command.valid_until - command.stamp)
+        if not isfinite(elapsed) or elapsed < 0 or elapsed >= budget:
+            raise ExecutionDeadlineError(
+                mode, stage, elapsed, budget, write_completed=stage == "after_write"
+            )
+    return elapsed * 1000
 
 
 class VelocityRobotBackend(Protocol):
@@ -65,12 +107,16 @@ class CommandGate:
             raise ValueError("robot backend must return RobotState")
         self.limits.check_state(state)
         tolerance = 1e-6
-        if np.any(state.q < self.limits.lower - tolerance) or np.any(state.q > self.limits.upper + tolerance):
+        if np.any(state.q < self.limits.lower - tolerance) or np.any(
+            state.q > self.limits.upper + tolerance
+        ):
             raise ValueError("measured configuration is outside configured joint limits")
         if np.any(np.abs(state.v) > self.limits.velocity + tolerance):
             raise ValueError("measured velocity exceeds configured limits")
         if self._last_stamp is not None and state.stamp <= self._last_stamp:
             raise ValueError("robot state clock did not advance")
+        # Public RobotState arrays can be made writable again. Keep an owned
+        # observation so later task/controller mutation cannot change this gate.
         snapshot = RobotState(state.q, state.v, state.stamp)
         object.__setattr__(self, "_last_stamp", state.stamp)
         object.__setattr__(self, "_observed_state", snapshot)
@@ -82,21 +128,29 @@ class CommandGate:
         if not isinstance(command, VelocityCommand):
             raise ValueError("controller must return VelocityCommand")
         observed = self._observed_state
-        if not isinstance(state, RobotState) or observed is None or not _same_time(state.stamp, observed.stamp):
+        if (
+            not isinstance(state, RobotState)
+            or observed is None
+            or not _same_time(state.stamp, observed.stamp, self.control_dt)
+        ):
             raise ValueError("command was not validated against the latest observed state")
         if not np.array_equal(state.q, observed.q) or not np.array_equal(state.v, observed.v):
             raise ValueError("command state differs from the latest observed state")
-        if not _same_time(command.stamp, state.stamp):
+        if not _same_time(command.stamp, state.stamp, self.control_dt):
             raise ValueError("command timestamp does not match measured state")
-        end = state.stamp + self.control_dt
-        if not np.isfinite(end) or end <= state.stamp:
+        interval_end = state.stamp + self.control_dt
+        if not isfinite(interval_end) or interval_end <= state.stamp:
             raise ValueError("control interval cannot be represented")
-        if command.valid_until < end - 4 * max(ulp(end), ulp(command.valid_until)):
+        if interval_end - command.valid_until > _time_tolerance(
+            interval_end, command.valid_until, self.control_dt
+        ):
             raise ValueError("command does not cover the complete control interval")
         if command.velocity.shape != state.q.shape:
             raise ValueError("command and measured state dimensions differ")
-        lo, hi = self.limits.velocity_bounds(state, self.control_dt)
-        if np.any(command.velocity < lo - 1e-6) or np.any(command.velocity > hi + 1e-6):
+        velocity_lower, velocity_upper = self.limits.velocity_bounds(state, self.control_dt)
+        if np.any(command.velocity < velocity_lower - 1e-6) or np.any(
+            command.velocity > velocity_upper + 1e-6
+        ):
             raise ValueError("command violates configured position, velocity, or slew limits")
         return VelocityCommand(command.velocity, command.stamp, command.valid_until)
 
@@ -120,7 +174,11 @@ class ModelOrderRobotBackend:
     def write(self, command):
         if not isinstance(command, VelocityCommand):
             raise ValueError("expected VelocityCommand")
-        self.backend.write(VelocityCommand(self.order.to_backend(command.velocity), command.stamp, command.valid_until))
+        self.backend.write(
+            VelocityCommand(
+                self.order.to_backend(command.velocity), command.stamp, command.valid_until
+            )
+        )
 
     def stop(self):
         self.backend.stop()
@@ -131,7 +189,7 @@ class CycleResult:
     state: RobotState
     control: ControlResult
     control_ms: float
-    cycle_ms: float = 0.
+    cycle_ms: float = 0.0
 
     @property
     def command(self):
@@ -155,8 +213,9 @@ class VelocityControlLoop:
         self.backend, self.controller = backend, controller
         self.gate = CommandGate(limits, control_dt)
         self.control_dt = self.gate.control_dt
-        self._max_cycle_time = (None if max_cycle_time is None
-                                else positive(max_cycle_time, "max cycle time"))
+        self._max_cycle_time = (
+            None if max_cycle_time is None else positive(max_cycle_time, "max cycle time")
+        )
 
     max_cycle_time = property(lambda self: self._max_cycle_time)
 
@@ -194,40 +253,41 @@ class VelocityControlLoop:
         if not callable(task_factory):
             raise TypeError("task_factory must be callable")
         if self.fault is not None:
-            raise RuntimeError(f"velocity control loop is faulted: {self.fault}; reset before continuing")
+            raise RuntimeError(
+                f"velocity control loop is faulted: {self.fault}; reset before continuing"
+            )
         cycle_started = perf_counter()
 
-        def check_deadline(command=None):
-            elapsed = perf_counter() - cycle_started
-            if self.max_cycle_time is not None:
-                budget = self.max_cycle_time
-                if command is not None:
-                    budget = min(budget, command.valid_until - command.stamp)
-                if not np.isfinite(elapsed) or elapsed < 0 or elapsed >= budget:
-                    raise RuntimeError("velocity control cycle exceeded its execution deadline")
-            return elapsed * 1000
+        def check_deadline(stage, command=None):
+            return _check_cycle_budget(
+                perf_counter() - cycle_started, self.max_cycle_time, "velocity", stage, command
+            )
 
         try:
             state = self.gate.observe(self.backend.read())
-            check_deadline()
+            check_deadline("after_read")
             tasks = task_factory(state)
-            if not isinstance(tasks, (list, tuple)) or not all(isinstance(task, LinearTask) for task in tasks):
+            if not isinstance(tasks, (list, tuple)) or not all(
+                isinstance(task, LinearTask) for task in tasks
+            ):
                 raise ValueError("task_factory must return a list or tuple of LinearTask values")
-            check_deadline()
-            started = perf_counter()
+            check_deadline("after_tasks")
+            control_started = perf_counter()
             control = self.controller.step(state, list(tasks), self.control_dt)
-            elapsed = (perf_counter() - started) * 1000
+            control_ms = (perf_counter() - control_started) * 1000
             if not isinstance(control, ControlResult) or not isinstance(control.solver, QPResult):
                 raise ValueError("controller must return ControlResult with QPResult")
             if not control.solver.success or control.command is None:
-                raise RuntimeError(f"WBC rejected command: {control.solver.status} — {control.solver.detail}")
-            if not np.isfinite(control.solver.violation) or control.solver.violation < 0 or control.solver.violation > 1e-6:
+                raise RuntimeError(
+                    f"WBC rejected command: {control.solver.status} — {control.solver.detail}"
+                )
+            if not isfinite(control.solver.violation) or not 0 <= control.solver.violation <= 1e-6:
                 raise ValueError("controller reported an invalid constraint violation")
             command = self.gate.validate(state, control.command)
-            check_deadline(command)
+            check_deadline("before_write", command)
             self.backend.write(command)
-            cycle_ms = check_deadline(command)
-            return CycleResult(state, ControlResult(control.solver, command), elapsed, cycle_ms)
+            cycle_ms = check_deadline("after_write", command)
+            return CycleResult(state, ControlResult(control.solver, command), control_ms, cycle_ms)
         except Exception as exc:
             self._fail(exc)
         except BaseException as exc:
