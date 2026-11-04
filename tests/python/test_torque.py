@@ -279,4 +279,3 @@ def test_h1_torque_pipeline_matches_direct_demo_trajectory():
         np.testing.assert_allclose(plant.read().q, direct.state.q, atol=1e-10, rtol=0)
         np.testing.assert_allclose(plant.acceleration, result.control.acceleration, atol=1e-6)
     assert plant.stops == 0
-

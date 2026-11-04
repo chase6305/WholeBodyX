@@ -139,4 +139,3 @@ def test_continuous_support_validator_is_independent_of_qp_matrices():
     assert mpc.validate_plan(outside) > .5
     mpc.problem.hessian = np.eye(1)
     assert mpc.validate_plan(valid) <= 1e-6
-

@@ -90,4 +90,3 @@ def test_result_keeps_mapping_compatibility_and_detaches_output_arrays():
         result["missing"]
     with pytest.raises(ValueError):
         result.acceleration[:] = 9
-

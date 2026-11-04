@@ -212,4 +212,3 @@ def test_urdf_pipeline_combines_cartesian_tasks_mpc_and_reordered_backend(backen
     assert report["final_position_error_m"] < 1e-4
     assert report["final_orientation_error_rad"] < 1e-4
     assert report["max_constraint_violation"] <= 1e-6
-
