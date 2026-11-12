@@ -321,4 +321,3 @@ def test_soak_generator_checks_kkt_optima_across_eleven_decades_of_physical_row_
     assert case.report['solves'] == case.report['attempts'] == 80
     assert case.report['max_solution_difference'] <= 3e-5
     assert case.report['max_physical_violation'] <= 1e-6
-
