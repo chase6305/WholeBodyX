@@ -19,17 +19,18 @@ from wholebodyx import JointLimits, LinearTask, RobotState
 from wholebodyx.native import NativeWBC, _extension
 
 
-def benchmark(joints, iterations):
+def benchmark(joints, iterations, *, acceleration=None, near_limits=False):
     results, traces = [], {}
     for n in joints:
         rng = np.random.default_rng(n)
         jacobian = rng.normal(size=(2 * n, n))
-        limits = JointLimits([-10.0] * n, [10.0] * n, [1.0] * n)
+        limits = JointLimits([-10.0] * n, [10.0] * n, [1.0] * n,
+                             None if acceleration is None else [acceleration] * n)
         controller = NativeWBC(limits, regularization=0.1)
         samples, velocities, iteration_counts = [], [], []
         maximum_violation = 0.0
         for k in range(iterations + 5):
-            state = RobotState(np.zeros(n), np.zeros(n), k * 0.01)
+            state = RobotState(np.full(n, 9.9995 if near_limits else 0.), np.zeros(n), k * 0.01)
             task = LinearTask(
                 jacobian + 0.01 * np.sin(k) * np.eye(2 * n, n), np.full(2 * n, 0.1 * np.cos(k))
             )
@@ -65,6 +66,8 @@ def benchmark(joints, iterations):
         numpy=np.__version__,
         warmup=5,
         iterations=iterations,
+        acceleration=acceleration,
+        near_limits=near_limits,
         threads={
             name: os.environ.get(name) for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS")
         },
@@ -78,12 +81,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--joints", nargs="+", type=int, default=[6, 19, 29])
     parser.add_argument("--iterations", type=int, default=400)
+    parser.add_argument("--acceleration", type=float, help="enable velocity-slew and braking bounds")
+    parser.add_argument("--near-limits", action="store_true", help="exercise the exact braking envelope")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--trace", type=Path)
     args = parser.parse_args()
     if args.iterations < 1 or any(n < 1 for n in args.joints):
         parser.error("iterations and joint counts must be positive")
-    report, traces = benchmark(args.joints, args.iterations)
+    if args.acceleration is not None and (not np.isfinite(args.acceleration) or args.acceleration <= 0):
+        parser.error("acceleration must be finite and positive")
+    report, traces = benchmark(args.joints, args.iterations, acceleration=args.acceleration,
+                               near_limits=args.near_limits)
     rendered = json.dumps(report, indent=2)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

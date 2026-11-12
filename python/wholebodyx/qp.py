@@ -1,5 +1,6 @@
 """Backend-independent convex QP and an OSQP adapter."""
 
+from copy import copy
 from dataclasses import dataclass
 from typing import NamedTuple, Protocol
 
@@ -9,6 +10,25 @@ from scipy import sparse
 
 from .types import array
 from ._solver_execution import OSQP_EXECUTION_LOCK
+
+
+class _OSQPFailure(Exception):
+    pass
+
+
+# OSQP 1.0 raises ValueError directly; later versions expose OSQPException.
+# Translate only errors from backend calls so input validation keeps its
+# original ValueError and does not discard a healthy cached workspace.
+_OSQP_ERRORS = (ValueError,)
+if hasattr(osqp, "OSQPException"):
+    _OSQP_ERRORS += (osqp.OSQPException,)
+
+
+def _osqp_call(operation, *args, **kwargs):
+    try:
+        return operation(*args, **kwargs)
+    except _OSQP_ERRORS as exc:
+        raise _OSQPFailure(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -165,11 +185,14 @@ def _immutable_array_key(value):
 
 def _sparse_view(value):
     """Share immutable CSC buffers with independent matrix and array metadata."""
-    return sparse.csc_matrix(
-        (value.data.view(), value.indices.view(), value.indptr.view()),
-        shape=value.shape,
-        copy=False,
-    )
+    # The source already has validated CSC structure. A shallow matrix copy
+    # avoids repeating SciPy's constructor checks, while the three new views
+    # isolate dtype/shape/strides changes made by a retained public problem.
+    result = copy(value)
+    result.data = value.data.view()
+    result.indices = value.indices.view()
+    result.indptr = value.indptr.view()
+    return result
 
 
 def _matrix_snapshot(value, key):
@@ -220,6 +243,7 @@ class _UpperCSC:
     def clear(self):
         self.shape = None
         self.rows = self.columns = self.indptr = None
+        self._template = None
 
     def convert(self, hessian):
         triangle = np.triu(hessian)
@@ -228,9 +252,11 @@ class _UpperCSC:
             # Equal nnz and all old positions still nonzero prove that no
             # position was removed or added, including same-count exchanges.
             if np.count_nonzero(triangle) == values.size and (values != 0).all():
-                return sparse.csc_matrix(
-                    (values, self.rows.view(), self.indptr.view()), shape=hessian.shape
-                )
+                result = copy(self._template)
+                result.data = values
+                result.indices = self.rows.view()
+                result.indptr = self.indptr.view()
+                return result
         result = sparse.csc_matrix(triangle)
         columns = np.repeat(
             np.arange(hessian.shape[1], dtype=result.indices.dtype), np.diff(result.indptr)
@@ -240,6 +266,9 @@ class _UpperCSC:
             np.frombuffer(value.tobytes(), dtype=value.dtype)
             for value in (result.indices, columns, result.indptr)
         )
+        # Keep only an empty CSC wrapper and the immutable structural indices.
+        # Every returned matrix receives fresh values; none are retained here.
+        self._template = sparse.csc_matrix(hessian.shape, dtype=hessian.dtype)
         self.shape = hessian.shape
         return result
 
@@ -460,10 +489,10 @@ class OSQPSolver:
         try:
             solver_warm_start = self._update_workspace(problem, warm_start)
             if solver_warm_start is not None:
-                self._solver.warm_start(x=solver_warm_start)
+                _osqp_call(self._solver.warm_start, x=solver_warm_start)
             with OSQP_EXECUTION_LOCK:
-                result = self._solver.solve(raise_error=False)
-        except osqp.OSQPException as exc:
+                result = _osqp_call(self._solver.solve, raise_error=False)
+        except _OSQPFailure as exc:
             self.reset()
             return QPResult("error", detail=str(exc))
         return self._validate_result(problem, result)
@@ -537,10 +566,11 @@ class OSQPSolver:
                     raise ValueError("nonfinite scaled QP vectors") from exc
 
         if same_matrices:
-            self._solver.update(q=solver_gradient, l=problem.lower, u=problem.upper)
+            _osqp_call(self._solver.update, q=solver_gradient, l=problem.lower, u=problem.upper)
         elif pattern != self._pattern:
             self._solver = osqp.OSQP()
-            self._solver.setup(
+            _osqp_call(
+                self._solver.setup,
                 P=solver_hessian,
                 q=solver_gradient,
                 A=solver_constraint,
@@ -557,7 +587,7 @@ class OSQPSolver:
                 updates["Px"] = solver_hessian.data
             if not same_constraint:
                 updates["Ax"] = solver_constraint.data
-            self._solver.update(**updates)
+            _osqp_call(self._solver.update, **updates)
 
         # Record snapshots after setup/update returns. Preserve the original A
         # independently of solver scaling for physical residual validation.

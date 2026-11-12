@@ -20,15 +20,22 @@ jobs:
       fail-fast: false
       matrix:
         python: ["3.10", "3.12"]
+        dependencies: [locked]
+        include:
+          - python: "3.10"
+            dependencies: minimum
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           python-version: ${{ matrix.python }}
           enable-cache: true
-          cache-suffix: python-${{ matrix.python }}
+          cache-suffix: python-${{ matrix.python }}-${{ matrix.dependencies }}
       - run: uv sync --locked
-      - run: uv run --locked pytest -q
+      - name: Install the oldest supported NumPy, SciPy, and OSQP
+        if: matrix.dependencies == 'minimum'
+        run: uv pip install --python .venv/bin/python numpy==1.24.0 scipy==1.10.0 osqp==1.0.0
+      - run: uv run --no-sync pytest -q
       - run: uv build --python .venv/bin/python
 
   native-and-urdf:

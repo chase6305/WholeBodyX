@@ -25,6 +25,13 @@
 普通公开数组仍复制数值，以检测后续写入。缩放后的求解器矩阵独立保存，物理残差继续
 使用原始坐标的约束矩阵。该优化减少 Python 快照存储，不代表 OSQP 分解或进程 RSS 同比下降。
 
+固定 CSC 通过浅复制矩阵封装并为 data/indices/indptr 建立独立数组视图，避免每个周期
+重复运行 SciPy 的构造检查；校验凭据仍覆盖实际缓冲区和视图元数据。动态稠密 Hessian
+只在非零结构保持不变时复用空 CSC 封装及不可写索引，每次重新提取数值，不保留旧数值。
+
+C++ 速度边界在关节远离位置限位时，先用保守停止距离排除无需收紧的制动边界。
+接近限位及速度差下溢时仍使用离散制动公式；停止距离以扩展精度计算，避免快捷判断溢出。
+
 关节 MPC 的积分直接写入输出缓冲区，速度差分包含测量速度与首条命令之间的变化，
 无需先拼接历史数组。C++ 计划验收使用列视图归约，避免逐预测步分配临时向量；
 公开计划仍需检查积分一致性，计算溢出不能作为一致性证据。
@@ -82,6 +89,9 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONPATH=build/native \
 
 `benchmark_process_mpc.py` 比较同步规划周期与进程父周期；`benchmark_wbc_hessian_cache.py`
 对照固定和变化任务的可选缓存。具体参数以各入口 `--help` 为准。
+`benchmark_native_validation.py --acceleration 4` 测量启用速度差与制动边界的完整 native WBC；
+加 `--near-limits` 覆盖靠近位置限位的负载。默认不设置加速度限制，适合检查普通路径是否回退。
+通过 `PYTHONPATH` 选择基线或候选扩展，使用 `--trace` 保存输出并独立比较数值。
 版本对照中，`compare_python_mpc.py --backend sparse` 与
 `compare_native_mpc.py --backend native-sparse` 分别选择稀疏实现；默认仍为消元 MPC。
 两者在计时外独立复核导出计划的位置、速度和速度差约束。
