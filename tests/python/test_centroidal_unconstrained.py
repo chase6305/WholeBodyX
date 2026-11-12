@@ -1,5 +1,8 @@
 """A feasible free optimum may bypass OSQP; active constraints and hooks may not."""
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -183,3 +186,18 @@ def test_nonfinite_factor_disables_direct_solves(monkeypatch):
     plan = planner.plan(*initial, targets, target_velocities=velocities)
     assert planner.solver._solver is not None
     assert planner.validate_plan(plan) <= 1e-6
+
+
+def test_long_preview_matches_the_independent_decimal_optimum():
+    fixture = json.loads((Path(__file__).resolve().parents[1]/'data/com_preview_free_100.json').read_text())
+    planner = CoMPreviewMPC(fixture['support_points'], fixture['height'],
+                            horizon=fixture['horizon'], dt=fixture['dt'], gravity=fixture['gravity'])
+    plan = planner.plan(*fixture['initial'], fixture['targets'],
+                         target_velocities=fixture['target_velocities'])
+    assert planner.solver._solver is None and planner.validate_plan(plan) <= 1e-6
+    np.testing.assert_allclose(plan.jerks, fixture['expected_jerks'], atol=1e-6, rtol=0)
+    np.testing.assert_allclose(plan.states, fixture['expected_states'], atol=1e-7, rtol=0)
+    objective = (.5*np.sum((plan.states[1:, 0]-fixture['targets'])**2)
+                 + .005*np.sum((plan.states[1:, 1]-fixture['target_velocities'])**2)
+                 + .5e-5*np.sum(plan.jerks**2))
+    assert objective == pytest.approx(fixture['objective'], rel=0, abs=1e-12)

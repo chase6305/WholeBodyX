@@ -35,6 +35,9 @@ conan create . -pr:h profiles/linux-gcc12-release -pr:b profiles/linux-gcc12-rel
 - 质心预览的直接求解覆盖已知 KKT 最优解、活动 jerk 边界、两条路径交替、reset、
   自定义求解器钩子和固定模型替换；动态非有限向量必须在进入 LAPACK 前拒绝。
   无约束候选仍需通过原 QP 边界及独立的完整区间轨迹验收。
+  `tests/data/com_preview_free_100.json` 保存 100 步的 70 位 Decimal 参考；
+  `scripts/generate_com_preview_reference.py --output tests/data/com_preview_free_100.json`
+  可从独立标量积分公式重建，不读取规划器的预测矩阵。
 - 可选约束行归一化覆盖小系数活动约束、全零/空行、无穷边界、固定矩阵与结构变化，
   并注入归一化残差很小但物理残差超限的结果，确认最终验收仍使用原始 A/边界。
 - 修改公开数组、稀疏索引、dtype、shape 和 strides 后必须重新校验；非法输入不得污染健康工作区。
