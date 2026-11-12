@@ -31,6 +31,14 @@ def _osqp_call(operation, *args, **kwargs):
         raise _OSQPFailure(str(exc)) from exc
 
 
+def _real_qp_array(value, ndim, name):
+    """Reject complex QP inputs before a float conversion can discard values."""
+    value = np.asarray(value)
+    if value.dtype.kind == "c":
+        raise ValueError(f"{name} must be real-valued")
+    return array(value, ndim, name)
+
+
 @dataclass(frozen=True)
 class QuadraticProgram:
     """Minimize 1/2 x'Hx + g'x subject to lower <= A x <= upper.
@@ -47,7 +55,7 @@ class QuadraticProgram:
 
     def __post_init__(self):
         for name, ndim in (("hessian", 2), ("constraint", 2)):
-            object.__setattr__(self, name, array(getattr(self, name), ndim, name))
+            object.__setattr__(self, name, _real_qp_array(getattr(self, name), ndim, name))
         self._validate_vectors()
         self._validate_hessian()
         self._remember_matrix_validation()
@@ -83,7 +91,7 @@ class QuadraticProgram:
         )
 
     def _validate_vectors(self):
-        object.__setattr__(self, "gradient", array(self.gradient, 1, "gradient"))
+        object.__setattr__(self, "gradient", _real_qp_array(self.gradient, 1, "gradient"))
         for name in ("lower", "upper"):
             value = np.asarray(getattr(self, name))
             if value.dtype.kind == "c":

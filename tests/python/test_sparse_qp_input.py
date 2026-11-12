@@ -1,4 +1,4 @@
-"""Sparse QP construction must reject complex storage before float casting."""
+"""QP construction must reject complex storage before float casting."""
 
 import warnings
 
@@ -10,9 +10,15 @@ from wholebodyx import QuadraticProgram, SparseQuadraticProgram
 
 
 @pytest.mark.parametrize('field', ['hessian', 'constraint'])
-@pytest.mark.parametrize('container', ['dense', 'sparse', 'list'])
+@pytest.mark.parametrize('constructor,container', [
+    (QuadraticProgram, 'dense'), (QuadraticProgram, 'list'),
+    (SparseQuadraticProgram, 'dense'), (SparseQuadraticProgram, 'sparse'),
+    (SparseQuadraticProgram, 'list'),
+])
 @pytest.mark.parametrize('imaginary', [0., .5])
-def test_complex_matrix_input_is_rejected_without_discarding_imaginary_values(field, container, imaginary):
+def test_complex_matrix_input_is_rejected_without_discarding_imaginary_values(
+    field, constructor, container, imaginary
+):
     value = np.eye(2, dtype=complex)
     value[0, 0] += imaginary * 1j
     if container == 'sparse':
@@ -25,7 +31,20 @@ def test_complex_matrix_input_is_rejected_without_discarding_imaginary_values(fi
     with warnings.catch_warnings():
         warnings.simplefilter('error')
         with pytest.raises(ValueError, match='real-valued'):
-            SparseQuadraticProgram(**values)
+            constructor(**values)
+
+
+@pytest.mark.parametrize('constructor', [QuadraticProgram, SparseQuadraticProgram])
+@pytest.mark.parametrize('container', ['array', 'list'])
+@pytest.mark.parametrize('imaginary', [0., .5])
+def test_complex_gradient_is_rejected_before_float_conversion(constructor, container, imaginary):
+    gradient = np.array([1. + imaginary * 1j, 0.], dtype=complex)
+    if container == 'list':
+        gradient = gradient.tolist()
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        with pytest.raises(ValueError, match='real-valued'):
+            constructor(np.eye(2), gradient, np.eye(2), [-1., -1.], [1., 1.])
 
 
 @pytest.mark.parametrize('constructor', [QuadraticProgram, SparseQuadraticProgram])
