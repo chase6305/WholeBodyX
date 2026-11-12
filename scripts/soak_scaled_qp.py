@@ -22,11 +22,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class Case:
-    def __init__(self, n, compact, seed, tolerance=1e-8, normalize_rows=False):
+    def __init__(self, n, compact, seed, tolerance=1e-8, normalize_rows=False,
+                 solver_normalize_rows=False, row_exponents=None):
         self.n, self.compact = n, compact
         self.rng = np.random.default_rng(seed + n + 100 * compact)
         self.normalize_rows = normalize_rows
+        self.row_exponents = _check_row_exponents(row_exponents)
         self.solver = OSQPSolver(variable_scaling=np.geomspace(.2, 3., n),
+                                 normalize_constraints=solver_normalize_rows,
                                  eps_abs=tolerance, eps_rel=tolerance,
                                  eps_prim_inf=tolerance, eps_dual_inf=tolerance)
         self.h = self.a = None
@@ -50,14 +53,21 @@ class Case:
             self.a = rng.normal(size=(m, n))
             if k % 13 == 0:
                 self.a[rng.random((m, n)) < .35] = 0.
+            self.row_factors = np.ones(m)
+            if self.row_exponents is not None:
+                self.row_factors = 10. ** rng.uniform(*self.row_exponents, m)
+                self.a *= self.row_factors[:, None]
         h, a = self.h, self.a
         expected = rng.uniform(-.5, .5, n)
         ax = a @ expected
-        lower, upper = ax - rng.uniform(.1, 2., m), ax + rng.uniform(.1, 2., m)
+        lower = ax - rng.uniform(.1, 2., m) * self.row_factors
+        upper = ax + rng.uniform(.1, 2., m) * self.row_factors
         dual = np.zeros(m)
         active = rng.choice(m, size=max(1, n // 2), replace=False)
         signs = rng.choice([-1., 1.], active.size)
         dual[active] = signs * rng.uniform(.2, 1., active.size)
+        # Keep the objective's active force comparable across physical units.
+        dual /= self.row_factors
         lower[active[signs < 0]] = ax[active[signs < 0]]
         upper[active[signs > 0]] = ax[active[signs > 0]]
         gradient = -h @ expected - a.T @ dual
@@ -134,18 +144,35 @@ class Case:
         r['max_solve_ms'] = max(r['max_solve_ms'], elapsed)
 
 
-def run(seconds, output, seed, tolerance=1e-8, normalize_rows=False):
+def _check_row_exponents(value):
+    if value is None:
+        return None
+    exponents = np.asarray(value, dtype=float)
+    if (exponents.shape != (2,) or not np.isfinite(exponents).all()
+            or not -300. <= exponents[0] <= exponents[1] <= 300.):
+        raise ValueError('row exponents must be two ordered finite values within [-300, 300]')
+    return tuple(exponents.tolist())
+
+
+def run(seconds, output, seed, tolerance=1e-8, normalize_rows=False,
+        solver_normalize_rows=False, row_exponents=None):
     if not np.isfinite(seconds) or seconds <= 0:
         raise ValueError('duration must be finite and positive')
     if not np.isfinite(tolerance) or tolerance <= 0:
         raise ValueError('tolerance must be finite and positive')
+    if normalize_rows and solver_normalize_rows:
+        raise ValueError('choose caller or solver row normalization, not both')
+    row_exponents = _check_row_exponents(row_exponents)
     paths = list((ROOT / 'python/wholebodyx').rglob('*.py')) + [Path(__file__).resolve()]
     hashes = source_hashes(ROOT, paths)
-    cases = {f'{n}-{"sparse" if compact else "dense"}': Case(n, compact, seed, tolerance, normalize_rows)
+    cases = {f'{n}-{"sparse" if compact else "dense"}': Case(
+                 n, compact, seed, tolerance, normalize_rows, solver_normalize_rows, row_exponents)
              for n in (3, 6, 19, 30) for compact in (False, True)}
     sequence = list(cases.values())
     report = dict(status='running', requested_wall_s=seconds, seed=seed, attempts=0,
                   tolerance=tolerance, normalized_rows=normalize_rows,
+                  solver_normalized_rows=solver_normalize_rows,
+                  row_exponents=row_exponents,
                   initial_rss_kib=rss_kib(), max_sampled_rss_kib=rss_kib(),
                   rss_sample_period_s=30., source_sha256=hashes)
     started = heartbeat = time.monotonic()
@@ -185,7 +212,14 @@ if __name__ == '__main__':
     parser.add_argument('--seconds', type=float, default=3600.)
     parser.add_argument('--seed', type=int, default=20261024)
     parser.add_argument('--tolerance', type=float, default=1e-8)
-    parser.add_argument('--normalize-rows', action='store_true')
+    parser.add_argument('--row-exponents', nargs=2, type=float, metavar=('LOW', 'HIGH'),
+                        help='multiply physical rows by 10**uniform(LOW,HIGH); rescale KKT duals')
+    normalization = parser.add_mutually_exclusive_group()
+    normalization.add_argument('--normalize-rows', action='store_true',
+                               help='normalize caller A/bounds before constructing the QP')
+    normalization.add_argument('--solver-normalize-rows', action='store_true',
+                               help='pass original physical QP to OSQPSolver normalization')
     parser.add_argument('--output', type=Path, default=Path('/tmp/wholebodyx-scaled-qp-soak.json'))
     args = parser.parse_args()
-    run(args.seconds, args.output, args.seed, args.tolerance, args.normalize_rows)
+    run(args.seconds, args.output, args.seed, args.tolerance, args.normalize_rows,
+        args.solver_normalize_rows, args.row_exponents)

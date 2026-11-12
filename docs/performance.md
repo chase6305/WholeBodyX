@@ -21,9 +21,16 @@
 重新校验凸性；普通公开数组被修改后会重新检查，不依赖可逆的只读标志。
 稠密上三角矩阵打包可复用非零索引，变化稀疏结构仍重新构建。
 
+求解前的 QP 缓冲区已由构造器转换为 NumPy 数组或 SciPy 稀疏矩阵。复数存储检查
+直接读取 `dtype.kind`，减少进入通用类型分派的开销；有限性与维度继续独立校验。
+
 求解器对 bytes 支撑的 H/A 快照共享不可写数据，各自保留矩阵与数组元数据；
 普通公开数组仍复制数值，以检测后续写入。缩放后的求解器矩阵独立保存，物理残差继续
 使用原始坐标的约束矩阵。该优化减少 Python 快照存储，不代表 OSQP 分解或进程 RSS 同比下降。
+
+[SciPy 稀疏校验](https://docs.scipy.org/doc/scipy/reference/generated/scipy.sparse.csc_matrix.check_format.html)
+可能重新分配索引存储。适配器在实际校验后重算矩阵存储凭据；转换后可写的缓冲区保存
+独立快照，后续修改仍会触发重新校验。CSC/CSR 的格式本身也参与矩阵比较。
 
 固定 CSC 通过浅复制矩阵封装并为 data/indices/indptr 建立独立数组视图，避免每个周期
 重复运行 SciPy 的构造检查；校验凭据仍覆盖实际缓冲区和视图元数据。动态稠密 Hessian
@@ -66,11 +73,20 @@ Python 与 native 消元 MPC 在默认求解中复用压缩固定模型。调用
 约 `3e-9` 的约束残差仍可能对应约 `3.5e-5` 的决策偏差。变量缩放和 OSQP 内部均衡
 不会消除所有这类情况；单独收紧求解容差也可能先触发迭代上限。
 
-对有此精度要求的问题，可在交给求解器前按每行最大绝对系数归一化 A 和两侧边界，
-并继续使用原始 A/边界独立复核物理残差；全零行使用尺度 1。正行缩放保持可行集不变。
-`scripts/soak_scaled_qp.py --normalize-rows` 提供该对照，确定性 KKT 用例见
-`tests/data/scaled_qp_small_row.json`。适配器默认仍接受 `1e-6` 的绝对物理残差，
-不额外承诺问题无关的决策距离界限；默认缩放长测的严格决策偏差断言保持不变。
+对有此精度要求的问题，可选择 `OSQPSolver(normalize_constraints=True)`，按原始
+A 每行最大绝对系数归一化 A 和两侧边界。全零行使用尺度 1；正行缩放保持可行集不变。
+适配器保存原始 A，返回结果继续按原始 A/边界复核绝对物理残差，公开 QP 无需改写。
+该选项与 `variable_scaling` 可同时使用，先归一化行，再变换变量坐标。
+归一化后的矩阵和行除数只在 A 改变时更新；动态边界每次缩放，增加的开销需要按实际负载测量。
+
+`scripts/soak_scaled_qp.py --solver-normalize-rows` 覆盖适配器内归一化，
+`--normalize-rows` 保留调用方手动归一化对照，两者不能同时指定。
+确定性 KKT 用例见 `tests/data/scaled_qp_small_row.json`。选项默认关闭，
+适配器仍要求 `1e-6` 的绝对物理残差，不额外承诺问题无关的决策距离界限；
+默认缩放长测的严格决策偏差断言保持不变。行归一化可能改变迭代次数及不可行性判据的
+数值表现；大系数行也可能因原始物理残差超限被拒绝。按行相除发生有限值溢出或把非零值
+下溢为零时，会在更新工作区前抛出 `ValueError`。近相关的活动约束仍可能在配置的迭代
+预算内无法达到严格收敛状态，调用方需按已有失败处理路径拒绝这些结果。
 
 ## 复现入口
 
@@ -101,6 +117,9 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONPATH=build/native \
 
 `benchmark_process_mpc.py` 比较同步规划周期与进程父周期；`benchmark_wbc_hessian_cache.py`
 对照固定和变化任务的可选缓存。具体参数以各入口 `--help` 为准。
+`benchmark_qp_row_normalization.py` 串行比较调用方每次归一化、调用方缓存固定 A、
+以及适配器内归一化的完整 QP 构造/求解路径；报告墙钟与线程 CPU 分位数及独立数值验收。
+调用方缓存模式只在固定 A 的负载中预处理矩阵，变化 A 仍在计时内重新归一化。
 `benchmark_native_validation.py --acceleration 4` 测量启用速度差与制动边界的完整 native WBC；
 加 `--near-limits` 覆盖靠近位置限位的负载。默认不设置加速度限制，适合检查普通路径是否回退。
 通过 `PYTHONPATH` 选择基线或候选扩展，使用 `--trace` 保存输出并独立比较数值。
