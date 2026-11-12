@@ -73,6 +73,10 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONPATH=build/native \
 `soak_mpc.py` 和 `soak_scaled_qp.py` 补充规划与缩放更新检查；`check_async_soak.py`
 流式复核异步事件、回复采用和故障恢复。报告须说明实际墙钟时长、模拟时间、拒绝/重试、
 源码是否保持不变、父子进程 RSS 采样与子进程回收。并行测试的时长不能相加。
+`soak_com_preview.py --seconds 300 --horizons 20 60 100 --modes free mixed` 检查变化的
+质心预览、定期重置和不可行测量。普通输入各有一个独立的可行轨迹见证；直接接受的结果
+另用物理递推的伴随梯度核对驻点。有限迭代预算拒绝后只冷重试一次，报告分别保留初次拒绝、
+冷恢复及最终拒绝，完成脚本不等于所有问题都成功求解。
 `soak_scaled_qp.py --solver-normalize-rows` 将原始物理 QP 交给适配器归一化，
 独立 KKT 最优解、目标差和物理残差阈值保持不变；`--normalize-rows` 则在调用方预先归一化。
 两种模式分别报告，不能把调用方模式的结果算作适配器内部归一化的验收。
