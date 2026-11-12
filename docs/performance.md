@@ -67,6 +67,13 @@ Python 与 native 消元 MPC 在默认求解中复用压缩固定模型。调用
 它改变控制周期中的等待分布，不减少规划问题本身的计算量；启动、IPC、参考接续和停机
 都需要单独测量。队列有界与非阻塞锁不构成 Python 或操作系统调度的硬实时保证。
 
+`CoMPreviewMPC` 默认先尝试固定代价的无约束极小值。一次缓存 Cholesky 分解后，
+每次只求解动态梯度对应的线性系统；候选值按原 QP 上下界逐值比较，不增加可行性松弛，
+并对返回轨迹独立检查 Bernstein 区间约束与终端捕获点。候选不可行时继续使用 OSQP。
+替换求解器、修改其求解方法或改变固定模型时，继续调用原求解接口。
+可设置 `unconstrained_fast_path=False` 关闭此路径；活动约束频繁时需测量额外尝试的成本。
+缓存分解占 `(2*N)^2*8` 字节，N=100 时约 313 KiB；这部分须与固定 H/A 分别报告。
+
 ## 小系数约束与精度
 
 绝对约束残差不能直接作为决策变量误差的上界。一个活动约束的系数若只有 `8e-5`，
@@ -120,6 +127,10 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONPATH=build/native \
 `benchmark_qp_row_normalization.py` 串行比较调用方每次归一化、调用方缓存固定 A、
 以及适配器内归一化的完整 QP 构造/求解路径；报告墙钟与线程 CPU 分位数及独立数值验收。
 调用方缓存模式只在固定 A 的负载中预处理矩阵，变化 A 仍在计时内重新归一化。
+`compare_com_preview.py --baseline-python /path/to/baseline/python` 比较质心预览的
+无活动约束、活动约束与交替负载，单独报告初始化、首次规划、墙钟/线程 CPU 分位数、
+直接求解命中和拒绝次数；数值复核在计时外进行。`--disable-fast-path` 可对照关闭快捷路径，
+`factor_bytes` 计分解缓存，`fixed_qp_bytes` 只计固定 H/A。仅比较成功率一致的负载耗时。
 `benchmark_native_validation.py --acceleration 4` 测量启用速度差与制动边界的完整 native WBC；
 加 `--near-limits` 覆盖靠近位置限位的负载。默认不设置加速度限制，适合检查普通路径是否回退。
 通过 `PYTHONPATH` 选择基线或候选扩展，使用 `--trace` 保存输出并独立比较数值。
