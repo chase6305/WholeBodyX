@@ -67,6 +67,21 @@ def test_active_jerk_constraint_uses_osqp_and_keeps_the_kkt_optimum(horizon):
     assert planner.validate_plan(plan) <= 1e-6
 
 
+def test_free_candidate_just_outside_a_bound_still_uses_the_backend():
+    planner = CoMPreviewMPC(SUPPORT, .8, horizon=3)
+    initial = np.zeros((3, 2))
+    jerks = np.zeros((3, 2))
+    jerks[0, 0] = planner.jerk_limit + 1e-8
+    states = rollout(initial, jerks, planner.dt)
+    correction = np.linalg.solve(planner.position_map.T, 1e-5*jerks.ravel())
+    targets = states[1:, 0] + correction.reshape(3, 2)
+    # Independent physical acceptance has a 1e-6 tolerance, but the shortcut
+    # must compare the original QP bounds exactly before applying that guard.
+    plan = planner.plan(*initial, targets, target_velocities=states[1:, 1])
+    assert planner.solver._solver is not None and planner._direct_solves == 0
+    assert planner.validate_plan(plan) <= 1e-6
+
+
 def test_free_active_free_transitions_and_reset_preserve_plans():
     planner = CoMPreviewMPC(SUPPORT, .8, horizon=3)
     saved = None
