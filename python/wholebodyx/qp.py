@@ -111,7 +111,7 @@ class QuadraticProgram:
     def _check_vectors(self):
         self._check_dimensions()
         if any(
-            np.iscomplexobj(value)
+            value.dtype.kind == "c"
             for value in (self.hessian, self.gradient, self.constraint, self.lower, self.upper)
         ):
             raise ValueError("QP storage must remain real-valued")
