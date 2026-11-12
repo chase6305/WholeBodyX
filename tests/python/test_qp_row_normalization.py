@@ -264,6 +264,27 @@ def test_solver_can_switch_dense_and_sparse_models_with_nonunit_rows():
         workspace = solver._solver
 
 
+@pytest.mark.parametrize('normalize', [False, True])
+@pytest.mark.parametrize('scale', [None, [.2, 3.]])
+def test_identical_sparse_buffers_in_a_different_format_are_not_the_same_constraint(normalize, scale):
+    p = SparseQuadraticProgram(sparse.eye(2), [-4., -2.],
+                               sparse.csc_matrix([[1., 2.], [0., 3.]]), [-np.inf] * 2, [1.] * 2)
+    solver = OSQPSolver(normalize_constraints=normalize, variable_scaling=scale)
+    for matrix_type, expected in ((sparse.csc_matrix, [2.6, -.8]),
+                                  (sparse.csr_matrix, [1., -1. / 3.]),
+                                  (sparse.csc_matrix, [2.6, -.8])):
+        # Changing compressed storage interpretation preserves data, indices,
+        # indptr and shape, but transposes this square constraint matrix.
+        p.constraint.__class__ = matrix_type
+        result = solver.solve(p)
+        assert result.success
+        np.testing.assert_allclose(result.x, expected, atol=2e-7, rtol=0)
+        ax = p.constraint @ result.x
+        physical = max((ax - p.upper).max(initial=0), (p.lower - ax).max(initial=0), 0.)
+        assert physical <= 1e-6
+        assert result.violation == pytest.approx(physical, abs=1e-14)
+
+
 @pytest.mark.parametrize('planner_type', [JointMPC, SparseJointMPC])
 def test_custom_normalizing_solver_preserves_mpc_plans_and_physical_limits(planner_type):
     limits = JointLimits([-1.] * 3, [1.] * 3, [.7] * 3, [3.] * 3)

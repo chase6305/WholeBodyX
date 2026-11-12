@@ -216,7 +216,11 @@ def _same_immutable_key(previous, current):
 def _same_matrix(snapshot, value, previous_key, key):
     """Reuse certified storage identity or compare against owned values."""
     if sparse.issparse(value):
-        if not sparse.issparse(snapshot) or snapshot.shape != value.shape:
+        if (
+            not sparse.issparse(snapshot)
+            or snapshot.shape != value.shape
+            or snapshot.format != value.format
+        ):
             return False
         if _same_immutable_key(previous_key, key):
             return True
