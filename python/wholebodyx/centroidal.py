@@ -7,6 +7,7 @@ centroidal momentum or contact-switching model.
 
 from dataclasses import dataclass
 from typing import Protocol
+from weakref import ref
 
 import numpy as np
 from scipy.linalg import cholesky, cho_solve
@@ -160,7 +161,9 @@ class CoMPreviewMPC:
             unconstrained_fast_path,
         )
         self.solver = OSQPSolver(eps_abs=1e-7, eps_rel=1e-7, max_iter=50000)
-        self._default_solver = self.solver
+        # Identifying the original instance must not retain its workspace after
+        # an application replaces the solver.
+        self._default_solver_ref = ref(self.solver)
         self.last_plan = None
         self.replans = 0
         self._direct_solves = self._qp_solves = 0
@@ -294,7 +297,7 @@ class CoMPreviewMPC:
         factor = self._unconstrained_factor
         if (
             factor is None
-            or self.solver is not self._default_solver
+            or self.solver is not self._default_solver_ref()
             or type(self.solver) is not OSQPSolver
             or getattr(self.solver.solve, "__func__", None) is not _OSQP_SOLVE
         ):

@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import weakref
 
 import numpy as np
 import pytest
@@ -158,6 +159,22 @@ def test_replacement_model_cannot_reuse_an_old_cost_factor():
     plan = planner.plan(*initial, targets, target_velocities=velocities)
     assert planner.solver._solver is not None
     np.testing.assert_allclose(plan.jerks, .5*original_optimum, atol=3e-5, rtol=0)
+
+
+def test_replacing_the_default_solver_releases_its_workspace():
+    import gc
+
+    planner = CoMPreviewMPC(SUPPORT, .8, horizon=3)
+    initial, targets, velocities, _, _ = known_optimum(planner, active=True)
+    planner.plan(*initial, targets, target_velocities=velocities)
+    assert planner.solver._solver is not None
+    previous = weakref.ref(planner.solver)
+    planner.solver = OSQPSolver()
+    gc.collect()
+    assert previous() is None
+    initial, targets, velocities, _, _ = known_optimum(planner)
+    planner.plan(*initial, targets, target_velocities=velocities)
+    assert planner.solver._solver is not None
 
 
 def test_solver_failure_after_a_free_plan_clears_the_old_plan(monkeypatch):
