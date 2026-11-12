@@ -9,6 +9,8 @@ from .qp import QuadraticProgram, _FixedQP, _immutable, _immutable_matrix_key, _
 
 
 def _frozen_csc(value, name):
+    if np.iscomplexobj(value):
+        raise ValueError(f"{name} must be real-valued")
     result = sparse.csc_matrix(value, dtype=float, copy=True)
     result.check_format(full_check=True)
     result.sum_duplicates()
