@@ -85,7 +85,10 @@ class QuadraticProgram:
     def _validate_vectors(self):
         object.__setattr__(self, "gradient", array(self.gradient, 1, "gradient"))
         for name in ("lower", "upper"):
-            value = np.array(getattr(self, name), dtype=float, copy=True)
+            value = np.asarray(getattr(self, name))
+            if value.dtype.kind == "c":
+                raise ValueError("bounds must be real-valued")
+            value = np.array(value, dtype=float, copy=True)
             if value.ndim != 1 or np.isnan(value).any():
                 raise ValueError("bounds must be vectors without NaNs")
             value.setflags(write=False)
