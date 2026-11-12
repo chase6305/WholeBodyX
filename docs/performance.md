@@ -66,11 +66,19 @@ Python 与 native 消元 MPC 在默认求解中复用压缩固定模型。调用
 约 `3e-9` 的约束残差仍可能对应约 `3.5e-5` 的决策偏差。变量缩放和 OSQP 内部均衡
 不会消除所有这类情况；单独收紧求解容差也可能先触发迭代上限。
 
-对有此精度要求的问题，可在交给求解器前按每行最大绝对系数归一化 A 和两侧边界，
-并继续使用原始 A/边界独立复核物理残差；全零行使用尺度 1。正行缩放保持可行集不变。
-`scripts/soak_scaled_qp.py --normalize-rows` 提供该对照，确定性 KKT 用例见
-`tests/data/scaled_qp_small_row.json`。适配器默认仍接受 `1e-6` 的绝对物理残差，
-不额外承诺问题无关的决策距离界限；默认缩放长测的严格决策偏差断言保持不变。
+对有此精度要求的问题，可选择 `OSQPSolver(normalize_constraints=True)`，按原始
+A 每行最大绝对系数归一化 A 和两侧边界。全零行使用尺度 1；正行缩放保持可行集不变。
+适配器保存原始 A，返回结果继续按原始 A/边界复核绝对物理残差，公开 QP 无需改写。
+该选项与 `variable_scaling` 可同时使用，先归一化行，再变换变量坐标。
+归一化后的矩阵和行除数只在 A 改变时更新；动态边界每次缩放，增加的开销需要按实际负载测量。
+
+`scripts/soak_scaled_qp.py --solver-normalize-rows` 覆盖适配器内归一化，
+`--normalize-rows` 保留调用方手动归一化对照，两者不能同时指定。
+确定性 KKT 用例见 `tests/data/scaled_qp_small_row.json`。选项默认关闭，
+适配器仍要求 `1e-6` 的绝对物理残差，不额外承诺问题无关的决策距离界限；
+默认缩放长测的严格决策偏差断言保持不变。行归一化可能改变迭代次数及不可行性判据的
+数值表现；大系数行也可能因原始物理残差超限被拒绝。有限值溢出或非零值下溢为零的
+归一化会在更新工作区前抛出 `ValueError`，不会静默丢弃系数或边界。
 
 ## 复现入口
 
@@ -101,6 +109,9 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONPATH=build/native \
 
 `benchmark_process_mpc.py` 比较同步规划周期与进程父周期；`benchmark_wbc_hessian_cache.py`
 对照固定和变化任务的可选缓存。具体参数以各入口 `--help` 为准。
+`benchmark_qp_row_normalization.py` 串行比较调用方每次归一化、调用方缓存固定 A、
+以及适配器内归一化的完整 QP 构造/求解路径；报告墙钟与线程 CPU 分位数及独立数值验收。
+调用方缓存模式只在固定 A 的负载中预处理矩阵，变化 A 仍在计时内重新归一化。
 `benchmark_native_validation.py --acceleration 4` 测量启用速度差与制动边界的完整 native WBC；
 加 `--near-limits` 覆盖靠近位置限位的负载。默认不设置加速度限制，适合检查普通路径是否回退。
 通过 `PYTHONPATH` 选择基线或候选扩展，使用 `--trace` 保存输出并独立比较数值。

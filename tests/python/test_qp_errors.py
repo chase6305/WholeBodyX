@@ -14,11 +14,12 @@ if hasattr(osqp, "OSQPException"):
 
 @pytest.mark.parametrize('operation', ['setup', 'update', 'warm_start', 'solve'])
 @pytest.mark.parametrize('error_type', ERROR_TYPES)
+@pytest.mark.parametrize('normalize', [False, True])
 def test_backend_failure_returns_error_and_recovers_with_fresh_workspace(
-    monkeypatch, operation, error_type
+    monkeypatch, operation, error_type, normalize
 ):
     problem = QuadraticProgram([[1.]], [-.2], [[1.]], [-1.], [1.])
-    solver = OSQPSolver()
+    solver = OSQPSolver(normalize_constraints=normalize)
     if operation != 'setup':
         assert solver.solve(problem).success
 
@@ -32,6 +33,7 @@ def test_backend_failure_returns_error_and_recovers_with_fresh_workspace(
     assert result.status == 'error' and result.x is None
     assert 'injected ' + operation + ' failure' in result.detail
     assert solver._solver is None
+    assert solver._constraint_divisor is None
     recovered = solver.solve(problem)
     assert recovered.success
     np.testing.assert_allclose(recovered.x, [.2], atol=1e-7)

@@ -10,9 +10,10 @@ from wholebodyx import OSQPSolver, QuadraticProgram, SparseQuadraticProgram
 @pytest.mark.parametrize("kind", ["nonconvex", "asymmetric", "nonfinite_hessian", "nonfinite_constraint",
                                   "nonfinite_gradient", "nan_lower", "nan_upper", "gradient_shape",
                                   "complex_hessian", "complex_constraint", "complex_gradient", "complex_lower", "complex_upper"])
-def test_changed_dense_problem_rejects_invalid_input_and_keeps_workspace_recoverable(kind):
+@pytest.mark.parametrize('normalize', [False, True])
+def test_changed_dense_problem_rejects_invalid_input_and_keeps_workspace_recoverable(kind, normalize):
     problem = QuadraticProgram(np.eye(2), [-1., -1.], np.eye(2), [-2., -2.], [2., 2.])
-    solver = OSQPSolver()
+    solver = OSQPSolver(normalize_constraints=normalize)
     assert solver.solve(problem).success
     workspace = solver._solver
     field = {"nonconvex": "hessian", "asymmetric": "hessian", "nonfinite_hessian": "hessian",
@@ -44,9 +45,10 @@ def test_changed_dense_problem_rejects_invalid_input_and_keeps_workspace_recover
 
 @pytest.mark.parametrize("kind", ["nonconvex", "asymmetric", "nan_hessian", "nan_constraint", "bad_indices",
                                   "complex_hessian", "complex_constraint"])
-def test_sparse_replacement_buffers_cannot_reuse_a_stale_constructor_certificate(kind):
+@pytest.mark.parametrize('normalize', [False, True])
+def test_sparse_replacement_buffers_cannot_reuse_a_stale_constructor_certificate(kind, normalize):
     problem = SparseQuadraticProgram(sparse.eye(2), [-1., -1.], sparse.eye(2), [-2., -2.], [2., 2.])
-    solver = OSQPSolver(variable_scaling=[.1, 2.])
+    solver = OSQPSolver(variable_scaling=[.1, 2.], normalize_constraints=normalize)
     assert solver.solve(problem).success
     target = problem.constraint if kind in ("nan_constraint", "bad_indices", "complex_constraint") else problem.hessian
     original = target.copy()

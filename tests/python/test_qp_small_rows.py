@@ -47,3 +47,19 @@ def test_row_normalization_recovers_small_row_optimum_in_physical_coordinates(co
     assert result.success
     np.testing.assert_allclose(result.x, expected, atol=1e-7, rtol=0)
     assert max(np.max(lower - a @ result.x), np.max(a @ result.x - upper), 0.) < 1e-8
+
+
+@pytest.mark.parametrize('compact', [False, True])
+@pytest.mark.parametrize('scale', [None, [.2, np.sqrt(.6), 3.]])
+def test_adapter_normalization_recovers_small_row_optimum_without_rewriting_problem(compact, scale):
+    h, a, g, lower, upper, expected, _ = fixture()
+    constructor = SparseQuadraticProgram if compact else QuadraticProgram
+    problem = constructor(sparse.csc_matrix(h) if compact else h, g,
+                          sparse.csc_matrix(a) if compact else a, lower, upper)
+    solver = OSQPSolver(variable_scaling=scale, normalize_constraints=True)
+    for warm_start in (None, expected, None):
+        result = solver.solve(problem, warm_start=warm_start)
+        assert result.success
+        np.testing.assert_allclose(result.x, expected, atol=1e-7, rtol=0)
+        physical = max((lower - a @ result.x).max(), (a @ result.x - upper).max(), 0.)
+        assert result.violation == pytest.approx(physical, abs=1e-14)

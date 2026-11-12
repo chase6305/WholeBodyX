@@ -299,6 +299,48 @@ def _scaled_csc(matrix, scale, *, rows=False):
     return result
 
 
+def _divide_constraint_rows(values, divisor):
+    """Reject overflow or lost nonzero coefficients/bounds before updating OSQP."""
+    with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+        try:
+            result = values / divisor
+        except FloatingPointError as exc:
+            raise ValueError("unrepresentable normalized QP constraints") from exc
+    if ((values != 0) & (result == 0)).any():
+        raise ValueError("unrepresentable normalized QP constraints: nonzero underflow")
+    return result
+
+
+def _normalized_constraint(matrix, column_scale=None):
+    """Own canonical CSC; cache nonunit row divisors without dense matrices."""
+    result = matrix.astype(float, copy=True)
+    # Public sparse storage may have changed since construction. Compute norms
+    # from actual coefficients, after combining duplicates and removing zeros.
+    result.has_sorted_indices = False
+    result.has_canonical_format = False
+    result.sum_duplicates()
+    result.sort_indices()
+    result.eliminate_zeros()
+    if not np.isfinite(result.data).all():
+        raise ValueError("nonfinite normalized QP constraints")
+    divisor = np.zeros(result.shape[0])
+    np.maximum.at(divisor, result.indices, np.abs(result.data))
+    divisor[divisor == 0] = 1.
+    # Box constraints and already normalized models need no bound transforms.
+    if (divisor == 1).all():
+        divisor = None
+    else:
+        result.data = _divide_constraint_rows(result.data, divisor[result.indices])
+        divisor = _immutable(divisor)
+    if column_scale is not None:
+        # The canonical CSC is already owned. Apply D here to avoid a second
+        # full copy/canonicalization through _scaled_csc for combined scaling.
+        with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+            result.data *= np.repeat(column_scale, np.diff(result.indptr))
+        result.eliminate_zeros()
+    return result, divisor
+
+
 class _FixedQP:
     """Validate a fixed H/A once; each instance still validates dynamic vectors."""
 
@@ -407,6 +449,8 @@ class OSQPSolver:
     """Reuse OSQP workspace when the sparsity structure is unchanged.
 
     Instances own mutable solver state; use one instance per control/planning loop.
+    Optional constraint normalization divides A and bounds by each row's largest
+    absolute coefficient. Results and residual acceptance retain physical units.
     """
 
     def __init__(
@@ -419,6 +463,7 @@ class OSQPSolver:
         max_iter=20000,
         polishing=False,
         variable_scaling=None,
+        normalize_constraints=False,
         adaptive_rho_interval=0,
     ):
         tolerances = [eps_abs, eps_rel, eps_prim_inf, eps_dual_inf]
@@ -432,6 +477,8 @@ class OSQPSolver:
             raise ValueError("max_iter must be a positive integer")
         if not isinstance(polishing, bool):
             raise ValueError("polishing must be boolean")
+        if not isinstance(normalize_constraints, bool):
+            raise ValueError("normalize_constraints must be boolean")
         if (
             isinstance(adaptive_rho_interval, bool)
             or not isinstance(adaptive_rho_interval, (int, np.integer))
@@ -439,6 +486,7 @@ class OSQPSolver:
         ):
             raise ValueError("adaptive_rho_interval must be a nonnegative integer")
         self._variable_scaling = None
+        self._normalize_constraints = normalize_constraints
         if variable_scaling is not None:
             scale = array(variable_scaling, 1, "variable scaling")
             if not scale.size or (scale <= 0).any():
@@ -461,6 +509,11 @@ class OSQPSolver:
         """Fixed x = D*z scaling; results and warm starts retain physical x."""
         return None if self._variable_scaling is None else self._variable_scaling.view()
 
+    @property
+    def normalize_constraints(self):
+        """Whether positive row normalization is applied before variable scaling."""
+        return self._normalize_constraints
+
     def reset(self):
         self._solver = None
         self._pattern = None
@@ -468,6 +521,7 @@ class OSQPSolver:
         self._sparse_constraint = None
         self._sparse_hessian = None
         self._physical_constraint = None
+        self._constraint_divisor = None
         self._matrix_keys = (None, None)
         self._upper_cache = _UpperCSC()
 
@@ -505,6 +559,7 @@ class OSQPSolver:
         numeric update; changed sparsity requires a fresh OSQP workspace.
         """
         scale = self._variable_scaling
+        divisor = self._constraint_divisor
         keys = (_immutable_matrix_key(problem.hessian), _immutable_matrix_key(problem.constraint))
         same_hessian = self._solver is not None and _same_matrix(
             self._hessian, problem.hessian, self._matrix_keys[0], keys[0]
@@ -538,10 +593,13 @@ class OSQPSolver:
             )
             if not same_constraint:
                 physical_constraint = solver_constraint
+                if self._normalize_constraints:
+                    physical_constraint = solver_constraint.copy()
+                    solver_constraint, divisor = _normalized_constraint(solver_constraint, scale)
             if scale is not None:
                 if not same_hessian:
                     solver_hessian = _scaled_csc(solver_hessian, scale, rows=True)
-                if not same_constraint:
+                if not same_constraint and not self._normalize_constraints:
                     physical_constraint = solver_constraint.copy()
                     solver_constraint = _scaled_csc(solver_constraint, scale)
                 if (
@@ -555,6 +613,10 @@ class OSQPSolver:
             )
 
         solver_gradient = problem.gradient
+        solver_lower, solver_upper = problem.lower, problem.upper
+        if divisor is not None:
+            solver_lower = _divide_constraint_rows(solver_lower, divisor)
+            solver_upper = _divide_constraint_rows(solver_upper, divisor)
         solver_warm_start = warm_start
         if scale is not None:
             with np.errstate(over="raise", invalid="raise", divide="raise"):
@@ -566,7 +628,7 @@ class OSQPSolver:
                     raise ValueError("nonfinite scaled QP vectors") from exc
 
         if same_matrices:
-            _osqp_call(self._solver.update, q=solver_gradient, l=problem.lower, u=problem.upper)
+            _osqp_call(self._solver.update, q=solver_gradient, l=solver_lower, u=solver_upper)
         elif pattern != self._pattern:
             self._solver = osqp.OSQP()
             _osqp_call(
@@ -574,15 +636,15 @@ class OSQPSolver:
                 P=solver_hessian,
                 q=solver_gradient,
                 A=solver_constraint,
-                l=problem.lower,
-                u=problem.upper,
+                l=solver_lower,
+                u=solver_upper,
                 verbose=False,
                 warm_starting=True,
                 **self._settings,
             )
             self._pattern = pattern
         else:
-            updates = dict(q=solver_gradient, l=problem.lower, u=problem.upper)
+            updates = dict(q=solver_gradient, l=solver_lower, u=solver_upper)
             if not same_hessian:
                 updates["Px"] = solver_hessian.data
             if not same_constraint:
@@ -598,6 +660,7 @@ class OSQPSolver:
             self._constraint = _matrix_snapshot(problem.constraint, keys[1])
             self._sparse_constraint = solver_constraint
             self._physical_constraint = physical_constraint
+            self._constraint_divisor = divisor
         self._matrix_keys = keys
         return solver_warm_start
 
