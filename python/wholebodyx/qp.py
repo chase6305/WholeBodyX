@@ -579,10 +579,14 @@ class OSQPSolver:
             getattr(problem, "_validated_hessian_key", None), keys[0]
         ):
             problem._validate_hessian()
+            # Sparse validation may cast index/data buffers into new mutable
+            # storage. Snapshot ownership must describe the validated buffers.
+            keys = (_immutable_matrix_key(problem.hessian), keys[1])
         if not same_constraint and not _same_immutable_key(
             getattr(problem, "_validated_constraint_key", None), keys[1]
         ):
             problem._validate_constraint()
+            keys = (keys[0], _immutable_matrix_key(problem.constraint))
 
         if not same_matrices:
             solver_hessian = (

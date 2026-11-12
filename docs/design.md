@@ -44,7 +44,7 @@ Python `OSQPSolver(normalize_constraints=True)` 可先按原始 A 每行最大�
 同时除 A 和上下界，再执行变量缩放；全零行的除数为 1。该选项默认关闭，
 不改变公开 QP、warm start 或结果的物理单位。行除数和缩放后的 CSC 随 A 缓存，
 只有边界或 Hessian 改变时不重新计算行尺度，reset 清除缓存。
-归一化导致有限值溢出或非零值下溢为零时，在更新工作区之前抛出 `ValueError`；
+按行相除发生有限值溢出或非零值下溢为零时，在更新工作区之前抛出 `ValueError`；
 原始 A 与边界仍用于独立的物理残差验收。
 Python `OSQPSolver` 与两个 C++ 适配器的原始/对偶不可行性判据默认均为 `1e-8`；Python 允许通过
 `eps_prim_inf` / `eps_dual_inf` 单独配置，以避免弱约束被 OSQP 较宽的默认判据提前误判。
