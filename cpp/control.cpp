@@ -57,10 +57,19 @@ std::pair<Vector, Vector> JointLimits::velocity_bounds(const RobotState& state, 
     velocity_lower = velocity_lower.cwiseMax(state.v - acceleration * dt);
     velocity_upper = velocity_upper.cwiseMin(state.v + acceleration * dt);
     for (Eigen::Index i = 0; i < velocity_lower.size(); ++i) {
-      velocity_lower[i] = std::max(
-          velocity_lower[i], -braking_speed(state.q[i] - lower[i], acceleration[i], dt));
-      velocity_upper[i] = std::min(
-          velocity_upper[i], braking_speed(upper[i] - state.q[i], acceleration[i], dt));
+      // A conservative stopping distance proves that the exact discrete
+      // envelope cannot tighten a joint comfortably inside its limits.
+      // Extended precision keeps this shortcut valid at extreme scales.
+      const long double speed = velocity[i];
+      const long double travel = speed * (speed / acceleration[i] + dt);
+      const double below = state.q[i] - lower[i], above = upper[i] - state.q[i];
+      const bool zero_slew = acceleration[i] * dt == 0.;
+      if (velocity_lower[i] < 0 && (below < travel || zero_slew))
+        velocity_lower[i] = std::max(
+            velocity_lower[i], -braking_speed(below, acceleration[i], dt));
+      if (velocity_upper[i] > 0 && (above < travel || zero_slew))
+        velocity_upper[i] = std::min(
+            velocity_upper[i], braking_speed(above, acceleration[i], dt));
       const double scale = std::max({std::abs(lower[i]), std::abs(upper[i]), std::abs(state.q[i])});
       if (std::isfinite(velocity_lower[i]) && std::isfinite(velocity_upper[i]) &&
           velocity_lower[i] > velocity_upper[i] &&

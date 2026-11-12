@@ -82,6 +82,41 @@ def test_sparse_buffers_are_immutable_but_returned_matrix_metadata_is_independen
     assert planner.solve(state, [.3]).solver.success
 
 
+@pytest.mark.parametrize('planner_type', [JointMPC, SparseJointMPC])
+@pytest.mark.parametrize('field', ['hessian', 'constraint'])
+@pytest.mark.parametrize('buffer', ['data', 'indices', 'indptr'])
+@pytest.mark.parametrize('mutation', ['shape', 'replace'])
+def test_retained_sparse_metadata_cannot_change_templates_or_solver_snapshots(
+    planner_type, field, buffer, mutation
+):
+    limits = JointLimits([-2., -2.], [2., 2.], [1., 1.], [4., 4.])
+    planner = planner_type(limits, horizon=5)
+    state, goal = RobotState([.1, -.2], [.05, -.05]), [.7, -.4]
+    expected = planner.solve(state, goal).plan
+    template = planner._template
+    first = (
+        template.problem(*planner._vectors(state, goal))
+        if planner_type is JointMPC else planner.formulate(state, goal)
+    )
+    assert planner.solver.solve(first).success
+    matrix = getattr(first, field)
+    part = getattr(matrix, buffer)
+    if mutation == 'shape':
+        part.shape = (1, part.size)
+    else:
+        setattr(matrix, buffer, np.zeros_like(part))
+    # Shape and both cached structural flags belong to each matrix object.
+    matrix._shape = (1, 1)
+    matrix.has_sorted_indices = False
+    matrix.has_canonical_format = False
+    actual = planner.solve(state, goal).plan
+    assert actual is not None
+    np.testing.assert_allclose(actual.positions, expected.positions, atol=1e-7, rtol=0)
+    np.testing.assert_allclose(actual.velocities, expected.velocities, atol=1e-6, rtol=0)
+    for matrix in (template._hessian, template._constraint):
+        assert matrix.has_sorted_indices and matrix.has_canonical_format
+
+
 def test_sparse_backend_works_in_existing_retargeting_and_failure_recovery():
     from wholebodyx.runner import run
 
