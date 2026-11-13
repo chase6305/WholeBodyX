@@ -7,11 +7,14 @@ centroidal momentum or contact-switching model.
 
 from dataclasses import dataclass
 from typing import Protocol
+from weakref import ref
 
 import numpy as np
+from scipy.linalg import cholesky, cho_solve
 from scipy.spatial import ConvexHull
 
-from .qp import OSQPSolver, _FixedQP, _immutable
+from .qp import (OSQPSolver, _FixedQP, _immutable, _immutable_matrix_key,
+                 _same_immutable_key, _OSQP_SOLVE)
 from .mpc import _time_window
 from .types import _snapshot, array
 
@@ -100,6 +103,7 @@ class _PreviewSettings:
     velocity_limit: float
     acceleration_limit: float
     jerk_limit: float
+    unconstrained_fast_path: bool
 
 
 class CoMPreviewMPC:
@@ -110,6 +114,7 @@ class CoMPreviewMPC:
     velocity_limit = property(lambda self: self._settings.velocity_limit)
     acceleration_limit = property(lambda self: self._settings.acceleration_limit)
     jerk_limit = property(lambda self: self._settings.jerk_limit)
+    unconstrained_fast_path = property(lambda self: self._settings.unconstrained_fast_path)
 
     def __init__(
         self,
@@ -122,6 +127,8 @@ class CoMPreviewMPC:
         acceleration_limit=0.6,
         jerk_limit=3.0,
         gravity=9.81,
+        *,
+        unconstrained_fast_path=True,
     ):
         points = array(support_points, 2, "support points")
         if (
@@ -137,6 +144,8 @@ class CoMPreviewMPC:
                 raise ValueError("MPC height, timing and bounds must be finite and positive")
         if not np.isfinite(margin) or margin < 0:
             raise ValueError("support margin must be nonnegative")
+        if not isinstance(unconstrained_fast_path, bool):
+            raise ValueError("unconstrained_fast_path must be boolean")
         hull = ConvexHull(points)
         self.support_vertices = _immutable(points[hull.vertices])
         self.normals = _immutable(hull.equations[:, :2])
@@ -149,10 +158,15 @@ class CoMPreviewMPC:
             float(velocity_limit),
             float(acceleration_limit),
             float(jerk_limit),
+            unconstrained_fast_path,
         )
         self.solver = OSQPSolver(eps_abs=1e-7, eps_rel=1e-7, max_iter=50000)
+        # Identifying the original instance must not retain its workspace after
+        # an application replaces the solver.
+        self._default_solver_ref = ref(self.solver)
         self.last_plan = None
         self.replans = 0
+        self._direct_solves = self._qp_solves = 0
         self._prepare()
 
     def _prepare(self):
@@ -217,11 +231,26 @@ class CoMPreviewMPC:
             )
         )
         self.problem = _FixedQP(hessian / 1000.0, constraint)
+        self._unconstrained_factor = None
+        self._unconstrained_keys = (self.problem._hessian_key, self.problem._constraint_key)
+        if self.unconstrained_fast_path:
+            try:
+                # OSQP reads H's upper triangle. Use that same symmetric
+                # operator, including any accepted roundoff asymmetry.
+                factor = cholesky(self.problem._hessian, lower=False, check_finite=False)
+            except np.linalg.LinAlgError:
+                # A numerically singular cost retains the existing QP path.
+                pass
+            else:
+                # Own immutable bytes in LAPACK's column-major order.
+                if np.isfinite(factor).all():
+                    self._unconstrained_factor = _immutable(factor.T).T
 
     def reset(self):
         self.solver.reset()
         self.last_plan = None
         self.replans = 0
+        self._direct_solves = self._qp_solves = 0
 
     def validate_plan(self, plan):
         """Independent physical validation, including complete interval curves.
@@ -258,6 +287,59 @@ class CoMPreviewMPC:
             raise ValueError("nonfinite CoM plan constraint evaluation")
         return float(max(0.0, *values))
 
+    def _plan_from_decision(self, initial, nominal, decision, stamp):
+        jerks = decision.reshape(self.horizon, 2)
+        states = np.concatenate((initial[None], nominal + self.state_control @ jerks))
+        return CoMPlan(states, jerks, float(stamp), self.dt, self.height, self.gravity)
+
+    def _unconstrained_plan(self, problem, initial, nominal, stamp):
+        """Accept the unique free optimum only for a certified, feasible model."""
+        factor = self._unconstrained_factor
+        if (
+            factor is None
+            or self.solver is not self._default_solver_ref()
+            or type(self.solver) is not OSQPSolver
+            or getattr(self.solver.solve, "__func__", None) is not _OSQP_SOLVE
+        ):
+            return None
+        for expected, matrix in zip(
+            self._unconstrained_keys, (problem.hessian, problem.constraint)
+        ):
+            if not _same_immutable_key(expected, _immutable_matrix_key(matrix)):
+                return None
+        # Retain the adapter's public-buffer checks even when a custom problem
+        # factory changed vectors after construction. LAPACK receives finite RHS.
+        problem._check_vectors()
+        # The negated gradient is owned; LAPACK may overwrite this RHS only.
+        with np.errstate(over="ignore", invalid="ignore"):
+            decision = cho_solve((factor, False), -problem.gradient,
+                                 overwrite_b=True, check_finite=False)
+        # The certified model starts with the jerk identity block. Avoid a
+        # full matrix-vector product when this box already rejects the point.
+        if (not np.isfinite(decision).all()
+                or not (decision >= problem.lower[:decision.size]).all()
+                or not (decision <= problem.upper[:decision.size]).all()):
+            return None
+        with np.errstate(over="ignore", invalid="ignore"):
+            values = problem.constraint @ decision
+        if (
+            not np.isfinite(values).all()
+            or not (values >= problem.lower).all()
+            or not (values <= problem.upper).all()
+        ):
+            return None
+        # Independently evaluate the returned physical trajectory, including
+        # Bernstein interval bounds and terminal capture, before bypassing QP.
+        try:
+            plan = self._plan_from_decision(initial, nominal, decision, stamp)
+            violation = self.validate_plan(plan)
+        except ValueError:
+            return None
+        if not np.isfinite(violation) or not 0 <= violation <= 1e-6:
+            return None
+        self._direct_solves += 1
+        return plan
+
     def plan(self, position, velocity, acceleration, targets, stamp=0.0, *, target_velocities=None):
         initial = np.stack([array(x, 1, "CoM state") for x in (position, velocity, acceleration)])
         targets = array(targets, 2, "CoM targets")
@@ -290,14 +372,15 @@ class CoMPreviewMPC:
             (self.offsets - support).ravel(),
             self.offsets - self.normals @ (self.capture_start @ initial),
         ]
-        result = self.solver.solve(self.problem.problem(gradient / 1000.0, lower, upper))
-        if not result.success:
-            self.last_plan = None
-            raise RuntimeError(f"CoM MPC failed: {result.status}: {result.detail}")
-        jerks = result.x.reshape(self.horizon, 2)
-        states = np.concatenate((initial[None], nominal + self.state_control @ jerks))
-        # CoMPlan validates and owns immutable snapshots of both arrays.
-        plan = CoMPlan(states, jerks, float(stamp), self.dt, self.height, self.gravity)
+        problem = self.problem.problem(gradient / 1000.0, lower, upper)
+        plan = self._unconstrained_plan(problem, initial, nominal, stamp)
+        if plan is None:
+            self._qp_solves += 1
+            result = self.solver.solve(problem)
+            if not result.success:
+                self.last_plan = None
+                raise RuntimeError(f"CoM MPC failed: {result.status}: {result.detail}")
+            plan = self._plan_from_decision(initial, nominal, result.x, stamp)
         self.last_plan = plan
         self.replans += 1
         return plan

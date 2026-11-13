@@ -726,3 +726,7 @@ class OSQPSolver:
                 detail="solution exceeds absolute constraint tolerance",
             )
         return QPResult("solved", solution, result.info.iter, violation, result.info.status)
+
+
+# Stable implementation identity for internal fast paths that must honor solver hooks.
+_OSQP_SOLVE = OSQPSolver.solve

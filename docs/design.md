@@ -292,6 +292,17 @@ Python 调度可以组合 Python 或 native WBC/MPC。native 求解调用释放 
 - 当前 native wheel 面向构建机平台，尚未进行多平台 wheel 修复/发布。
   扩展使用静态核心和当前静态 OSQP 包；Python 侧 Pinocchio 对象不跨 native 边界。
 
+## 质心预览的可行无约束解
+
+`CoMPreviewMPC` 的 jerk 正则项为正，固定代价在精确算术下严格凸。
+当 `H*x + g = 0` 的唯一解满足全部线性约束时，它也是原约束问题的唯一最优解。
+规划器默认缓存一份不可写 Cholesky 分解，使用与
+[OSQP 上三角约定](https://osqp.org/docs/interfaces/python.html) 相同的对称算子。
+模型存储与视图元数据必须仍匹配缓存凭据；动态向量每次重新检查。
+候选值通过不带可行性松弛的 QP 边界比较后，还要通过独立的 Bernstein 区间与终端捕获验收。
+不满足条件、无法可靠分解或显式使用其他求解器时，继续走 QP 求解接口。
+`unconstrained_fast_path=False` 可关闭该路径；reset 清除计划与求解历史，保留固定分解。
+
 ## 后续算法顺序与验收
 
 1. 接入自有仓库：提供 CMake target / Conan recipe 或 Python 包，完成 adapter，

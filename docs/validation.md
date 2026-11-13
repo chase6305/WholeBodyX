@@ -32,6 +32,12 @@ conan create . -pr:h profiles/linux-gcc12-release -pr:b profiles/linux-gcc12-rel
 - 独立离散制动 rollout 检查位置、速度、速度差和下一步可行性；注入求解残差后仍验证边界。
   C++ 回归另覆盖停止距离快捷判断两侧，以及扩展精度和速度差下溢边界。
 - 耦合 WBC 与 QP 使用解析解、KKT 最优解及独立物理残差；缩放前后保持物理单位和验收阈值。
+- 质心预览的直接求解覆盖已知 KKT 最优解、活动 jerk 边界、两条路径交替、reset、
+  自定义求解器钩子和固定模型替换；动态非有限向量必须在进入 LAPACK 前拒绝。
+  无约束候选仍需通过原 QP 边界及独立的完整区间轨迹验收。
+  `tests/data/com_preview_free_100.json` 保存 100 步的 70 位 Decimal 参考；
+  `scripts/generate_com_preview_reference.py --output tests/data/com_preview_free_100.json`
+  可从独立标量积分公式重建，不读取规划器的预测矩阵。
 - 可选约束行归一化覆盖小系数活动约束、全零/空行、无穷边界、固定矩阵与结构变化，
   并注入归一化残差很小但物理残差超限的结果，确认最终验收仍使用原始 A/边界。
 - 修改公开数组、稀疏索引、dtype、shape 和 strides 后必须重新校验；非法输入不得污染健康工作区。
@@ -67,6 +73,10 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONPATH=build/native \
 `soak_mpc.py` 和 `soak_scaled_qp.py` 补充规划与缩放更新检查；`check_async_soak.py`
 流式复核异步事件、回复采用和故障恢复。报告须说明实际墙钟时长、模拟时间、拒绝/重试、
 源码是否保持不变、父子进程 RSS 采样与子进程回收。并行测试的时长不能相加。
+`soak_com_preview.py --seconds 300 --horizons 20 60 100 --modes free mixed` 检查变化的
+质心预览、定期重置和不可行测量。普通输入各有一个独立的可行轨迹见证；直接接受的结果
+另用物理递推的伴随梯度核对驻点。有限迭代预算拒绝后只冷重试一次，报告分别保留初次拒绝、
+冷恢复及最终拒绝，完成脚本不等于所有问题都成功求解。
 `soak_scaled_qp.py --solver-normalize-rows` 将原始物理 QP 交给适配器归一化，
 独立 KKT 最优解、目标差和物理残差阈值保持不变；`--normalize-rows` 则在调用方预先归一化。
 两种模式分别报告，不能把调用方模式的结果算作适配器内部归一化的验收。
