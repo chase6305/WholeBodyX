@@ -81,22 +81,27 @@ def measure(name, bounds, work, horizon, warmup, interval):
         sync_times.append(step.cycle.cycle_ms)
     index = 0
     replies, cycle_times, child_times = [], [], []
+    round_trips = []
     max_qdiff = max_vdiff = max_violation = 0.
     with ProcessMPCWorker(bounds, backend=name, horizon=horizon, dt=.1) as worker:
-        submitted = False
+        submitted_at = None
 
         def exchange():
-            nonlocal index, submitted
+            nonlocal index, submitted_at
             if worker.error:
                 raise RuntimeError(worker.error)
             reply = worker.poll()
             if reply is not None:
+                assert submitted_at is not None
+                round_trips.append((time.perf_counter() - submitted_at) * 1000)
                 replies.append(reply)
                 child_times.append(reply.solve_ms)
                 index += 1
-                submitted = False
-            if not submitted and index < len(work):
-                submitted = worker.submit(*work[index]) is not None
+                submitted_at = None
+            if submitted_at is None and index < len(work):
+                started = time.perf_counter()
+                if worker.submit(*work[index]) is not None:
+                    submitted_at = started
 
         session = make_session(bounds, name, exchange)
         deadline = time.monotonic() + max(60., 10 * len(work))
@@ -129,6 +134,7 @@ def measure(name, bounds, work, horizon, warmup, interval):
         max_vdiff = max(max_vdiff, float(np.max(np.abs(plan.velocities - sync_plans[i].velocities))))
     assert max_qdiff <= 1e-5 and max_vdiff <= 3e-4
     return dict(synchronous_cycles=describe(sync_times[warmup:]), process_cycles=describe(cycle_times),
+                process_round_trip=describe(round_trips[warmup:]),
                 child_solve=describe(child_times[warmup:]), max_plan_position_difference=max_qdiff,
                 max_plan_velocity_difference=max_vdiff, max_physical_violation=max_violation,
                 worker_runtime=info, worker_statistics=stats, all_workers_reaped=True)
@@ -176,6 +182,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--joints", type=int, default=30)
     parser.add_argument("--horizon", type=int, default=60)
+    parser.add_argument("--interval", type=float, default=.005, help="process polling period in seconds")
     parser.add_argument("--backend", choices=("python", "native", "sparse", "native-sparse", "all"), default="all")
     parser.add_argument("--reverse", action="store_true", help="Reverse backend measurement order")
     parser.add_argument("--output", type=Path, default=Path("/tmp/wholebodyx-process-mpc-benchmark.json"))
@@ -184,4 +191,4 @@ if __name__ == "__main__":
     if args.reverse:
         selected = tuple(reversed(selected))
     run(args.output, backends=selected, joints=args.joints, horizon=args.horizon,
-        samples=args.samples, warmup=args.warmup)
+        samples=args.samples, warmup=args.warmup, interval=args.interval)

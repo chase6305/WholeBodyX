@@ -294,13 +294,16 @@ class JointMPC(_JointMPC):
         decision_count = joint_count * horizon
         # Keep only nonzero joint/temporal terms. The condensed decision order
         # remains u_0..u_(N-1); this is not the uncondensed SparseJointMPC model.
-        temporal = self.dt * np.tril(np.ones((horizon, horizon)))
+        temporal = np.tri(horizon)
+        temporal *= self.dt
         weights = np.full(horizon, self.tracking_weight)
         weights[-1] = self.terminal_weight
         prediction = sparse.kron(temporal, sparse.eye(joint_count, format="csc"), format="csc")
-        temporal_hessian = temporal.T @ (weights[:, None] * temporal)
+        # Two command columns overlap from their later interval to the end.
+        self._gradient_weights = np.cumsum((self.dt * weights)[::-1])[::-1]
+        position_cost = self.dt * self._gradient_weights
+        temporal_hessian = np.minimum.outer(position_cost, position_cost)
         temporal_hessian.flat[:: horizon + 1] += self.control_weight
-        self._gradient_weights = temporal.T @ weights
         rows = [sparse.eye(decision_count, format="csc"), prediction]
         lower = [-np.tile(self.limits.velocity, horizon), np.tile(self.limits.lower, horizon)]
         upper = [np.tile(self.limits.velocity, horizon), np.tile(self.limits.upper, horizon)]
@@ -335,13 +338,6 @@ class JointMPC(_JointMPC):
             if not max(np.finfo(float).tiny, rounding) < self.control_weight:
                 return
             rhs = -self._gradient_weights / self._gradient_weights[0]
-            # OSQP symmetrizes the upper triangle. Mirror it if matrix
-            # multiplication produced roundoff asymmetry.
-            if not np.array_equal(hessian, hessian.T):
-                upper = np.triu(hessian, k=1)
-                symmetric = upper + upper.T
-                np.fill_diagonal(symmetric, hessian.diagonal())
-                hessian = symmetric
             try:
                 gain = np.linalg.solve(hessian, rhs)
             except np.linalg.LinAlgError:

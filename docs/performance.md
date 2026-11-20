@@ -57,6 +57,7 @@ Linux/GCC 12 的 x86_64 profile 仅为 OSQP 设置 `-falign-functions=64:16:16`�
 
 Python 与 native 消元 MPC 在默认求解中复用压缩固定模型。调用 `formulate()` 会按需展开
 稠密诊断问题；使用自定义 Python 求解器也保留稠密接口。比较内存时应明确是否已创建诊断缓存。
+Python 消元 MPC 用重叠预测区间的权重尾和构造时间 Hessian，省去初始化时的稠密矩阵乘法。
 `sparse` / `native-sparse` 使用局部耦合的状态和控制变量；固定矩阵存储随关节数和预测长度
 线性增长，但额外决策变量和收敛行为可能使小问题或切换负载更慢。
 默认稀疏规划器会平移远离零点的窄关节区间，避免绝对位置抬高 OSQP 的相对收敛阈值。
@@ -136,6 +137,8 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONPATH=build/native \
 
 `benchmark_process_mpc.py` 比较同步规划周期与进程父周期；`benchmark_wbc_hessian_cache.py`
 对照固定和变化任务的可选缓存。具体参数以各入口 `--help` 为准。
+`process_round_trip` 计从提交到父进程取回结果的时间。该值包含 `--interval` 指定的轮询等待，
+`child_solve` 单独报告子进程的求解时间。
 `benchmark_qp_row_normalization.py` 串行比较调用方每次归一化、调用方缓存固定 A、
 以及适配器内归一化的完整 QP 构造/求解路径；报告墙钟与线程 CPU 分位数及独立数值验收。
 调用方缓存模式只在固定 A 的负载中预处理矩阵，变化 A 仍在计时内重新归一化。
