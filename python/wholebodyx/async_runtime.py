@@ -1,6 +1,6 @@
 """Future-state joint MPC references with explicit startup seeding."""
 
-from math import ceil, ulp
+from math import ceil, inf, isfinite, nextafter, ulp
 from time import monotonic
 from typing import NamedTuple
 
@@ -42,7 +42,7 @@ def _forecast_window(stamp, control_dt, lookahead):
     or a separate forecasting implementation.
     """
     ratio = lookahead / control_dt
-    if not np.isfinite(ratio) or ratio > 4096:
+    if not isfinite(ratio) or ratio > 4096:
         raise ValueError("lookahead must span at most 4096 control ticks")
     nearest = round(ratio)
     ticks = max(1, nearest if abs(ratio - nearest) <= 8 * ulp(ratio) else ceil(ratio))
@@ -57,8 +57,8 @@ def _forecast_window(stamp, control_dt, lookahead):
     previous = max(previous, stamp + (ticks - 1) * control_dt)
     start = min(start, stamp + ticks * control_dt)
     for _ in range(4):
-        start = float(np.nextafter(start, -np.inf))
-    if not np.isfinite(start) or start <= stamp or previous >= start:
+        start = nextafter(start, -inf)
+    if not isfinite(start) or start <= stamp or previous >= start:
         raise ValueError("future control timestamp cannot be represented")
     return start, previous
 
