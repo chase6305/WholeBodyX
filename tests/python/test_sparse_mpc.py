@@ -124,6 +124,29 @@ def test_short_step_slew_refusal_retries_original_model(monkeypatch):
     assert result.solver.detail.startswith("retry after velocity-difference solve:")
 
 
+def test_short_step_slew_retries_the_warm_workspace_from_cold(monkeypatch):
+    planner = SparseJointMPC(JointLimits([-1.], [1.], [.8], [2.]), horizon=40, dt=.004)
+    state, goal = RobotState([0.], [0.]), [.05]
+    assert planner.solve(state, goal).plan is not None
+    _, solver = planner._slew_problem
+    workspace = solver._solver
+    original = solver.solve
+    calls = []
+
+    def solve(problem, warm_start=None):
+        calls.append(warm_start is not None)
+        if len(calls) == 1:
+            return QPResult("iteration_limit", iterations=7, detail="maximum iterations reached")
+        return original(problem, warm_start=warm_start)
+
+    monkeypatch.setattr(solver, "solve", solve)
+    result = planner.solve(state, goal)
+
+    assert calls == [True, False] and solver._solver is not workspace
+    assert result.plan is not None and planner.solver._solver is None
+    assert result.solver.iterations > 7 and result.solver.detail.startswith("cold retry after")
+
+
 def test_generic_osqp_solver_can_switch_between_dense_and_sparse_workspaces():
     from wholebodyx import QuadraticProgram
 

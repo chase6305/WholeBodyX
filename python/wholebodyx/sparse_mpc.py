@@ -200,7 +200,21 @@ class SparseJointMPC(_JointMPC):
                 if np.isfinite(differences).all()
                 else None
             )
-        result = solver.solve(template.problem(gradient, lower, upper), warm_start=warm)
+        expanded_problem = template.problem(gradient, lower, upper)
+        reused_workspace = solver._solver is not None
+        result = solver.solve(expanded_problem, warm_start=warm)
+        if (
+            reused_workspace
+            and result.x is None
+            and (result.status == "iteration_limit" or result.detail.lower() == "solved inaccurate")
+        ):
+            first = result
+            solver.reset()
+            cold = solver.solve(expanded_problem)
+            result = QPResult(
+                cold.status, cold.x, first.iterations + cold.iterations, cold.violation,
+                "cold retry after " + first.detail + ". " + cold.detail,
+            )
         if not result.success:
             return result
         decision = result.x[:2 * size].copy()

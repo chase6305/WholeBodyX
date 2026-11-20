@@ -367,8 +367,9 @@ PlanResult SparseJointMPC::solve(const RobotState& state, const Vector& goal) {
           velocity;
     }
   }
-  const bool reused_workspace = planner.workspace != nullptr;
   const bool slew_variables = planner.slew_hessian.rows() != 0;
+  const bool reused_workspace = planner.workspace != nullptr &&
+                                planner.workspace_has_slew_variables == slew_variables;
   const auto solve = [&](const Vector& guess, bool use_slew_variables, bool* retryable = nullptr) {
     auto result = planner.solve_qp(
         gradient, lower_bounds, upper_bounds, guess, state.v, use_slew_variables, retryable);
@@ -381,17 +382,23 @@ PlanResult SparseJointMPC::solve(const RobotState& state, const Vector& goal) {
   };
   bool retryable = false;
   auto result = solve(warm, slew_variables, &retryable);
-  const bool retry_original = slew_variables && !result.success() && result.status != "infeasible";
-  if (retry_original || (reused_workspace && retryable)) {
-    // A badly conditioned warm workspace may retain unsuitable dual/rho state.
-    // Retry once from cold; inaccurate candidates never become executable plans.
+  if (reused_workspace && retryable) {
+    // Keep the same formulation for the cold retry. A poor warm start
+    // can fail even when the velocity-difference model converges cold.
     const auto first_iterations = result.iterations;
     const auto first_status = result.detail;
     planner.reset();
+    result = solve(Vector(), slew_variables);
+    result.iterations += first_iterations;
+    result.detail = "cold retry after " + first_status + "; " + result.detail;
+  }
+  const bool retry_original = slew_variables && !result.success() && result.status != "infeasible";
+  if (retry_original) {
+    const auto first_iterations = result.iterations;
+    planner.reset();
     result = solve(Vector(), false);
     result.iterations += first_iterations;
-    result.detail = retry_original ? "retry after velocity-difference solve: " + result.detail
-                                   : "cold retry after " + first_status + "; " + result.detail;
+    result.detail = "retry after velocity-difference solve: " + result.detail;
   }
   if (!result.success()) return {std::move(result), std::nullopt};
   JointPlan plan{Matrix(planner.horizon + 1, planner.joint_count),
