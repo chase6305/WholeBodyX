@@ -10,7 +10,7 @@ import hashlib
 import multiprocessing as mp
 from pathlib import Path
 import sys
-from threading import Event, Lock, Thread
+from threading import Condition, Event, Lock, Thread
 from time import perf_counter
 
 import numpy as np
@@ -140,6 +140,7 @@ class ProcessMPCWorker:
         self._error = None
         self._info = None
         self._lock = Lock()
+        self._request_available = Condition(self._lock)
         self._stop, self._ready = Event(), Event()
         self._counts = dict(
             submitted=0, coalesced=0, completed=0, discarded=0, max_solve_ms=0.0, mean_solve_ms=0.0
@@ -236,6 +237,7 @@ class ProcessMPCWorker:
             self._latest = token
             self._reply = None
             self._counts["submitted"] += 1
+            self._request_available.notify()
             return token
         finally:
             self._lock.release()
@@ -265,6 +267,7 @@ class ProcessMPCWorker:
         if self._lock.acquire(blocking=False):
             try:
                 self._outbox = self._reply = None
+                self._request_available.notify()
             finally:
                 self._lock.release()
 
@@ -301,7 +304,8 @@ class ProcessMPCWorker:
         sent = None
         try:
             while not self._stop.is_set():
-                if self._connection.poll(0.001):
+                waiting_for_child = sent is not None or self._info is None
+                if self._connection.poll(0.001 if waiting_for_child else 0):
                     message = self._connection.recv()
                     if not isinstance(message, tuple) or not message:
                         raise ValueError("invalid planner worker message")
@@ -337,9 +341,13 @@ class ProcessMPCWorker:
                     else:
                         raise ValueError("unexpected planner worker message")
                 if self._info is not None and sent is None:
-                    with self._lock:
+                    with self._request_available:
+                        if self._outbox is None and not self._stop.is_set():
+                            # An idle relay wakes on submit. Poll the child's
+                            # health periodically even without new requests.
+                            self._request_available.wait(timeout=0.02)
                         request, self._outbox = self._outbox, None
-                    if request is not None:
+                    if request is not None and not self._stop.is_set():
                         token, state, goal = request
                         if token == self._latest and token.generation == self._generation:
                             self._connection.send(
@@ -359,8 +367,8 @@ class ProcessMPCWorker:
         if self._shutdown_complete:
             return
         self._closed = True
-        self.cancel()
         self._stop.set()
+        self.cancel()
         # Termination also unblocks a relay receiving a partial IPC frame.
         if self._process.is_alive():
             self._process.terminate()

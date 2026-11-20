@@ -29,6 +29,58 @@ int main() {
     check(solved.solver.x.size() == 2, "uncondensed decision order");
     check(std::abs(solved.solver.x[0] - .2 * solved.solver.x[1]) < 1e-6, "uncondensed dynamics");
 
+    {
+      const Vector origin = (Vector(3) << 1000., -1100., 0.).finished();
+      const Vector radius = Vector::Constant(3, 2.);
+      const Vector velocity = Vector::Ones(3), acceleration = Vector::Constant(3, 3.);
+      SparseJointMPC absolute({origin - radius, origin + radius, velocity, acceleration});
+      SparseJointMPC reference({-radius, radius, velocity, acceleration});
+      const Vector v = (Vector(3) << .04, -.02, 0.).finished();
+      for (double stamp : {0., .08, .16}) {
+        const Vector measured = origin + (Vector(3) << .15, -.2, .1).finished();
+        const Vector goal = origin + (Vector(3) << .75 - 4 * stamp, -.55 + 5 * stamp, .2).finished();
+        const auto problem = absolute.formulate({measured, v, stamp}, goal);
+        const auto actual = absolute.solve({measured, v, stamp}, goal);
+        const auto expected = reference.solve({measured - origin, v, stamp}, goal - origin);
+        check(actual.plan && expected.plan, "sparse solve failed with distant joint coordinates");
+        check((problem.lower.head(3).array() == measured.array()).all(), "formulation changed origin");
+        check((actual.plan->velocities - expected.plan->velocities).cwiseAbs().maxCoeff() < 1e-7,
+              "centering changed velocities");
+        const Vector values = problem.constraint * actual.solver.x;
+        const double violation = std::max({(problem.lower - values).maxCoeff(),
+                                           (values - problem.upper).maxCoeff(), 0.});
+        check(violation == actual.solver.violation && violation <= 1e-6,
+              "solver decision or residual did not use physical coordinates");
+      }
+    }
+
+    {
+      constexpr int horizon = 60;
+      constexpr double dt = .004;
+      JointLimits limits{Vector::Constant(2, -1.), Vector::Ones(2),
+                         Vector::Constant(2, .8), Vector::Constant(2, 2.)};
+      SparseJointMPC planner(limits, horizon, dt);
+      const Vector goal = (Vector(2) << 20., -20.).finished();
+      for (double stamp : {0., .004, .008}) {
+        const RobotState state{Vector::Zero(2), Vector::Zero(2), stamp};
+        const auto result = planner.solve(state, goal);
+        check(result.plan && result.solver.x.size() == 4 * horizon,
+              "short-step sparse solve changed the public decision layout");
+        for (int k = 0; k < horizon; ++k) {
+          // The maximal feasible ramp in either direction minimizes every
+          // future tracking cost here, even with the velocity penalty.
+          const Eigen::RowVector2d expected(2. * dt * (k + 1), -2. * dt * (k + 1));
+          check((result.plan->velocities.row(k) - expected).cwiseAbs().maxCoeff() < 2e-7,
+                "short-step sparse solve differs from the maximal slew ramp");
+        }
+        const auto problem = planner.formulate(state, goal);
+        const Vector values = problem.constraint * result.solver.x;
+        check((problem.lower - values).maxCoeff() <= 1e-6 &&
+                  (values - problem.upper).maxCoeff() <= 1e-6,
+              "short-step sparse decision violates physical bounds");
+      }
+    }
+
     std::mt19937 random(137);
     std::uniform_real_distribution<double> uniform(-1., 1.);
     for (bool slew : {false, true}) {

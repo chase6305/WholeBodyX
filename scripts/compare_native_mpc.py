@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import platform
 
-from _comparison import case, invoke_worker, joint_plan_violation, rss_kib
+from _comparison import case, invoke_worker, joint_mpc_workload, joint_plan_violation, rss_kib
 
 from _measurement import source_hashes, sources_unchanged
 
@@ -32,11 +32,13 @@ def worker(args):
         raise RuntimeError(f"loaded {binary}, expected a build in {args.native_dir}")
     joints, horizon = args.case
     limits = JointLimits([-2.0] * joints, [2.0] * joints, [1.0] * joints, [4.0] * joints)
-    state, goal = RobotState(np.zeros(joints), np.zeros(joints)), np.full(joints, 0.3)
+    state = RobotState(np.zeros(joints), np.zeros(joints))
+    goal = np.full(joints, .02 if args.workload == "near" else .3)
     report = dict(
         joints=joints,
         horizon=horizon,
         backend=args.backend,
+        workload=args.workload,
         native_binary=str(binary),
         native_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
         initial_rss_kib=rss_kib(),
@@ -51,24 +53,25 @@ def worker(args):
         internal_fixed_matrix_bytes=getattr(planner, "fixed_matrix_bytes", None),
     )
 
-    def solve(target):
+    def solve(measurement, target):
         start = perf_counter()
-        outcome = planner.solve(state, target)
+        outcome = planner.solve(measurement, target)
         elapsed = (perf_counter() - start) * 1000
         if outcome.plan is None:
             raise RuntimeError(outcome.solver)
-        violation = joint_plan_violation(limits, outcome.plan, state.v)
+        violation = joint_plan_violation(limits, outcome.plan, measurement.v)
         if violation > 1e-6:
             raise RuntimeError(f"invalid physical plan: {violation}")
         return elapsed, outcome.solver, violation
 
-    report["first_solve_ms"], _, _ = solve(goal)
+    report["first_solve_ms"], _, _ = solve(state, goal)
     report["after_first_solve_rss_kib"] = rss_kib()
     for _ in range(args.warmup - 1):
-        solve(goal)
+        solve(state, goal)
     times, iterations, maximum, physical = [], [], 0.0, 0.0
-    for k in range(args.iterations):
-        elapsed, result, violation = solve(goal + 0.01 * np.sin(k))
+    work = joint_mpc_workload(args.workload, state, goal, args.iterations, args.seed)
+    for measurement, target in work:
+        elapsed, result, violation = solve(measurement, target)
         times.append(elapsed)
         iterations.append(result.iterations)
         maximum = max(maximum, result.violation)
@@ -78,6 +81,7 @@ def worker(args):
         p95_ms=float(np.percentile(times, 95)),
         max_ms=max(times),
         mean_solver_iterations=float(np.mean(iterations)),
+        zero_iteration_solves=iterations.count(0),
         max_constraint_violation=maximum,
         max_physical_violation=physical,
         after_updates_rss_kib=rss_kib(),
@@ -90,6 +94,10 @@ def main():
     parser.add_argument("--baseline-native", type=Path)
     parser.add_argument("--candidate-native", type=Path, default=ROOT / "build/native")
     parser.add_argument("--backend", choices=("native", "native-sparse"), default="native")
+    parser.add_argument(
+        "--workload", choices=("fixed", "random", "near", "alternating"), default="fixed"
+    )
+    parser.add_argument("--seed", type=int, default=20261022)
     parser.add_argument("--baseline-source-receipt", type=Path)
     parser.add_argument("--cases", type=case, nargs="+", default=[(6, 15), (19, 30), (30, 60)])
     parser.add_argument("--iterations", type=int, default=300)
@@ -134,6 +142,8 @@ def main():
         iterations=args.iterations,
         warmup=args.warmup,
         backend=args.backend,
+        workload=args.workload,
+        seed=args.seed,
         candidate_source_sha256=hashes,
         results=[],
         cpu_affinity=sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
@@ -162,6 +172,10 @@ def main():
                             str(args.warmup),
                             "--backend",
                             args.backend,
+                            "--workload",
+                            args.workload,
+                            "--seed",
+                            str(args.seed),
                         ],
                     )
                     row.update(build=name, round=index + 1)

@@ -1,10 +1,27 @@
 #pragma once
 
+#include "time_utils.hpp"
 #include "wholebodyx/control.hpp"
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace wholebodyx::detail {
+
+inline bool prefer_slew_variables(const JointLimits& limits, double dt, int horizon) {
+  return limits.acceleration.size() && dt <= .02 && horizon >= 30 &&
+         (dt * limits.acceleration.array() <= .1 * limits.velocity.array()).any();
+}
+
+inline std::pair<Vector, Vector> sample_validated_joint_plan(const JointPlan& plan, double time) {
+  if (!(std::isfinite(time) && time >= plan.stamp && time < plan.valid_until()))
+    throw std::invalid_argument("reference is future-dated or expired");
+  const auto index = interval(time, plan.stamp, plan.dt, plan.velocities.rows());
+  const double offset = std::max(0., time - plan.stamp - index * plan.dt);
+  Vector velocity = plan.velocities.row(index).transpose();
+  Vector position = plan.positions.row(index).transpose() + offset * velocity;
+  return {std::move(position), std::move(velocity)};
+}
 
 inline double joint_plan_violation(const JointPlan& plan, const JointLimits& limits,
                                    const RobotState& initial) {

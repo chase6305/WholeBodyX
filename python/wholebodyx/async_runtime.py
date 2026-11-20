@@ -1,6 +1,6 @@
 """Future-state joint MPC references with explicit startup seeding."""
 
-from math import ceil, ulp
+from math import ceil, inf, isfinite, nextafter, ulp
 from time import monotonic
 from typing import NamedTuple
 
@@ -42,7 +42,7 @@ def _forecast_window(stamp, control_dt, lookahead):
     or a separate forecasting implementation.
     """
     ratio = lookahead / control_dt
-    if not np.isfinite(ratio) or ratio > 4096:
+    if not isfinite(ratio) or ratio > 4096:
         raise ValueError("lookahead must span at most 4096 control ticks")
     nearest = round(ratio)
     ticks = max(1, nearest if abs(ratio - nearest) <= 8 * ulp(ratio) else ceil(ratio))
@@ -57,8 +57,8 @@ def _forecast_window(stamp, control_dt, lookahead):
     previous = max(previous, stamp + (ticks - 1) * control_dt)
     start = min(start, stamp + ticks * control_dt)
     for _ in range(4):
-        start = float(np.nextafter(start, -np.inf))
-    if not np.isfinite(start) or start <= stamp or previous >= start:
+        start = nextafter(start, -inf)
+    if not isfinite(start) or start <= stamp or previous >= start:
         raise ValueError("future control timestamp cannot be represented")
     return start, previous
 
@@ -157,7 +157,7 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
         # A display boundary may hide expired data but must never run a solver.
         stamp = float(stamp)
         if self.plan is not None and (
-            not np.isfinite(stamp) or stamp < self.plan.stamp or stamp >= self.plan.valid_until
+            not isfinite(stamp) or stamp < self.plan.stamp or stamp >= self.plan.valid_until
         ):
             self.invalidate("expired")
 
@@ -229,7 +229,7 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
             return self._failure("worker_error", str(exc))
         if token is not None:
             deadline = state.stamp + self.replan_period
-            if not np.isfinite(deadline) or deadline <= state.stamp:
+            if not isfinite(deadline) or deadline <= state.stamp:
                 return self._failure("coverage", "replan deadline cannot be represented")
             self._pending = _PendingPlan(
                 token,
@@ -248,7 +248,8 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
         goal = array(goal, 1, "goal")
         if goal.shape != state.q.shape:
             raise ValueError("goal and state dimensions differ")
-        if not np.isfinite(state.stamp + control_dt) or state.stamp + control_dt <= state.stamp:
+        control_end = state.stamp + control_dt
+        if not isfinite(control_end) or control_end <= state.stamp:
             raise ValueError("control interval cannot be represented")
         if self._clock_invalid or (self._last_stamp is not None and state.stamp < self._last_stamp):
             self._clock_invalid = True

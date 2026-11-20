@@ -31,6 +31,31 @@ def joint_plan_violation(limits, plan, initial_velocity):
     return violation
 
 
+def joint_mpc_workload(name, state, goal, iterations, seed):
+    import numpy as np
+    from wholebodyx import RobotState
+
+    joints = state.q.size
+    phases = np.linspace(0, np.pi, joints)
+    rng = np.random.default_rng(seed)
+    for k in range(iterations):
+        if name == "random":
+            measurement = RobotState(
+                rng.uniform(-.25, .25, joints), rng.uniform(-.1, .1, joints), k * .07
+            )
+            target = rng.uniform(-3., 3., joints)
+        elif name in ("near", "alternating"):
+            measurement = RobotState(
+                .03 * np.cos(phases + .17 * k), .05 * np.sin(phases + .1 * k), k * .02
+            )
+            distance = .32 if name == "alternating" and k % 6 >= 3 else .02
+            target = measurement.q + distance * np.cos(phases + .003 * k)
+        else:
+            measurement = state
+            target = goal + .01 * np.sin(k)
+        yield measurement, target
+
+
 def invoke_worker(script, pythonpath, arguments):
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(pythonpath)

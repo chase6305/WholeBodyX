@@ -3,6 +3,7 @@
 import os
 import multiprocessing as mp
 from pathlib import Path
+from threading import Condition, Event
 import time
 
 import numpy as np
@@ -87,6 +88,30 @@ def test_submit_poll_cancel_never_wait_on_held_relay_lock():
             assert time.monotonic() - started < .1
         token = worker.submit(RobotState([0.] * 3, [0.] * 3), [.2] * 3)
         assert receive(worker).token == token
+
+
+def test_submission_notifies_an_idle_relay(monkeypatch):
+    from wholebodyx import process_mpc
+
+    waiting = Event()
+
+    class SlowHealthCheck(Condition):
+        def wait(self, timeout=None):
+            waiting.set()
+            return super().wait(timeout=10.)
+
+    monkeypatch.setattr(process_mpc, "Condition", SlowHealthCheck)
+    with ProcessMPCWorker(limits(), horizon=5) as worker:
+        assert waiting.wait(5.)
+        state = RobotState([0.] * 3, [0.] * 3)
+        deadline = time.monotonic() + 2.
+        token = None
+        while token is None and time.monotonic() < deadline:
+            token = worker.submit(state, [.01] * 3)
+            if token is None:
+                time.sleep(.001)
+        assert token is not None
+        assert receive(worker, timeout=2.).token == token
 
 
 def test_worker_death_is_reported_and_can_be_reaped():

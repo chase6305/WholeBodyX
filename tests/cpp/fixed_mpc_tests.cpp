@@ -43,6 +43,75 @@ int main() {
     auto shared = std::make_shared<OSQPSolver>();
     JointMPC first(limits, 5, .1, 2, .4, 9, shared);
     JointMPC second(limits, 5, .1, 7, 2, 12, shared);
+    {
+      JointMPC planner(limits, 60, .075, 7., .3, 14.);
+      const Vector near_goal = state.q + (Vector(2) << .006, -.008).finished();
+      const auto problem = planner.formulate(state, near_goal);
+      const auto direct = planner.solve(state, near_goal);
+      check(direct.plan && direct.solver.iterations == 0, "inactive MPC did not solve directly");
+      const Vector values = problem.constraint * direct.solver.x;
+      check((values.array() >= problem.lower.array()).all() &&
+                (values.array() <= problem.upper.array()).all(),
+            "inactive MPC violated exact QP bounds");
+      check((problem.hessian * direct.solver.x + problem.gradient).cwiseAbs().maxCoeff() < 5e-14,
+            "inactive MPC did not satisfy stationarity");
+      same_optimum(planner, state, goal);
+      planner.reset();
+      same_optimum(planner, state, near_goal);
+    }
+    {
+      const JointLimits tight{Vector::Constant(1, -1.), Vector::Ones(1),
+                              Vector::Constant(1, .5 - 2e-9), Vector()};
+      JointMPC planner(tight, 1);
+      const RobotState origin{Vector::Zero(1), Vector::Zero(1), 0};
+      const Vector near_bound = Vector::Constant(1, .5 * (.1 + .1 * .1 * 30.) / (.1 * 30.));
+      const auto constrained = planner.solve(origin, near_bound);
+      check(constrained.plan && constrained.solver.iterations > 0,
+            "inactive MPC bypassed a slightly violated velocity bound");
+    }
+    {
+      constexpr int horizon = 12;
+      constexpr double dt = .1;
+      const JointLimits wide{Vector::Constant(1, -1.), Vector::Ones(1), Vector::Ones(1),
+                             Vector()};
+      const RobotState origin{Vector::Zero(1), Vector::Zero(1), 0};
+      const Vector goal = Vector::Constant(1, .08);
+      const auto free = JointMPC(wide, horizon, dt).solve(origin, goal);
+      check(free.plan && free.solver.iterations == 0, "wide MPC did not solve directly");
+
+      JointLimits position_limited = wide;
+      position_limited.upper[0] = free.plan->positions(horizon, 0) - 2e-9;
+      check(free.plan->positions(1, 0) < position_limited.upper[0],
+            "MPC validation case must first hit the bound after interval one");
+      const auto position = JointMPC(position_limited, horizon, dt).solve(origin, goal);
+      check(position.plan && position.solver.iterations > 0,
+            "direct MPC missed a later position bound");
+
+      const auto& velocity = free.plan->velocities;
+      const auto largest_change =
+          (velocity.bottomRows(horizon - 1) - velocity.topRows(horizon - 1)).cwiseAbs().maxCoeff();
+      JointLimits slew_limited = wide;
+      slew_limited.acceleration = Vector::Constant(1, (largest_change - 2e-9) / dt);
+      const RobotState moving{Vector::Zero(1), velocity.row(0).transpose(), 0};
+      const auto slew = JointMPC(slew_limited, horizon, dt).solve(moving, goal);
+      check(slew.plan && slew.solver.iterations > 0, "direct MPC missed a later slew bound");
+    }
+    {
+      JointMPC planner(limits, 60, .004);
+      const RobotState initial{Vector::Zero(2), Vector::Zero(2), 0};
+      const auto goal = (Vector(2) << 20., -20.).finished();
+      const auto initial_bytes = planner.fixed_matrix_bytes();
+      const auto outcome = planner.solve(initial, goal);
+      check(outcome.plan && outcome.solver.x.size() == 120,
+            "short-step condensed MPC did not return a velocity-only solution");
+      check(planner.fixed_matrix_bytes() > initial_bytes,
+            "fixed storage omitted the short-step solver's matrices");
+      const auto problem = planner.formulate(initial, goal);
+      const Vector values = problem.constraint * outcome.solver.x;
+      check((problem.lower - values).maxCoeff() <= 1e-6 &&
+                (values - problem.upper).maxCoeff() <= 1e-6,
+            "short-step sparse solution violates condensed bounds");
+    }
     for (int k = 0; k < 10; ++k) {
       same_optimum(first, state, goal);
       same_optimum(second, state, -goal);

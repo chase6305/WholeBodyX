@@ -8,6 +8,14 @@ from scipy import sparse
 from .qp import QuadraticProgram, _FixedQP, _immutable, _immutable_matrix_key, _sparse_view
 
 
+def _sparse_template_bytes(template):
+    return sum(
+        part.nbytes
+        for matrix in (template._hessian, template._constraint)
+        for part in (matrix.data, matrix.indices, matrix.indptr)
+    )
+
+
 def _frozen_csc(value, name):
     if np.iscomplexobj(value):
         raise ValueError(f"{name} must be real-valued")
