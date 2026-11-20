@@ -70,6 +70,33 @@ int main() {
             "inactive MPC bypassed a slightly violated velocity bound");
     }
     {
+      constexpr int horizon = 12;
+      constexpr double dt = .1;
+      const JointLimits wide{Vector::Constant(1, -1.), Vector::Ones(1), Vector::Ones(1),
+                             Vector()};
+      const RobotState origin{Vector::Zero(1), Vector::Zero(1), 0};
+      const Vector goal = Vector::Constant(1, .08);
+      const auto free = JointMPC(wide, horizon, dt).solve(origin, goal);
+      check(free.plan && free.solver.iterations == 0, "wide MPC did not solve directly");
+
+      JointLimits position_limited = wide;
+      position_limited.upper[0] = free.plan->positions(horizon, 0) - 2e-9;
+      check(free.plan->positions(1, 0) < position_limited.upper[0],
+            "MPC validation case must first hit the bound after interval one");
+      const auto position = JointMPC(position_limited, horizon, dt).solve(origin, goal);
+      check(position.plan && position.solver.iterations > 0,
+            "direct MPC missed a later position bound");
+
+      const auto& velocity = free.plan->velocities;
+      const auto largest_change =
+          (velocity.bottomRows(horizon - 1) - velocity.topRows(horizon - 1)).cwiseAbs().maxCoeff();
+      JointLimits slew_limited = wide;
+      slew_limited.acceleration = Vector::Constant(1, (largest_change - 2e-9) / dt);
+      const RobotState moving{Vector::Zero(1), velocity.row(0).transpose(), 0};
+      const auto slew = JointMPC(slew_limited, horizon, dt).solve(moving, goal);
+      check(slew.plan && slew.solver.iterations > 0, "direct MPC missed a later slew bound");
+    }
+    {
       JointMPC planner(limits, 60, .004);
       const RobotState initial{Vector::Zero(2), Vector::Zero(2), 0};
       const auto goal = (Vector(2) << 20., -20.).finished();

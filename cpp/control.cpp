@@ -322,13 +322,30 @@ Vector JointMPC::unconstrained_solution(const Vector& gradient, const Vector& lo
   if (!(first.array() >= lower.head(joints).array()).all() ||
       !(first.array() <= upper.head(joints).array()).all())
     return {};
-  Vector candidate(gradient.size());
-  for (int k = 0; k < horizon_; ++k)
-    candidate.segment(k * joints, joints) = unconstrained_gain_[k] * gradient.head(joints);
-  const Vector values = fixed_->constraint * candidate;
-  if (!values.allFinite() || !(values.array() >= lower.array()).all() ||
-      !(values.array() <= upper.array()).all())
-    return {};
+  const auto size = gradient.size();
+  Vector candidate(size);
+  Vector displacement = Vector::Zero(joints);
+  const bool check_slew = limits_.acceleration.size() != 0;
+  for (int k = 0; k < horizon_; ++k) {
+    const auto row = k * joints;
+    auto velocity = candidate.segment(row, joints);
+    velocity = unconstrained_gain_[k] * gradient.head(joints);
+    // The position rows of the condensed model are interval-ordered
+    // prefix sums. Each row extends the previous one by dt*u for this step.
+    displacement += dt_ * velocity;
+    if (!(velocity.array() >= lower.segment(row, joints).array()).all() ||
+        !(velocity.array() <= upper.segment(row, joints).array()).all() ||
+        !(displacement.array() >= lower.segment(size + row, joints).array()).all() ||
+        !(displacement.array() <= upper.segment(size + row, joints).array()).all())
+      return {};
+    if (check_slew && k > 0) {
+      const auto slew = 2 * size + row;
+      const auto change = velocity - candidate.segment(row - joints, joints);
+      if (!(change.array() >= lower.segment(slew, joints).array()).all() ||
+          !(change.array() <= upper.segment(slew, joints).array()).all())
+        return {};
+    }
+  }
   return candidate;
 }
 PlanResult JointMPC::solve_with_sparse_model(const RobotState& state, const Vector& goal,

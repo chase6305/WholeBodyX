@@ -168,6 +168,31 @@ def test_inactive_joint_mpc_falls_back_for_tiny_positive_constraint_residuals(co
     assert outcome.solver.iterations > 0 and planner.solver._solver is not None
 
 
+@pytest.mark.parametrize("constraint", ["later_position", "later_slew"])
+def test_direct_mpc_certifies_constraints_after_the_first_interval(constraint):
+    horizon, dt = 12, .1
+    goal = [.08]
+    state = RobotState([0.], [0.])
+    unrestricted = JointMPC(JointLimits([-1.], [1.], [1.]), horizon, dt)
+    result = unrestricted.solve(state, goal)
+    assert result.solver.iterations == 0 and result.plan is not None
+    velocity = result.plan.velocities[:, 0]
+    if constraint == "later_position":
+        final_limit = result.plan.positions[-1, 0] - 2e-9
+        assert result.plan.positions[1, 0] < final_limit
+        limits = JointLimits([-1.], [final_limit], [1.])
+    else:
+        state = RobotState([0.], velocity[:1])
+        limit = np.max(np.abs(np.diff(velocity))) - 2e-9
+        assert limit > 0.
+        limits = JointLimits([-1.], [1.], [1.], [limit / dt])
+    planner = JointMPC(limits, horizon, dt)
+
+    outcome = planner.solve(state, goal)
+
+    assert outcome.plan is not None and outcome.solver.iterations > 0
+
+
 def test_inactive_joint_mpc_can_resume_after_an_active_solve_and_reset():
     limits = JointLimits([-1.], [1.], [.8], [4.])
     planner = JointMPC(limits, horizon=10)

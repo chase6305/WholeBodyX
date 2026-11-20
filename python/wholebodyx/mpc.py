@@ -410,8 +410,20 @@ class JointMPC(_JointMPC):
                     return None
             if not ((first >= lower[:joint_count]).all() and (first <= upper[:joint_count]).all()):
                 return None
-            decision = (gain[:, None] * first_gradient).ravel()
-            values = self._template._constraint @ decision
+            velocities = gain[:, None] * first_gradient
+            decision = velocities.ravel()
+            size = decision.size
+            values = np.empty_like(lower)
+            values[:size] = decision
+            # The condensed position rows sum dt*u in interval order.
+            # Accumulate those rows without visiting their triangular matrix.
+            position = values[size:2 * size].reshape(velocities.shape)
+            np.multiply(velocities, self.dt, out=position)
+            np.cumsum(position, axis=0, out=position)
+            if self.limits.acceleration is not None:
+                slew = values[2 * size:].reshape(velocities.shape)
+                slew[0] = first
+                np.subtract(velocities[1:], velocities[:-1], out=slew[1:])
         if (
             not np.isfinite(values).all()
             or not (values >= lower).all()
