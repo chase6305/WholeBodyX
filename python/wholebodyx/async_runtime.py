@@ -157,7 +157,7 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
         # A display boundary may hide expired data but must never run a solver.
         stamp = float(stamp)
         if self.plan is not None and (
-            not np.isfinite(stamp) or stamp < self.plan.stamp or stamp >= self.plan.valid_until
+            not isfinite(stamp) or stamp < self.plan.stamp or stamp >= self.plan.valid_until
         ):
             self.invalidate("expired")
 
@@ -229,7 +229,7 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
             return self._failure("worker_error", str(exc))
         if token is not None:
             deadline = state.stamp + self.replan_period
-            if not np.isfinite(deadline) or deadline <= state.stamp:
+            if not isfinite(deadline) or deadline <= state.stamp:
                 return self._failure("coverage", "replan deadline cannot be represented")
             self._pending = _PendingPlan(
                 token,
@@ -248,7 +248,8 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
         goal = array(goal, 1, "goal")
         if goal.shape != state.q.shape:
             raise ValueError("goal and state dimensions differ")
-        if not np.isfinite(state.stamp + control_dt) or state.stamp + control_dt <= state.stamp:
+        control_end = state.stamp + control_dt
+        if not isfinite(control_end) or control_end <= state.stamp:
             raise ValueError("control interval cannot be represented")
         if self._clock_invalid or (self._last_stamp is not None and state.stamp < self._last_stamp):
             self._clock_invalid = True

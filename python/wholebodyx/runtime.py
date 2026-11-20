@@ -1,7 +1,7 @@
 """Synchronous MPC reference scheduling, independent of robot geometry and UI."""
 
 from dataclasses import dataclass
-from math import isfinite, ulp
+from math import ceil, isfinite, ulp
 from time import perf_counter
 
 import numpy as np
@@ -20,7 +20,8 @@ def _deadline_reached(stamp, deadline, origin, control_dt):
     Cap the allowance below one control tick so poor clock resolution cannot
     turn rounding tolerance into a materially early replan.
     """
-    ticks = max(1.0, np.ceil(max(0.0, stamp - origin) / control_dt))
+    span_ticks = max(1.0, (stamp - origin) / control_dt)
+    ticks = ceil(span_ticks) if isfinite(span_ticks) else span_ticks
     tolerance = min((4 + ticks) * max(ulp(stamp), ulp(deadline)), 0.25 * control_dt)
     return stamp >= deadline - tolerance
 
