@@ -29,7 +29,7 @@ class MPCReferenceManager {
 
  private:
   void clear();
-  JointPlan accept(const JointPlan&, const RobotState&, double control_dt) const;
+  void validate_plan(const JointPlan&, const RobotState&, double control_dt) const;
   Planner& planner_;
   JointLimits limits_;
   double replan_period_, tracking_tolerance_;

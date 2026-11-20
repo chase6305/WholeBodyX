@@ -175,11 +175,7 @@ void JointPlan::validate() const {
 }
 std::pair<Vector, Vector> JointPlan::sample(double time) const {
   validate();
-  require(std::isfinite(time) && time >= stamp && time < valid_until(),
-          "reference is future-dated or expired");
-  const auto k = interval(time, stamp, dt, velocities.rows());
-  Vector v = velocities.row(k).transpose();
-  return {positions.row(k).transpose() + std::max(0.0, time - stamp - k * dt) * v, v};
+  return detail::sample_validated_joint_plan(*this, time);
 }
 
 JointMPC::JointMPC(JointLimits limits, int horizon, double dt, double tracking_weight,

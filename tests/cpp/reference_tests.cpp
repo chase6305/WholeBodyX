@@ -65,10 +65,23 @@ int main() {
     RobotState state{Vector::Zero(2), Vector::Zero(2), 0};
     auto first = references.update(state, goal, .02);
     check(first.replanned() && first.reason == "initial", "initial reference missing");
+    first.position->setConstant(99);
+    first.velocity->setConstant(99);
+    first.solver->x.setConstant(99);
     planner.latest.plan->positions.setConstant(99);
     check(references.plan()->positions.maxCoeff() < 1, "planner workspace mutation changed accepted reference");
+    auto invalid = *references.plan();
+    invalid.positions.row(invalid.positions.rows() - 1).setConstant(99);
+    bool rejected_sample = false;
+    try { invalid.sample(state.stamp); }
+    catch (const std::invalid_argument&) { rejected_sample = true; }
+    check(rejected_sample, "public sampling accepted an invalid tail");
     state.stamp = .02;
-    check(references.update(state, goal, .02).reason == "reused", "valid plan was not reused");
+    const auto reused = references.update(state, goal, .02);
+    check(reused.reason == "reused", "valid plan was not reused");
+    const auto expected = references.plan()->sample(state.stamp);
+    check(reused.position->isApprox(expected.first) && reused.velocity->isApprox(expected.second),
+          "reused reference differs from public sampling");
     goal[0] += .1;
     check(references.update(state, goal, .02).reason == "goal_changed", "target change did not refresh immediately");
     for (int failure : {1, 2, 3}) {

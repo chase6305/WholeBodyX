@@ -1,4 +1,5 @@
 #include "wholebodyx/reference.hpp"
+#include "plan_validation.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -61,9 +62,8 @@ void MPCReferenceManager::discard_outdated(double stamp, const Vector& goal) {
   else if (stamp < plan_->stamp || stamp >= plan_->valid_until())
     invalidate("expired");
 }
-JointPlan MPCReferenceManager::accept(const JointPlan& proposed, const RobotState& state,
-                                      double control_dt) const {
-  JointPlan plan = proposed;  // Own all arrays, independently of planner storage.
+void MPCReferenceManager::validate_plan(const JointPlan& plan, const RobotState& state,
+                                        double control_dt) const {
   plan.validate();
   require(plan.stamp == state.stamp, "planner returned a stale or future-dated plan");
   require(plan.positions.cols() == state.q.size() &&
@@ -90,7 +90,6 @@ JointPlan MPCReferenceManager::accept(const JointPlan& proposed, const RobotStat
       }
     }
   }
-  return plan;
 }
 ReferenceUpdate MPCReferenceManager::update(const RobotState& state, const Vector& goal,
                                             double control_dt) {
@@ -117,7 +116,7 @@ ReferenceUpdate MPCReferenceManager::update(const RobotState& state, const Vecto
   else if (end > plan_->valid_until())
     update.reason = "coverage";
   else {
-    sampled = plan_->sample(state.stamp);
+    sampled = detail::sample_validated_joint_plan(*plan_, state.stamp);
     update.tracking_error = (state.q - sampled.first).cwiseAbs().maxCoeff();
     if (*update.tracking_error > tracking_tolerance_)
       update.reason = "tracking_error";
@@ -139,20 +138,21 @@ ReferenceUpdate MPCReferenceManager::update(const RobotState& state, const Vecto
       return update;
     };
     try {
-      const auto outcome = planner_.solve(state, goal);
-      update.solver = outcome.solver;
-      if (!outcome.solver.success() || !outcome.plan) {
-        if (outcome.solver.status == "solved")
+      auto outcome = planner_.solve(state, goal);
+      update.solver = std::move(outcome.solver);
+      if (!update.solver->success() || !outcome.plan) {
+        if (update.solver->status == "solved")
           update.solver =
               QPResult{"error", {}, 0, INFINITY, "solved result has no valid solution or plan"};
         update.solve_ms = elapsed();
         return update;
       }
-      JointPlan accepted = accept(*outcome.plan, state, control_dt);
+      validate_plan(*outcome.plan, state, control_dt);
       const double next = state.stamp + replan_period_;
       require(std::isfinite(next) && next > state.stamp, "replan deadline cannot be represented");
-      plan_ = std::move(accepted);
       goal_ = goal;
+      // The result owns its matrices and the manager exposes only a const view.
+      plan_ = std::move(outcome.plan);
       next_replan_ = next;
     } catch (const std::invalid_argument& exc) {
       return failure(exc);
@@ -160,7 +160,7 @@ ReferenceUpdate MPCReferenceManager::update(const RobotState& state, const Vecto
       return failure(exc);
     }
     update.solve_ms = elapsed();
-    sampled = plan_->sample(state.stamp);
+    sampled = detail::sample_validated_joint_plan(*plan_, state.stamp);
   }
   update.position = std::move(sampled.first);
   update.velocity = std::move(sampled.second);
