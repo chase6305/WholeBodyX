@@ -72,12 +72,19 @@ def worker(args):
         solve(state, goal)
     rng = np.random.default_rng(args.seed)
     times, iterations, maximum, physical = [], [], 0.0, 0.0
+    phases = np.linspace(0, np.pi, joints)
     for k in range(args.iterations):
         if args.workload == "random":
             state = RobotState(
                 rng.uniform(-0.25, 0.25, joints), rng.uniform(-0.1, 0.1, joints), k * 0.07
             )
             target = rng.uniform(-3.0, 3.0, joints)
+        elif args.workload in ("near", "alternating"):
+            state = RobotState(
+                .03 * np.cos(phases + .17 * k), .05 * np.sin(phases + .1 * k), k * .02
+            )
+            distance = .32 if args.workload == "alternating" and k % 6 >= 3 else .02
+            target = state.q + distance * np.cos(phases + .003 * k)
         else:
             target = goal + 0.01 * np.sin(k)
         elapsed, result, violation = solve(state, target)
@@ -91,6 +98,7 @@ def worker(args):
         max_ms=max(times),
         mean_solve_ms=float(np.mean(times)),
         mean_solver_iterations=float(np.mean(iterations)),
+        zero_iteration_solves=iterations.count(0),
         max_constraint_violation=maximum,
         max_physical_violation=physical,
         after_updates_rss_kib=rss_kib(),
@@ -111,7 +119,9 @@ def main():
     parser.add_argument("--iterations", type=int, default=300)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--rounds", type=int, default=4)
-    parser.add_argument("--workload", choices=("fixed", "random"), default="fixed")
+    parser.add_argument(
+        "--workload", choices=("fixed", "random", "near", "alternating"), default="fixed"
+    )
     parser.add_argument("--seed", type=int, default=20261022)
     parser.add_argument(
         "--output", type=Path, default=Path("/tmp/wholebodyx-python-comparison.json")

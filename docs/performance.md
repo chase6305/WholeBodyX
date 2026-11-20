@@ -46,6 +46,8 @@ C++ 速度边界在关节远离位置限位时，先用保守停止距离排除�
 同步参考管理器在一次复用更新中共用跟踪误差的采样结果；成功重规划后重新采样新轨迹。
 C++ 返回速度边界、周期状态和求解结果时移动已拥有的缓冲区；门控与规划接收边界的
 独立快照继续保留，避免诊断结果或调用方后续修改影响内部状态。
+同步 C++ 参考管理器会验收规划器返回的完整轨迹，并接管该结果的缓冲区。复用时只插值
+当前区间，开销随关节数增长。公开的 `JointPlan::sample()` 仍会验证完整轨迹。
 
 Linux/GCC 12 的 x86_64 profile 仅为 OSQP 设置 `-falign-functions=64:16:16`，
 并把该选项计入 Conan 包标识。该选项优先按 64 字节对齐，最多填充 15 字节，
@@ -57,6 +59,11 @@ Python 与 native 消元 MPC 在默认求解中复用压缩固定模型。调用
 稠密诊断问题；使用自定义 Python 求解器也保留稠密接口。比较内存时应明确是否已创建诊断缓存。
 `sparse` / `native-sparse` 使用局部耦合的状态和控制变量；固定矩阵存储随关节数和预测长度
 线性增长，但额外决策变量和收敛行为可能使小问题或切换负载更慢。
+
+Python `JointMPC` 的默认求解路径预计算单关节对目标偏差的无约束速度响应，缓存占
+`8*N` 字节。各关节使用各自的实测位置和目标缩放该响应。只有候选值满足原 QP 各行精确
+上下界且通过重建轨迹验收时，才返回零迭代的求解结果。约束截断候选值时交由 OSQP 求解。
+`unconstrained_fast_path=False` 可关闭此路径。注入求解器或覆盖问题构造仍使用各自接口。
 
 `cache_task_hessian=True` 适用于稳定的大 Jacobian 和权重；默认关闭。缓存逐值核对输入，
 只保留最近一批，不缓存目标速度。动态 Jacobian 可能因额外比较与复制增加开销。
@@ -137,4 +144,6 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONPATH=build/native \
 版本对照中，`compare_python_mpc.py --backend sparse` 与
 `compare_native_mpc.py --backend native-sparse` 分别选择稀疏实现；默认仍为消元 MPC。
 两者在计时外独立复核导出计划的位置、速度和速度差约束。
+Python 对照可用 `--workload near` 测量接近目标的周期，或用 `--workload alternating`
+交替测量接近目标和目标跳变。报告中的 `zero_iteration_solves` 记录直接求解次数。
 耐久与故障恢复的验收方法见 [验证说明](validation.md)，运行边界见 [执行接口](execution.md)。

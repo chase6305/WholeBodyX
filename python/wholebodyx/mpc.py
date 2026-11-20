@@ -6,7 +6,7 @@ from math import isfinite, ulp
 import numpy as np
 from scipy import sparse
 
-from .qp import OSQPSolver, QPResult, _immutable
+from .qp import OSQPSolver, QPResult, _OSQP_SOLVE, _immutable
 from .sparse_qp import _SparseFixedQP
 from .types import JointLimits, array, positive
 
@@ -253,11 +253,21 @@ class JointMPC(_JointMPC):
         control_weight=0.1,
         terminal_weight=30.0,
         solver=None,
+        *,
+        unconstrained_fast_path=True,
     ):
+        if not isinstance(unconstrained_fast_path, bool):
+            raise ValueError("unconstrained_fast_path must be boolean")
         self._settings = _MPCSettings(
             limits, horizon, dt, tracking_weight, control_weight, terminal_weight
         )
         self.solver = solver if solver is not None else OSQPSolver()
+        self._default_solver_token = None
+        if solver is None and unconstrained_fast_path:
+            # Identify the original adapter without retaining it after a
+            # replacement. An unopened planner can still be serialized.
+            self._default_solver_token = object()
+            self.solver._joint_mpc_owner = self._default_solver_token
         self._last_plan = None
         self._prepare()
 
@@ -305,6 +315,34 @@ class JointMPC(_JointMPC):
         )
         self._dense_template = None
         self._lower, self._upper = np.concatenate(lower), np.concatenate(upper)
+        self._unconstrained_gain = None
+        if self._default_solver_token is not None and self._gradient_weights[0] > 0:
+            self._prepare_unconstrained_gain(temporal_hessian)
+
+    def _prepare_unconstrained_gain(self, hessian):
+        # Each joint has the same temporal Hessian and a gradient proportional
+        # to its first entry. Cache the response to a unit first entry.
+        # When formation roundoff can dominate the control regularization,
+        # let the QP solver handle the problem using its normal checks.
+        with np.errstate(all="ignore"):
+            largest_row_sum = np.linalg.norm(hessian, ord=np.inf)
+            rounding = np.finfo(float).eps * (8 * self.horizon) * largest_row_sum
+            if not max(np.finfo(float).tiny, rounding) < self.control_weight:
+                return
+            rhs = -self._gradient_weights / self._gradient_weights[0]
+            # OSQP symmetrizes the upper triangle. Mirror it if matrix
+            # multiplication produced roundoff asymmetry.
+            if not np.array_equal(hessian, hessian.T):
+                upper = np.triu(hessian, k=1)
+                symmetric = upper + upper.T
+                np.fill_diagonal(symmetric, hessian.diagonal())
+                hessian = symmetric
+            try:
+                gain = np.linalg.solve(hessian, rhs)
+            except np.linalg.LinAlgError:
+                return
+        if np.isfinite(gain).all():
+            self._unconstrained_gain = _immutable(gain)
 
     def _vectors(self, state, goal):
         self.limits.check_state(state)
@@ -336,18 +374,62 @@ class JointMPC(_JointMPC):
             self._dense_template = self._template.dense_template()
         return self._dense_template.problem(*vectors)
 
+    def _unconstrained_result(self, state, gradient, lower, upper):
+        gain = self._unconstrained_gain
+        joint_count = state.q.size
+        first_gradient = gradient[:joint_count]
+        with np.errstate(all="ignore"):
+            first = gain[0] * first_gradient
+            if self.limits.acceleration is not None:
+                initial_slew = slice(2 * gradient.size, 2 * gradient.size + joint_count)
+                if not (
+                    (first >= lower[initial_slew]).all() and (first <= upper[initial_slew]).all()
+                ):
+                    return None
+            if not ((first >= lower[:joint_count]).all() and (first <= upper[:joint_count]).all()):
+                return None
+            decision = (gain[:, None] * first_gradient).ravel()
+            values = self._template._constraint @ decision
+        if (
+            not np.isfinite(values).all()
+            or not (values >= lower).all()
+            or not (values <= upper).all()
+        ):
+            return None
+        decision.setflags(write=False)
+        result = QPResult("solved", decision, violation=0.0, detail="unconstrained optimum")
+        try:
+            outcome = self._plan_result(state, result)
+        except ValueError:
+            return None
+        return outcome if outcome.plan is not None else None
+
     def solve(self, state, goal):
         # Custom solvers and overridden formulation methods retain the public
         # dense contract. Only the built-in adapter uses the compressed model.
         if (
             type(self.solver) is OSQPSolver
-            and getattr(self.solver.solve, "__func__", None) is OSQPSolver.solve
-            and getattr(self.formulate, "__func__", None) is JointMPC.formulate
+            and getattr(self.solver.solve, "__func__", None) is _OSQP_SOLVE
+            and getattr(self.formulate, "__func__", None) is _JOINT_MPC_FORMULATE
         ):
-            problem = self._template.problem(*self._vectors(state, goal))
+            vectors = self._vectors(state, goal)
+            if (
+                type(self) is JointMPC
+                and getattr(self, "_unconstrained_gain", None) is not None
+                and getattr(self.solver, "_joint_mpc_owner", None) is self._default_solver_token
+                and getattr(self._vectors, "__func__", None) is _JOINT_MPC_VECTORS
+            ):
+                direct = self._unconstrained_result(state, *vectors)
+                if direct is not None:
+                    return direct
+            problem = self._template.problem(*vectors)
         else:
             problem = self.formulate(state, goal)
         velocities = self._warm_velocities(state)
         warm = None if velocities is None else velocities.reshape(-1)
         result = self.solver.solve(problem, warm_start=warm)
         return self._plan_result(state, result)
+
+
+_JOINT_MPC_FORMULATE = JointMPC.formulate
+_JOINT_MPC_VECTORS = JointMPC._vectors

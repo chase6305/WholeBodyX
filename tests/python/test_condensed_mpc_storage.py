@@ -97,8 +97,82 @@ def test_instance_solver_override_keeps_dense_contract(monkeypatch):
         return original(problem, warm_start)
 
     monkeypatch.setattr(planner.solver, "solve", solve)
-    assert planner.solve(RobotState([0.], [0.]), [.3]).plan is not None
+    assert planner.solve(RobotState([0.], [0.]), [.02]).plan is not None
     assert calls == [1]
+
+
+@pytest.mark.parametrize("horizon, dt", [(1, .2), (7, .03), (60, .1)])
+def test_inactive_joint_mpc_matches_the_public_stationarity_equations(horizon, dt):
+    limits = JointLimits([-3., -2., -1.], [3., 4., 2.], [.8, 1.2, .9], [6., 8., 10.])
+    planner = JointMPC(limits, horizon=horizon, dt=dt, tracking_weight=7.,
+                       control_weight=.3, terminal_weight=14.)
+    state = RobotState([.15, -.25, .05], [.02, -.01, 0.], stamp=1e8)
+    goal = state.q + [.006, -.008, .012]
+    problem = planner.formulate(state, goal)
+
+    result = planner.solve(state, goal)
+
+    assert result.plan is not None
+    assert result.solver.iterations == 0 and planner.solver._solver is None
+    decision = result.solver.x
+    constrained_values = problem.constraint @ decision
+    assert np.all(problem.lower <= constrained_values)
+    assert np.all(constrained_values <= problem.upper)
+    np.testing.assert_allclose(problem.hessian @ decision, -problem.gradient, atol=5e-14)
+    expected = np.linalg.solve(problem.hessian, -problem.gradient)
+    np.testing.assert_allclose(result.plan.velocities.ravel(), expected, rtol=0., atol=5e-13)
+
+
+@pytest.mark.parametrize("constraint", ["position", "velocity", "initial_slew"])
+def test_inactive_joint_mpc_falls_back_for_tiny_positive_constraint_residuals(constraint):
+    velocity = .5
+    position = .1 * velocity
+    acceleration = velocity / .1
+    if constraint == "position":
+        position -= 2e-9
+    elif constraint == "velocity":
+        velocity -= 2e-9
+    else:
+        acceleration -= 2e-8
+    limits = JointLimits([-1.], [position if constraint == "position" else 1.],
+                         [velocity if constraint == "velocity" else 1.],
+                         [acceleration] if constraint == "initial_slew" else None)
+    planner = JointMPC(limits, horizon=1)
+    state = RobotState([0.], [0.])
+    # Horizon one solves (r + dt²*w)*u = dt*w*(goal - q).
+    goal = [.5 * (.1 + .1**2 * 30.) / (.1 * 30.)]
+
+    outcome = planner.solve(state, goal)
+
+    assert outcome.plan is not None
+    assert outcome.solver.iterations > 0 and planner.solver._solver is not None
+
+
+def test_inactive_joint_mpc_can_resume_after_an_active_solve_and_reset():
+    limits = JointLimits([-1.], [1.], [.8], [4.])
+    planner = JointMPC(limits, horizon=10)
+    baseline = JointMPC(limits, horizon=10, unconstrained_fast_path=False)
+    for index, goal in enumerate([.01, .3, -.02, -.4, 0.]):
+        state = RobotState([0.], [0.], index * .1)
+        actual, expected = planner.solve(state, [goal]), baseline.solve(state, [goal])
+        assert actual.plan is not None and expected.plan is not None
+        assert (actual.solver.iterations == 0) == (index % 2 == 0)
+        np.testing.assert_allclose(actual.plan.velocities, expected.plan.velocities,
+                                   rtol=0., atol=1e-6)
+        if index == 3:
+            planner.reset()
+            baseline.reset()
+
+
+def test_inactive_joint_mpc_does_not_skip_replacement_adapter():
+    planner = JointMPC(JointLimits([-1.], [1.], [.8]))
+    replacement = OSQPSolver()
+    planner.solver = replacement
+
+    result = planner.solve(RobotState([0.], [0.]), [.01])
+
+    assert result.plan is not None
+    assert result.solver.iterations > 0 and replacement._solver is not None
 
 
 @pytest.mark.parametrize("temporal", [[[-1.]], [[1., .5], [0., 1.]], [[np.nan]], [[np.inf]]])
