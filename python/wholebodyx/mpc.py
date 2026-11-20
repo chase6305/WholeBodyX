@@ -120,11 +120,16 @@ class JointPlan:
         _time_window(self.stamp, self.dt, len(velocities))
         try:
             # Overflow must not make two inconsistent displacements compare
-            # equal as infinities. The ordinary path needs no extra scans.
+            # equal as infinities. Both temporary arrays are safe to reuse.
             with np.errstate(over="raise", invalid="raise"):
-                consistent = np.allclose(
-                    np.diff(positions, axis=0), self.dt * velocities, rtol=1e-7, atol=1e-8
-                )
+                error = np.diff(positions, axis=0)
+                expected = self.dt * velocities
+                error -= expected
+                np.abs(error, out=error)
+                tolerance = np.abs(expected, out=expected)
+                tolerance *= 1e-7
+                tolerance += 1e-8
+                consistent = (error <= tolerance).all()
         except FloatingPointError:
             consistent = False
         if not consistent:
