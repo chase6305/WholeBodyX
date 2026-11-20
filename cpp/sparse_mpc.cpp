@@ -47,7 +47,7 @@ struct SparseJointMPC::Impl {
   Eigen::Index joint_count, trajectory_size;
   Eigen::SparseMatrix<double> hessian, constraint;
   Eigen::SparseMatrix<double> scaled_hessian, scaled_constraint;
-  Vector lower, upper, position_weights;
+  Vector lower, upper, position_weights, position_origin;
   std::optional<JointPlan> last_plan;
   OSQPWorkspace* workspace = nullptr;
 
@@ -71,6 +71,16 @@ struct SparseJointMPC::Impl {
     require(joint_count <= std::numeric_limits<int>::max() / (8LL * horizon),
             "sparse MPC dimensions exceed index capacity");
     trajectory_size = joint_count * horizon;
+    position_origin = Vector::Zero(joint_count);
+    for (Eigen::Index joint = 0; joint < joint_count; ++joint) {
+      const double half_lower = .5 * limits.lower[joint], half_upper = .5 * limits.upper[joint];
+      const double midpoint = half_lower + half_upper;
+      // A distant, narrow range can spend OSQP's relative tolerance on the
+      // coordinate offset. Move the origin before the internal solve.
+      if (std::abs(midpoint) > 100. && .125 * std::abs(midpoint) > half_upper - half_lower)
+        position_origin[joint] = midpoint;
+    }
+    if (position_origin.isZero(0.)) position_origin.resize(0);
     const bool slew = limits.acceleration.size() != 0;
     const auto rows = (slew ? 4 : 3) * trajectory_size;
     std::vector<Eigen::Triplet<double>> hessian_entries, constraint_entries;
@@ -148,6 +158,49 @@ struct SparseJointMPC::Impl {
             "nonfinite MPC vectors");
   }
 
+  void center_vectors(const Vector& goal, Vector& gradient, Vector& lower_bounds,
+                      Vector& upper_bounds) const {
+    const Vector centered_goal = goal - position_origin;
+    lower_bounds.head(joint_count) -= position_origin;
+    upper_bounds.head(joint_count) -= position_origin;
+    for (int k = 0; k < horizon; ++k) {
+      const auto row = k * joint_count;
+      gradient.segment(row, joint_count) =
+          -position_weights.segment(row, joint_count).cwiseProduct(centered_goal);
+      lower_bounds.segment(trajectory_size + row, joint_count) -= position_origin;
+      upper_bounds.segment(trajectory_size + row, joint_count) -= position_origin;
+    }
+    require(gradient.allFinite() && lower_bounds.allFinite() && upper_bounds.allFinite(),
+            "nonfinite centered MPC vectors");
+  }
+
+  void validate_solution(QPResult& result, const Vector& lower_bound,
+                         const Vector& upper_bound) const {
+    result.status = "error";
+    result.violation = INFINITY;
+    if (!result.x.allFinite()) {
+      result.x.resize(0);
+      result.detail = "nonfinite solution";
+      return;
+    }
+    const Vector values = constraint * result.x;
+    if (!values.allFinite()) {
+      result.x.resize(0);
+      result.detail = "nonfinite constraint evaluation";
+      return;
+    }
+    result.violation = 0.;
+    for (Eigen::Index i = 0; i < values.size(); ++i)
+      result.violation = std::max({result.violation, lower_bound[i] - values[i],
+                                   values[i] - upper_bound[i]});
+    if (result.violation > 1e-6) {
+      result.x.resize(0);
+      result.detail = "solution exceeds absolute constraint tolerance";
+      return;
+    }
+    result.status = "solved";
+  }
+
   QPResult solve_qp(const Vector& gradient, const Vector& lower_bound, const Vector& upper_bound,
                     const Vector& warm, bool* retryable = nullptr) {
     if (retryable) *retryable = false;
@@ -200,27 +253,9 @@ struct SparseJointMPC::Impl {
       result.status = detail::rejected_osqp_status(status);
       return result;
     }
-    Vector solution = Eigen::Map<const Vector>(workspace->solution->x, 2 * trajectory_size);
-    solution.head(trajectory_size) *= position_scale;
-    if (!solution.allFinite()) {
-      result.detail = "nonfinite solution";
-      return result;
-    }
-    Vector constraint_values = constraint * solution;
-    if (!constraint_values.allFinite()) {
-      result.detail = "nonfinite constraint evaluation";
-      return result;
-    }
-    result.violation = 0;
-    for (Eigen::Index i = 0; i < constraint_values.size(); ++i)
-      result.violation = std::max({result.violation, lower_bound[i] - constraint_values[i],
-                                   constraint_values[i] - upper_bound[i]});
-    if (result.violation > 1e-6) {
-      result.detail = "solution exceeds absolute constraint tolerance";
-      return result;
-    }
-    result.status = "solved";
-    result.x = std::move(solution);
+    result.x = Eigen::Map<const Vector>(workspace->solution->x, 2 * trajectory_size);
+    result.x.head(trajectory_size) *= position_scale;
+    validate_solution(result, lower_bound, upper_bound);
     return result;
   }
 };
@@ -243,12 +278,20 @@ PlanResult SparseJointMPC::solve(const RobotState& state, const Vector& goal) {
   auto& planner = *impl_;
   Vector gradient, lower_bounds, upper_bounds;
   planner.vectors(state, goal, gradient, lower_bounds, upper_bounds);
+  const bool centered = planner.position_origin.size() != 0;
+  Vector physical_lower, physical_upper;
+  if (centered) {
+    physical_lower = lower_bounds;
+    physical_upper = upper_bounds;
+    planner.center_vectors(goal, gradient, lower_bounds, upper_bounds);
+  }
   Vector warm;
   if (planner.last_plan && state.stamp >= planner.last_plan->stamp) {
     const auto offset =
         detail::interval(state.stamp, planner.last_plan->stamp, planner.dt, planner.horizon);
     warm.resize(2 * planner.trajectory_size);
     Vector position = state.q;
+    if (centered) position -= planner.position_origin;
     for (int k = 0; k < planner.horizon; ++k) {
       const auto velocity =
           planner.last_plan->velocities.row(std::min<Eigen::Index>(k + offset, planner.horizon - 1))
@@ -271,6 +314,11 @@ PlanResult SparseJointMPC::solve(const RobotState& state, const Vector& goal) {
     result = planner.solve_qp(gradient, lower_bounds, upper_bounds, Vector());
     result.iterations += first_iterations;
     result.detail = "cold retry after " + first_status + "; " + result.detail;
+  }
+  if (centered && result.success()) {
+    for (int k = 0; k < planner.horizon; ++k)
+      result.x.segment(k * planner.joint_count, planner.joint_count) += planner.position_origin;
+    planner.validate_solution(result, physical_lower, physical_upper);
   }
   if (!result.success()) return {std::move(result), std::nullopt};
   JointPlan plan{Matrix(planner.horizon + 1, planner.joint_count),

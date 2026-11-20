@@ -4,7 +4,7 @@ import numpy as np
 from scipy import sparse
 
 from .mpc import _JointMPC, _MPCSettings, _integrate_positions, _time_window
-from .qp import OSQPSolver, QPResult
+from .qp import OSQPSolver, QPResult, _OSQP_SOLVE, _immutable, _validated_qp_solution
 from .sparse_qp import _SparseFixedQP
 from .types import array
 
@@ -43,6 +43,14 @@ class SparseJointMPC(_JointMPC):
             else solver
         )
         self._default_solver = self.solver if solver is None else None
+        # OSQP's relative tolerance can exceed the 1e-6 physical residual
+        # tolerance at large absolute positions. Translate narrow, distant
+        # joint ranges and keep the physical problem for result acceptance.
+        half_lower, half_upper = .5 * self.limits.lower, .5 * self.limits.upper
+        midpoint = half_lower + half_upper
+        magnitude = np.abs(midpoint)
+        offset = (magnitude > 100.) & (.125 * magnitude > half_upper - half_lower)
+        self._position_origin = _immutable(np.where(offset, midpoint, 0.)) if offset.any() else None
         self._last_plan = None
         self._prepare()
 
@@ -88,6 +96,9 @@ class SparseJointMPC(_JointMPC):
         self._lower, self._upper = np.concatenate(lower), np.concatenate(upper)
 
     def formulate(self, state, goal):
+        return self._formulate(state, goal, position_origin=None)
+
+    def _formulate(self, state, goal, position_origin):
         self.limits.check_state(state)
         _time_window(state.stamp, self.dt, self.horizon)
         goal = array(goal, 1, "goal")
@@ -96,15 +107,23 @@ class SparseJointMPC(_JointMPC):
         joint_count = state.q.size
         trajectory_size = joint_count * self.horizon
         lower, upper = self._lower.copy(), self._upper.copy()
-        lower[:joint_count] = upper[:joint_count] = state.q
         gradient = np.zeros(2 * trajectory_size)
         position_gradient = gradient[:trajectory_size].reshape(self.horizon, joint_count)
         initial_slew_rows = slice(3 * trajectory_size, 3 * trajectory_size + joint_count)
         try:
             with np.errstate(over="raise", invalid="raise"):
+                initial_position = state.q
+                position_target = -goal
+                if position_origin is not None:
+                    initial_position = state.q - position_origin
+                    position_target += position_origin
+                    position_rows = slice(trajectory_size, 2 * trajectory_size)
+                    lower[position_rows].reshape(self.horizon, joint_count)[:] -= position_origin
+                    upper[position_rows].reshape(self.horizon, joint_count)[:] -= position_origin
+                lower[:joint_count] = upper[:joint_count] = initial_position
                 np.multiply(
                     self._position_weights.reshape(self.horizon, joint_count),
-                    -goal,
+                    position_target,
                     out=position_gradient,
                 )
                 if self.limits.acceleration is not None:
@@ -114,23 +133,47 @@ class SparseJointMPC(_JointMPC):
             raise ValueError("nonfinite MPC vectors") from exc
         return self._template.problem(gradient, lower, upper)
 
+    def _physical_result(self, result, problem, origin, trajectory_size):
+        if not result.success:
+            return result
+        decision = result.x.copy()
+        with np.errstate(over="ignore", invalid="ignore"):
+            decision[:trajectory_size].reshape(self.horizon, origin.size)[:] += origin
+            decision.setflags(write=False)
+            return _validated_qp_solution(
+                decision, problem.constraint, problem.lower, problem.upper,
+                iterations=result.iterations, detail=result.detail,
+            )
+
     def solve(self, state, goal):
-        problem = self.formulate(state, goal)
+        physical_problem = self.formulate(state, goal)
         joint_count = state.q.size
         trajectory_size = joint_count * self.horizon
+        default_adapter = (
+            self.solver is self._default_solver
+            and type(self.solver) is OSQPSolver
+            and getattr(self.solver.solve, "__func__", None) is _OSQP_SOLVE
+        )
+        origin = getattr(self, "_position_origin", None)
+        problem = physical_problem
+        if (
+            origin is not None
+            and default_adapter
+            and getattr(self.formulate, "__func__", None) is _SPARSE_MPC_FORMULATE
+            and type(self) is SparseJointMPC
+        ):
+            problem = self._formulate(state, goal, origin)
+        else:
+            origin = None
         warm = None
         velocities = self._warm_velocities(state)
         if velocities is not None:
             warm = np.empty(2 * trajectory_size)
             positions = warm[:trajectory_size].reshape(self.horizon, joint_count)
-            _integrate_positions(state.q, velocities, self.dt, out=positions)
+            initial = state.q if origin is None else state.q - origin
+            _integrate_positions(initial, velocities, self.dt, out=positions)
             warm[trajectory_size:] = velocities.ravel()
-        retryable_workspace = (
-            self.solver is self._default_solver
-            and type(self.solver) is OSQPSolver
-            and "solve" not in self.solver.__dict__
-            and self.solver._solver is not None
-        )
+        retryable_workspace = default_adapter and self.solver._solver is not None
         result = self.solver.solve(problem, warm_start=warm)
         if (
             retryable_workspace
@@ -147,4 +190,9 @@ class SparseJointMPC(_JointMPC):
                 cold.violation,
                 "cold retry after " + first.detail + "; " + cold.detail,
             )
+        if origin is not None:
+            result = self._physical_result(result, physical_problem, origin, trajectory_size)
         return self._plan_result(state, result, velocity_offset=trajectory_size, kind="sparse MPC")
+
+
+_SPARSE_MPC_FORMULATE = SparseJointMPC.formulate

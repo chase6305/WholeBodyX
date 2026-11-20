@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from scipy import sparse
 
-from wholebodyx import (BackendRegistry, JointLimits, JointMPC, OSQPSolver,
+from wholebodyx import (BackendRegistry, JointLimits, JointMPC, OSQPSolver, QPResult,
                         RobotState, SparseJointMPC, SparseQuadraticProgram)
 
 
@@ -43,6 +43,45 @@ def test_sparse_problem_is_linear_in_horizon_storage_and_uses_existing_solver():
         result = planner.solve(state, np.full(19, .3))
         assert result.plan is not None and result.solver.violation <= 1e-6
     assert counts[1] < 2.1 * counts[0]
+
+
+def test_sparse_plan_and_qp_decision_stay_physical_with_large_joint_offsets():
+    center = np.array([1000., -1100., 0.])
+    velocity, acceleration = [1., .8, .9], [2., 3., 4.]
+    absolute = SparseJointMPC(JointLimits(center - 2., center + 2., velocity, acceleration))
+    reference = SparseJointMPC(JointLimits([-2.] * 3, [2.] * 3, velocity, acceleration))
+    for index, target in enumerate(([.75, -.55, .1], [-.4, .65, -.2], [.01, .02, .03])):
+        state = RobotState(center + [.15, -.2, .1], [.04, -.02, 0.], index * .08)
+        goal = center + target
+        problem = absolute.formulate(state, goal)
+        actual = absolute.solve(state, goal)
+        expected = reference.solve(RobotState(state.q - center, state.v, state.stamp), goal - center)
+        assert actual.plan is not None and expected.plan is not None
+        np.testing.assert_array_equal(problem.lower[:3], state.q)
+        np.testing.assert_allclose(actual.plan.velocities, expected.plan.velocities, atol=1e-7, rtol=0.)
+        np.testing.assert_allclose(actual.plan.positions - center, expected.plan.positions,
+                                   atol=1e-8, rtol=0.)
+        position_size = actual.plan.velocities.size
+        np.testing.assert_allclose(actual.solver.x[:position_size].reshape(-1, 3) - center,
+                                   expected.solver.x[:position_size].reshape(-1, 3),
+                                   atol=1e-8, rtol=0.)
+        values = problem.constraint @ actual.solver.x
+        violation = max((problem.lower - values).max(), (values - problem.upper).max(), 0.)
+        assert actual.solver.violation == violation <= 1e-6
+
+
+def test_sparse_solver_override_receives_the_absolute_qp(monkeypatch):
+    planner = SparseJointMPC(JointLimits([998.], [1002.], [1.]), horizon=5)
+    calls = []
+
+    def solve(problem, warm_start=None):
+        calls.append(problem)
+        return QPResult("infeasible")
+
+    monkeypatch.setattr(planner.solver, "solve", solve)
+    outcome = planner.solve(RobotState([1000.], [0.]), [1000.4])
+    assert outcome.plan is None and len(calls) == 1
+    assert calls[0].lower[0] == 1000.
 
 
 def test_generic_osqp_solver_can_switch_between_dense_and_sparse_workspaces():

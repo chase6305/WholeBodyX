@@ -454,6 +454,22 @@ class QPResult:
         return self.status == "solved" and self.x is not None
 
 
+def _validated_qp_solution(solution, constraint, lower, upper, *, iterations, detail):
+    values = constraint @ solution
+    if not np.isfinite(values).all():
+        return QPResult("error", iterations=iterations, detail="nonfinite constraint evaluation")
+    violation = float(max(
+        (lower - values).max(initial=0),
+        (values - upper).max(initial=0),
+    ))
+    if violation > 1e-6:
+        return QPResult(
+            "error", iterations=iterations, violation=violation,
+            detail="solution exceeds absolute constraint tolerance",
+        )
+    return QPResult("solved", solution, iterations, violation, detail)
+
+
 class QPSolver(Protocol):
     def reset(self) -> None: ...
 
@@ -707,25 +723,10 @@ class OSQPSolver:
                     "error", iterations=result.info.iter, detail="nonfinite physical solution"
                 )
         solution = array(solution, 1, "solution")
-        constraint_values = self._physical_constraint @ solution
-        if not np.isfinite(constraint_values).all():
-            return QPResult(
-                "error", iterations=result.info.iter, detail="nonfinite constraint evaluation"
-            )
-        violation = float(
-            max(
-                (problem.lower - constraint_values).max(initial=0),
-                (constraint_values - problem.upper).max(initial=0),
-            )
+        return _validated_qp_solution(
+            solution, self._physical_constraint, problem.lower, problem.upper,
+            iterations=result.info.iter, detail=result.info.status,
         )
-        if violation > 1e-6:
-            return QPResult(
-                "error",
-                iterations=result.info.iter,
-                violation=violation,
-                detail="solution exceeds absolute constraint tolerance",
-            )
-        return QPResult("solved", solution, result.info.iter, violation, result.info.status)
 
 
 # Stable implementation identity for internal fast paths that must honor solver hooks.
