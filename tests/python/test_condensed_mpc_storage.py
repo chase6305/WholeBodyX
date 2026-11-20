@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from scipy import sparse
 
-from wholebodyx import JointLimits, JointMPC, OSQPSolver, QuadraticProgram, RobotState, SparseJointMPC
+from wholebodyx import JointLimits, JointMPC, OSQPSolver, QPResult, QuadraticProgram, RobotState, SparseJointMPC
 from wholebodyx.sparse_qp import _SparseFixedQP
 
 
@@ -30,7 +30,7 @@ def test_condensed_short_step_uses_sparse_solve_with_velocity_only_result():
     reference = SparseJointMPC(limits, horizon=60, dt=.004)
     state = RobotState([0., 0.], [0., 0.])
     assert planner.solve(state, [.0001, -.0001]).solver.iterations == 0
-    assert planner._short_step_planner is None
+    assert planner._sparse_planner is None
     before = planner.fixed_matrix_bytes
     goal = [.55, -.55]
     outcome = planner.solve(state, goal)
@@ -42,6 +42,37 @@ def test_condensed_short_step_uses_sparse_solve_with_velocity_only_result():
     problem = planner.formulate(state, goal)
     values = problem.constraint @ outcome.solver.x
     assert max((problem.lower - values).max(), (values - problem.upper).max(), 0.) <= 1e-6
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_condensed_iteration_limit_only_retries_the_default_model(custom, monkeypatch):
+    limits = JointLimits([-1., -1.], [1., 1.], [.8, .8], [2., 2.])
+    planner = JointMPC(limits, horizon=5, solver=OSQPSolver() if custom else None)
+    state = RobotState([.1, -.15], [.02, -.01])
+    goal = [.85, -.9]
+
+    def limit(*args):
+        # The sparse retry must use the goal snapshotted for the original solve.
+        goal[:] = [.1, -.15]
+        return QPResult("iteration_limit", iterations=99)
+
+    original_goal = goal.copy()
+    monkeypatch.setattr(planner.solver, "_validate_result", limit)
+    result = planner.solve(state, goal)
+
+    assert goal != original_goal
+    if custom:
+        assert result.plan is None and result.solver.status == "iteration_limit"
+        assert planner._sparse_planner is None
+        return
+    assert result.plan is not None and result.solver.iterations > 99
+    assert "sparse retry" in result.solver.detail
+    problem = planner.formulate(state, original_goal)
+    values = problem.constraint @ result.solver.x
+    assert max((problem.lower - values).max(), (values - problem.upper).max(), 0.) <= 1e-6
+    reference = JointMPC(limits, horizon=5).solve(state, original_goal)
+    np.testing.assert_allclose(result.plan.velocities, reference.plan.velocities, atol=1e-6)
+    assert planner._last_plan is result.plan
 
 
 @pytest.mark.parametrize("acceleration", [None, [2., 3., 4.]])
