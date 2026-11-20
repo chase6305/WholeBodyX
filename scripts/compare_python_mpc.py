@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import platform
 
-from _comparison import case, invoke_worker, joint_plan_violation, rss_kib
+from _comparison import case, invoke_worker, joint_mpc_workload, joint_plan_violation, rss_kib
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -34,7 +34,8 @@ def worker(args):
     }
     joints, horizon = args.case
     limits = JointLimits([-2.0] * joints, [2.0] * joints, [1.0] * joints, [4.0] * joints)
-    state, goal = RobotState(np.zeros(joints), np.zeros(joints)), np.full(joints, 0.3)
+    state = RobotState(np.zeros(joints), np.zeros(joints))
+    goal = np.full(joints, .02 if args.workload == "near" else .3)
     report = dict(
         joints=joints,
         horizon=horizon,
@@ -70,24 +71,10 @@ def worker(args):
     report["after_first_solve_rss_kib"] = rss_kib()
     for _ in range(args.warmup - 1):
         solve(state, goal)
-    rng = np.random.default_rng(args.seed)
     times, iterations, maximum, physical = [], [], 0.0, 0.0
-    phases = np.linspace(0, np.pi, joints)
-    for k in range(args.iterations):
-        if args.workload == "random":
-            state = RobotState(
-                rng.uniform(-0.25, 0.25, joints), rng.uniform(-0.1, 0.1, joints), k * 0.07
-            )
-            target = rng.uniform(-3.0, 3.0, joints)
-        elif args.workload in ("near", "alternating"):
-            state = RobotState(
-                .03 * np.cos(phases + .17 * k), .05 * np.sin(phases + .1 * k), k * .02
-            )
-            distance = .32 if args.workload == "alternating" and k % 6 >= 3 else .02
-            target = state.q + distance * np.cos(phases + .003 * k)
-        else:
-            target = goal + 0.01 * np.sin(k)
-        elapsed, result, violation = solve(state, target)
+    work = joint_mpc_workload(args.workload, state, goal, args.iterations, args.seed)
+    for measurement, target in work:
+        elapsed, result, violation = solve(measurement, target)
         times.append(elapsed)
         iterations.append(result.iterations)
         maximum = max(maximum, result.violation)

@@ -43,6 +43,32 @@ int main() {
     auto shared = std::make_shared<OSQPSolver>();
     JointMPC first(limits, 5, .1, 2, .4, 9, shared);
     JointMPC second(limits, 5, .1, 7, 2, 12, shared);
+    {
+      JointMPC planner(limits, 60, .075, 7., .3, 14.);
+      const Vector near_goal = state.q + (Vector(2) << .006, -.008).finished();
+      const auto problem = planner.formulate(state, near_goal);
+      const auto direct = planner.solve(state, near_goal);
+      check(direct.plan && direct.solver.iterations == 0, "inactive MPC did not solve directly");
+      const Vector values = problem.constraint * direct.solver.x;
+      check((values.array() >= problem.lower.array()).all() &&
+                (values.array() <= problem.upper.array()).all(),
+            "inactive MPC violated exact QP bounds");
+      check((problem.hessian * direct.solver.x + problem.gradient).cwiseAbs().maxCoeff() < 5e-14,
+            "inactive MPC did not satisfy stationarity");
+      same_optimum(planner, state, goal);
+      planner.reset();
+      same_optimum(planner, state, near_goal);
+    }
+    {
+      const JointLimits tight{Vector::Constant(1, -1.), Vector::Ones(1),
+                              Vector::Constant(1, .5 - 2e-9), Vector()};
+      JointMPC planner(tight, 1);
+      const RobotState origin{Vector::Zero(1), Vector::Zero(1), 0};
+      const Vector near_bound = Vector::Constant(1, .5 * (.1 + .1 * .1 * 30.) / (.1 * 30.));
+      const auto constrained = planner.solve(origin, near_bound);
+      check(constrained.plan && constrained.solver.iterations > 0,
+            "inactive MPC bypassed a slightly violated velocity bound");
+    }
     for (int k = 0; k < 10; ++k) {
       same_optimum(first, state, goal);
       same_optimum(second, state, -goal);

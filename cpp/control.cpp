@@ -186,7 +186,7 @@ JointMPC::JointMPC(JointLimits limits, int horizon, double dt, double tracking_w
       tracking_weight_(tracking_weight),
       control_weight_(control_weight),
       terminal_weight_(terminal_weight),
-      solver_(solver ? std::move(solver) : std::make_shared<OSQPSolver>()) {
+      solver_(solver ? solver : std::make_shared<OSQPSolver>()) {
   limits_.validate();
   require(horizon_ > 0, "invalid horizon");
   positive(dt_, "invalid MPC dt");
@@ -202,15 +202,19 @@ JointMPC::JointMPC(JointLimits limits, int horizon, double dt, double tracking_w
   hessian_entries.reserve(joint_count * horizon_ * horizon_);
   constraint_entries.reserve(joint_count * (horizon_ * (horizon_ + 1LL) / 2 + 3LL * horizon_));
   gradient_weights_.resize(horizon_);
+  Vector position_cost(horizon_);
+  for (int k = 0; k < horizon_; ++k) {
+    const double weight = terminal_weight_ + (horizon_ - 1 - k) * tracking_weight_;
+    gradient_weights_[k] = dt_ * weight;
+    position_cost[k] = dt_ * dt_ * weight;
+  }
   const bool slew = limits_.acceleration.size() != 0;
   // Constraint rows: velocity boxes, predicted position boxes, then optional slew.
   const auto rows = (slew ? 3 : 2) * trajectory_size;
   Vector lower_bounds(rows), upper_bounds(rows);
   for (int k = 0; k < horizon_; ++k) {
     for (int j = 0; j < horizon_; ++j) {
-      const double remaining_weight =
-          terminal_weight_ + (horizon_ - 1 - std::max(k, j)) * tracking_weight_;
-      const double value = dt_ * dt_ * remaining_weight + (k == j ? control_weight_ : 0.);
+      const double value = position_cost[std::max(k, j)] + (k == j ? control_weight_ : 0.);
       for (Eigen::Index joint = 0; joint < joint_count; ++joint) {
         hessian_entries.emplace_back(k * joint_count + joint, j * joint_count + joint, value);
         if (j <= k)
@@ -218,8 +222,6 @@ JointMPC::JointMPC(JointLimits limits, int horizon, double dt, double tracking_w
                                           j * joint_count + joint, dt_);
       }
     }
-    const double remaining_weight = terminal_weight_ + (horizon_ - 1 - k) * tracking_weight_;
-    gradient_weights_[k] = dt_ * remaining_weight;
     for (Eigen::Index joint = 0; joint < joint_count; ++joint)
       constraint_entries.emplace_back(k * joint_count + joint, k * joint_count + joint, 1.);
     lower_bounds.segment(k * joint_count, joint_count) = -limits_.velocity;
@@ -244,6 +246,23 @@ JointMPC::JointMPC(JointLimits limits, int horizon, double dt, double tracking_w
   constraint.setFromTriplets(constraint_entries.begin(), constraint_entries.end());
   fixed_ = std::shared_ptr<const detail::FixedQP>(
       new detail::FixedQP(std::move(hessian), std::move(constraint)));
+  if (!solver && gradient_weights_[0] > 0.) {
+    const Matrix temporal = Matrix::NullaryExpr(
+        horizon_, horizon_, [&](Eigen::Index k, Eigen::Index j) {
+          return position_cost[std::max(k, j)] + (k == j ? control_weight_ : 0.);
+        });
+    const double rounding = 8. * horizon_ * std::numeric_limits<double>::epsilon() *
+                            temporal.rowwise().sum().maxCoeff();
+    // Use the same per-joint Hessian as OSQP. When roundoff can dominate the
+    // regularization, leave the solve to the configured adapter.
+    if (control_weight_ > std::max(std::numeric_limits<double>::min(), rounding)) {
+      Eigen::LLT<Matrix> factor(temporal);
+      if (factor.info() == Eigen::Success) {
+        Vector gain = factor.solve(-gradient_weights_ / gradient_weights_[0]);
+        if (gain.allFinite()) unconstrained_gain_ = std::move(gain);
+      }
+    }
+  }
   lower_ = std::move(lower_bounds);
   upper_ = std::move(upper_bounds);
 }
@@ -285,9 +304,48 @@ void JointMPC::vectors(const RobotState& state, const Vector& goal, Vector& grad
   require(gradient.allFinite() && lower_bounds.allFinite() && upper_bounds.allFinite(),
           "nonfinite MPC vectors");
 }
+Vector JointMPC::unconstrained_solution(const Vector& gradient, const Vector& lower,
+                                       const Vector& upper) const {
+  if (!unconstrained_gain_.size()) return {};
+  const auto joints = limits_.lower.size();
+  const auto first = unconstrained_gain_[0] * gradient.head(joints);
+  if (limits_.acceleration.size()) {
+    const auto slew = 2 * gradient.size();
+    if (!(first.array() >= lower.segment(slew, joints).array()).all() ||
+        !(first.array() <= upper.segment(slew, joints).array()).all())
+      return {};
+  }
+  if (!(first.array() >= lower.head(joints).array()).all() ||
+      !(first.array() <= upper.head(joints).array()).all())
+    return {};
+  Vector candidate(gradient.size());
+  for (int k = 0; k < horizon_; ++k)
+    candidate.segment(k * joints, joints) = unconstrained_gain_[k] * gradient.head(joints);
+  const Vector values = fixed_->constraint * candidate;
+  if (!values.allFinite() || !(values.array() >= lower.array()).all() ||
+      !(values.array() <= upper.array()).all())
+    return {};
+  return candidate;
+}
 PlanResult JointMPC::solve(const RobotState& state, const Vector& goal) {
   Vector gradient, lower_bounds, upper_bounds;
   vectors(state, goal, gradient, lower_bounds, upper_bounds);
+  Vector unconstrained = unconstrained_solution(gradient, lower_bounds, upper_bounds);
+  if (unconstrained.size()) {
+    auto direct = reconstruct_plan(
+        state, {"solved", std::move(unconstrained), 0, 0., "unconstrained optimum"});
+    if (direct.plan) {
+      try {
+        direct.plan->validate();
+      } catch (const std::invalid_argument&) {
+        direct.plan.reset();
+      }
+      if (direct.plan) {
+        last_plan_ = *direct.plan;
+        return direct;
+      }
+    }
+  }
   const auto joint_count = state.q.size();
   Vector warm;
   if (last_plan_ && state.stamp >= last_plan_->stamp) {
@@ -298,10 +356,16 @@ PlanResult JointMPC::solve(const RobotState& state, const Vector& goal) {
           last_plan_->velocities.row(std::min(k + offset, horizon_ - 1)).transpose();
   }
   auto* osqp = dynamic_cast<OSQPSolver*>(solver_.get());
-  auto result = osqp ? osqp->solve_fixed(fixed_, gradient, lower_bounds, upper_bounds, warm)
-                     : solver_->solve({Matrix(fixed_->hessian), gradient,
-                                       Matrix(fixed_->constraint), lower_bounds, upper_bounds},
-                                      warm);
+  auto outcome = reconstruct_plan(
+      state, osqp ? osqp->solve_fixed(fixed_, gradient, lower_bounds, upper_bounds, warm)
+                  : solver_->solve({Matrix(fixed_->hessian), gradient,
+                                    Matrix(fixed_->constraint), lower_bounds, upper_bounds},
+                                   warm));
+  if (outcome.plan) last_plan_ = *outcome.plan;
+  return outcome;
+}
+PlanResult JointMPC::reconstruct_plan(const RobotState& state, QPResult result) const {
+  const auto joint_count = state.q.size();
   if (!result.success()) return {std::move(result), std::nullopt};
   if (result.x.size() != joint_count * horizon_ || !result.x.allFinite())
     return {{"error", {}, result.iterations, INFINITY, "invalid MPC solution"}, std::nullopt};
@@ -317,7 +381,6 @@ PlanResult JointMPC::solve(const RobotState& state, const Vector& goal) {
     return {
         {"error", {}, result.iterations, violation, "reconstructed MPC plan violates joint bounds"},
         std::nullopt};
-  last_plan_ = plan;
   return {std::move(result), std::move(plan)};
 }
 }  // namespace wholebodyx
