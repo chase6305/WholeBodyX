@@ -175,6 +175,26 @@ def test_inactive_joint_mpc_does_not_skip_replacement_adapter():
     assert result.solver.iterations > 0 and replacement._solver is not None
 
 
+@pytest.mark.parametrize(
+    "goal, stamp, explicit", [(.3, .04, False), (-.3, .04, True), (.3, .14, True)]
+)
+def test_return_to_recent_qp_only_reuses_matching_workspace(goal, stamp, explicit, monkeypatch):
+    planner = JointMPC(JointLimits([-1.], [1.], [.8], [4.]))
+    assert planner.solve(RobotState([0.], [0.]), [.3]).solver.iterations > 0
+    assert planner.solve(RobotState([0.], [0.], .02), [.02]).solver.iterations == 0
+    workspace = planner.solver._solver
+    warm_start, calls = workspace.warm_start, []
+
+    def record(**values):
+        calls.append(values)
+        return warm_start(**values)
+
+    monkeypatch.setattr(workspace, "warm_start", record)
+    outcome = planner.solve(RobotState([0.], [0.], stamp), [goal])
+    assert outcome.plan is not None and outcome.solver.iterations > 0
+    assert bool(calls) == explicit
+
+
 @pytest.mark.parametrize("temporal", [[[-1.]], [[1., .5], [0., 1.]], [[np.nan]], [[np.inf]]])
 def test_separable_cost_builder_rejects_invalid_temporal_cost(temporal):
     with pytest.raises(ValueError):

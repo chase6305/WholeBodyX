@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from math import isfinite, ulp
+from weakref import ref
 
 import numpy as np
 from scipy import sparse
@@ -274,7 +275,12 @@ class JointMPC(_JointMPC):
             self._default_solver_token = object()
             self.solver._joint_mpc_owner = self._default_solver_token
         self._last_plan = None
+        self._last_qp_warm_start = self._last_direct_warm_start = None
         self._prepare()
+
+    def reset(self):
+        super().reset()
+        self._last_qp_warm_start = self._last_direct_warm_start = None
 
     @property
     def fixed_matrix_bytes(self):
@@ -405,9 +411,32 @@ class JointMPC(_JointMPC):
             return None
         return outcome if outcome.plan is not None else None
 
+    def _reuse_workspace_warm_start(self, state, gradient):
+        recent_qp = self._last_qp_warm_start
+        recent_direct = self._last_direct_warm_start
+        if recent_qp is None or recent_direct is None:
+            return False
+        workspace, stamp, qp_gradient = recent_qp
+        direct_plan, direct_gradient = recent_direct
+        if (
+            self._last_plan is not direct_plan
+            or self.solver._solver is None
+            or workspace() is not self.solver._solver
+            or state.stamp < stamp
+            or _interval(state.stamp, stamp, self.dt, self.horizon) != 0
+        ):
+            return False
+        # A direct solve leaves the OSQP primal and dual iterates in place.
+        # Keep those iterates if the new target is closer to their problem.
+        with np.errstate(over="ignore", invalid="ignore"):
+            return np.linalg.norm(gradient - qp_gradient) < np.linalg.norm(
+                gradient - direct_gradient
+            )
+
     def solve(self, state, goal):
         # Custom solvers and overridden formulation methods retain the public
         # dense contract. Only the built-in adapter uses the compressed model.
+        first_gradient = None
         if (
             type(self.solver) is OSQPSolver
             and getattr(self.solver.solve, "__func__", None) is _OSQP_SOLVE
@@ -420,16 +449,29 @@ class JointMPC(_JointMPC):
                 and getattr(self.solver, "_joint_mpc_owner", None) is self._default_solver_token
                 and getattr(self._vectors, "__func__", None) is _JOINT_MPC_VECTORS
             ):
+                first_gradient = vectors[0][:state.q.size]
                 direct = self._unconstrained_result(state, *vectors)
                 if direct is not None:
+                    self._last_direct_warm_start = (direct.plan, first_gradient.copy())
                     return direct
             problem = self._template.problem(*vectors)
         else:
             problem = self.formulate(state, goal)
-        velocities = self._warm_velocities(state)
+        if first_gradient is not None and self._reuse_workspace_warm_start(state, first_gradient):
+            velocities = None
+        else:
+            velocities = self._warm_velocities(state)
         warm = None if velocities is None else velocities.reshape(-1)
+        self._last_qp_warm_start = None
         result = self.solver.solve(problem, warm_start=warm)
-        return self._plan_result(state, result)
+        outcome = self._plan_result(state, result)
+        if outcome.plan is not None:
+            self._last_direct_warm_start = None
+            if first_gradient is not None and self.solver._solver is not None:
+                self._last_qp_warm_start = (
+                    ref(self.solver._solver), state.stamp, first_gradient.copy()
+                )
+        return outcome
 
 
 _JOINT_MPC_FORMULATE = JointMPC.formulate
