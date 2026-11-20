@@ -47,9 +47,12 @@ struct SparseJointMPC::Impl {
   Eigen::Index joint_count, trajectory_size;
   Eigen::SparseMatrix<double> hessian, constraint;
   Eigen::SparseMatrix<double> scaled_hessian, scaled_constraint;
+  Eigen::SparseMatrix<double> slew_hessian, slew_constraint;
   Vector lower, upper, position_weights, position_origin;
   std::optional<JointPlan> last_plan;
   OSQPWorkspace* workspace = nullptr;
+  bool workspace_has_slew_variables = false;
+  static constexpr double slew_scale = .1;
 
   Impl(JointLimits bounds, int count, double step, double tracking, double control, double terminal)
       : limits(std::move(bounds)),
@@ -72,15 +75,18 @@ struct SparseJointMPC::Impl {
             "sparse MPC dimensions exceed index capacity");
     trajectory_size = joint_count * horizon;
     position_origin = Vector::Zero(joint_count);
+    bool center_positions = false;
     for (Eigen::Index joint = 0; joint < joint_count; ++joint) {
       const double half_lower = .5 * limits.lower[joint], half_upper = .5 * limits.upper[joint];
       const double midpoint = half_lower + half_upper;
       // A distant, narrow range can spend OSQP's relative tolerance on the
       // coordinate offset. Move the origin before the internal solve.
-      if (std::abs(midpoint) > 100. && .125 * std::abs(midpoint) > half_upper - half_lower)
+      if (.125 * std::abs(midpoint) > half_upper - half_lower) {
         position_origin[joint] = midpoint;
+        center_positions = center_positions || std::abs(midpoint) > 100.;
+      }
     }
-    if (position_origin.isZero(0.)) position_origin.resize(0);
+    if (!center_positions) position_origin.resize(0);
     const bool slew = limits.acceleration.size() != 0;
     const auto rows = (slew ? 4 : 3) * trajectory_size;
     std::vector<Eigen::Triplet<double>> hessian_entries, constraint_entries;
@@ -124,6 +130,21 @@ struct SparseJointMPC::Impl {
       scaled_hessian.coeffRef(j, j) *= position_scale * position_scale;
       for (Eigen::SparseMatrix<double>::InnerIterator it(scaled_constraint, j); it; ++it)
         it.valueRef() *= position_scale;
+    }
+    if (slew && dt <= .02 && horizon >= 30 &&
+        trajectory_size <= std::numeric_limits<int>::max() / 10 &&
+        (dt * limits.acceleration.array() <= .1 * limits.velocity.array()).any()) {
+      // Keep the public position/velocity problem. Internally add one
+      // decision per velocity difference and separate its box from dynamics.
+      slew_hessian = scaled_hessian;
+      slew_hessian.conservativeResize(3 * trajectory_size, 3 * trajectory_size);
+      slew_constraint = scaled_constraint;
+      slew_constraint.conservativeResize(5 * trajectory_size, 3 * trajectory_size);
+      for (Eigen::Index i = 0; i < trajectory_size; ++i) {
+        slew_constraint.insert(3 * trajectory_size + i, 2 * trajectory_size + i) = -slew_scale;
+        slew_constraint.insert(4 * trajectory_size + i, 2 * trajectory_size + i) = slew_scale;
+      }
+      slew_constraint.makeCompressed();
     }
   }
 
@@ -202,7 +223,8 @@ struct SparseJointMPC::Impl {
   }
 
   QPResult solve_qp(const Vector& gradient, const Vector& lower_bound, const Vector& upper_bound,
-                    const Vector& warm, bool* retryable = nullptr) {
+                    const Vector& warm, const Vector& measured_velocity, bool slew_variables,
+                    bool* retryable = nullptr) {
     if (retryable) *retryable = false;
     if (warm.size() && !warm.allFinite())
       return {"error", {}, 0, INFINITY, "nonfinite sparse MPC warm start"};
@@ -214,13 +236,40 @@ struct SparseJointMPC::Impl {
     Vector scaled_gradient = gradient, scaled_warm = warm;
     scaled_gradient.head(trajectory_size) *= position_scale;
     if (scaled_warm.size()) scaled_warm.head(trajectory_size) /= position_scale;
+    if (slew_variables) {
+      scaled_gradient.conservativeResize(3 * trajectory_size);
+      scaled_gradient.tail(trajectory_size).setZero();
+      lower_bounds.conservativeResize(5 * trajectory_size);
+      upper_bounds.conservativeResize(5 * trajectory_size);
+      lower_bounds.tail(trajectory_size) = lower.tail(trajectory_size).cwiseMax(-OSQP_INFTY);
+      upper_bounds.tail(trajectory_size) = upper.tail(trajectory_size).cwiseMin(OSQP_INFTY);
+      lower_bounds.segment(3 * trajectory_size, trajectory_size).setZero();
+      upper_bounds.segment(3 * trajectory_size, trajectory_size).setZero();
+      lower_bounds.segment(3 * trajectory_size, joint_count) = measured_velocity.cwiseMax(-OSQP_INFTY);
+      upper_bounds.segment(3 * trajectory_size, joint_count) = measured_velocity.cwiseMin(OSQP_INFTY);
+      if (scaled_warm.size()) {
+        scaled_warm.conservativeResize(3 * trajectory_size);
+        auto differences = scaled_warm.tail(trajectory_size);
+        const auto velocities = warm.tail(trajectory_size);
+        differences.head(joint_count) = (velocities.head(joint_count) - measured_velocity) / slew_scale;
+        differences.tail(trajectory_size - joint_count) =
+            (velocities.tail(trajectory_size - joint_count) -
+             velocities.head(trajectory_size - joint_count)) / slew_scale;
+        if (!differences.allFinite()) scaled_warm.resize(0);
+      }
+    }
     if (!scaled_gradient.allFinite() || !scaled_warm.allFinite())
       return {"error", {}, 0, INFINITY, "nonfinite scaled MPC vectors"};
+    if (workspace && workspace_has_slew_variables != slew_variables) {
+      osqp_cleanup(workspace);
+      workspace = nullptr;
+    }
     c_int error = 0;
     if (!workspace) {
-      CscStorage hessian_csc(scaled_hessian), constraint_csc(scaled_constraint);
+      CscStorage hessian_csc(slew_variables ? slew_hessian : scaled_hessian);
+      CscStorage constraint_csc(slew_variables ? slew_constraint : scaled_constraint);
       OSQPData data{};
-      data.n = gradient.size();
+      data.n = scaled_gradient.size();
       data.m = lower_bounds.size();
       data.P = &hessian_csc.matrix;
       data.A = &constraint_csc.matrix;
@@ -230,6 +279,7 @@ struct SparseJointMPC::Impl {
       auto settings = detail::osqp_settings();
       settings.adaptive_rho_interval = 100;
       error = osqp_setup(&workspace, &data, &settings);
+      workspace_has_slew_variables = slew_variables;
     } else {
       error = osqp_update_lin_cost(workspace, scaled_gradient.data());
       if (!error) error = osqp_update_bounds(workspace, lower_bounds.data(), upper_bounds.data());
@@ -253,7 +303,12 @@ struct SparseJointMPC::Impl {
       result.status = detail::rejected_osqp_status(status);
       return result;
     }
-    result.x = Eigen::Map<const Vector>(workspace->solution->x, 2 * trajectory_size);
+    const Eigen::Map<const Vector> solution(workspace->solution->x, scaled_gradient.size());
+    if (slew_variables && !solution.tail(trajectory_size).allFinite()) {
+      result.detail = "nonfinite solution";
+      return result;
+    }
+    result.x = solution.head(2 * trajectory_size);
     result.x.head(trajectory_size) *= position_scale;
     validate_solution(result, lower_bound, upper_bound);
     return result;
@@ -303,22 +358,30 @@ PlanResult SparseJointMPC::solve(const RobotState& state, const Vector& goal) {
     }
   }
   const bool reused_workspace = planner.workspace != nullptr;
+  const bool slew_variables = planner.slew_hessian.rows() != 0;
+  const auto solve = [&](const Vector& guess, bool use_slew_variables, bool* retryable = nullptr) {
+    auto result = planner.solve_qp(
+        gradient, lower_bounds, upper_bounds, guess, state.v, use_slew_variables, retryable);
+    if (centered && result.success()) {
+      for (int k = 0; k < planner.horizon; ++k)
+        result.x.segment(k * planner.joint_count, planner.joint_count) += planner.position_origin;
+      planner.validate_solution(result, physical_lower, physical_upper);
+    }
+    return result;
+  };
   bool retryable = false;
-  auto result = planner.solve_qp(gradient, lower_bounds, upper_bounds, warm, &retryable);
-  if (reused_workspace && retryable) {
+  auto result = solve(warm, slew_variables, &retryable);
+  const bool retry_original = slew_variables && !result.success() && result.status != "infeasible";
+  if (retry_original || (reused_workspace && retryable)) {
     // A badly conditioned warm workspace may retain unsuitable dual/rho state.
     // Retry once from cold; inaccurate candidates never become executable plans.
     const auto first_iterations = result.iterations;
     const auto first_status = result.detail;
     planner.reset();
-    result = planner.solve_qp(gradient, lower_bounds, upper_bounds, Vector());
+    result = solve(Vector(), false);
     result.iterations += first_iterations;
-    result.detail = "cold retry after " + first_status + "; " + result.detail;
-  }
-  if (centered && result.success()) {
-    for (int k = 0; k < planner.horizon; ++k)
-      result.x.segment(k * planner.joint_count, planner.joint_count) += planner.position_origin;
-    planner.validate_solution(result, physical_lower, physical_upper);
+    result.detail = retry_original ? "retry after velocity-difference solve: " + result.detail
+                                   : "cold retry after " + first_status + "; " + result.detail;
   }
   if (!result.success()) return {std::move(result), std::nullopt};
   JointPlan plan{Matrix(planner.horizon + 1, planner.joint_count),

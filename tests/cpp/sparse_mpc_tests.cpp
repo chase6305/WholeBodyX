@@ -54,6 +54,33 @@ int main() {
       }
     }
 
+    {
+      constexpr int horizon = 60;
+      constexpr double dt = .004;
+      JointLimits limits{Vector::Constant(2, -1.), Vector::Ones(2),
+                         Vector::Constant(2, .8), Vector::Constant(2, 2.)};
+      SparseJointMPC planner(limits, horizon, dt);
+      const Vector goal = (Vector(2) << 20., -20.).finished();
+      for (double stamp : {0., .004, .008}) {
+        const RobotState state{Vector::Zero(2), Vector::Zero(2), stamp};
+        const auto result = planner.solve(state, goal);
+        check(result.plan && result.solver.x.size() == 4 * horizon,
+              "short-step sparse solve changed the public decision layout");
+        for (int k = 0; k < horizon; ++k) {
+          // The maximal feasible ramp in either direction minimizes every
+          // future tracking cost here, even with the velocity penalty.
+          const Eigen::RowVector2d expected(2. * dt * (k + 1), -2. * dt * (k + 1));
+          check((result.plan->velocities.row(k) - expected).cwiseAbs().maxCoeff() < 2e-7,
+                "short-step sparse solve differs from the maximal slew ramp");
+        }
+        const auto problem = planner.formulate(state, goal);
+        const Vector values = problem.constraint * result.solver.x;
+        check((problem.lower - values).maxCoeff() <= 1e-6 &&
+                  (values - problem.upper).maxCoeff() <= 1e-6,
+              "short-step sparse decision violates physical bounds");
+      }
+    }
+
     std::mt19937 random(137);
     std::uniform_real_distribution<double> uniform(-1., 1.);
     for (bool slew : {false, true}) {

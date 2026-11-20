@@ -84,6 +84,46 @@ def test_sparse_solver_override_receives_the_absolute_qp(monkeypatch):
     assert calls[0].lower[0] == 1000.
 
 
+@pytest.mark.parametrize("offset", [0., 1000.])
+def test_short_step_slew_model_exports_the_original_sparse_decision(offset):
+    n, horizon, dt = 6, 60, .004
+    phases = np.arange(n) * .37
+    center = offset * np.cos(phases)
+    limits = JointLimits(center - 1., center + 1., [.8] * n, [2.] * n)
+    reference_limits = JointLimits([-1.] * n, [1.] * n, [.8] * n, [2.] * n)
+    reference_solver = OSQPSolver(
+        variable_scaling=np.r_[np.full(n * horizon, .01), np.ones(n * horizon)],
+        adaptive_rho_interval=100,
+    )
+    reference = SparseJointMPC(reference_limits, horizon=horizon, dt=dt, solver=reference_solver)
+    planner = SparseJointMPC(limits, horizon=horizon, dt=dt)
+    for k in range(3):
+        state = RobotState(center + .01 * np.cos(phases + .1 * k), .03 * np.sin(phases + .4 * k),
+                           k * dt)
+        goal = center + .55 * np.sin(phases + .025 * k)
+        expected = reference.solve(RobotState(state.q - center, state.v, state.stamp), goal - center)
+        actual = planner.solve(state, goal)
+        assert actual.plan is not None and expected.plan is not None
+        assert planner.solver._solver is None
+        assert actual.solver.x.shape == (2 * n * horizon,)
+        np.testing.assert_allclose(actual.plan.velocities, expected.plan.velocities, atol=7e-6, rtol=0)
+        problem = planner.formulate(state, goal)
+        values = problem.constraint @ actual.solver.x
+        assert max((problem.lower - values).max(), (values - problem.upper).max(), 0.) <= 1e-6
+
+
+def test_short_step_slew_refusal_retries_original_model(monkeypatch):
+    planner = SparseJointMPC(JointLimits([-1.], [1.], [.8], [2.]), horizon=40, dt=.004)
+    _, solver = planner._slew_problem
+    monkeypatch.setattr(solver, "solve", lambda *args, **kwargs: QPResult("iteration_limit", iterations=3))
+
+    result = planner.solve(RobotState([0.], [0.]), [.005])
+
+    assert result.plan is not None and planner.solver._solver is not None
+    assert result.solver.iterations > 3
+    assert result.solver.detail.startswith("retry after velocity-difference solve:")
+
+
 def test_generic_osqp_solver_can_switch_between_dense_and_sparse_workspaces():
     from wholebodyx import QuadraticProgram
 
