@@ -7,8 +7,8 @@ from weakref import ref
 import numpy as np
 from scipy import sparse
 
-from .qp import OSQPSolver, QPResult, _OSQP_SOLVE, _immutable
-from .sparse_qp import _SparseFixedQP
+from .qp import OSQPSolver, QPResult, _OSQP_SOLVE, _immutable, _validated_qp_solution
+from .sparse_qp import _SparseFixedQP, _sparse_template_bytes
 from .types import JointLimits, array, positive
 
 
@@ -44,6 +44,15 @@ def _velocity_changes(velocities, initial_velocity):
     np.subtract(velocities[0], initial_velocity, out=changes[0])
     np.subtract(velocities[1:], velocities[:-1], out=changes[1:])
     return changes
+
+
+def _prefer_slew_variables(limits, dt, horizon):
+    return (
+        limits.acceleration is not None
+        and dt <= .02
+        and horizon >= 30
+        and (dt * limits.acceleration <= .1 * limits.velocity).any()
+    )
 
 
 def _integrate_positions(initial_position, velocities, dt, *, out):
@@ -268,31 +277,33 @@ class JointMPC(_JointMPC):
             limits, horizon, dt, tracking_weight, control_weight, terminal_weight
         )
         self.solver = solver if solver is not None else OSQPSolver()
+        self._unconstrained_fast_path = unconstrained_fast_path
         self._default_solver_token = None
-        if solver is None and unconstrained_fast_path:
+        if solver is None:
             # Identify the original adapter without retaining it after a
             # replacement. An unopened planner can still be serialized.
             self._default_solver_token = object()
             self.solver._joint_mpc_owner = self._default_solver_token
         self._last_plan = None
         self._last_qp_warm_start = self._last_direct_warm_start = None
+        self._prefer_sparse = solver is None and _prefer_slew_variables(self.limits, self.dt, self.horizon)
+        self._short_step_planner = None
         self._prepare()
 
     def reset(self):
         super().reset()
         self._last_qp_warm_start = self._last_direct_warm_start = None
+        if getattr(self, "_short_step_planner", None) is not None:
+            self._short_step_planner.reset()
 
     @property
     def fixed_matrix_bytes(self):
         """Owned fixed H/A buffers, including dense diagnostics if requested."""
-        matrices = (self._template._hessian, self._template._constraint)
-        total = sum(
-            part.nbytes
-            for matrix in matrices
-            for part in (matrix.data, matrix.indices, matrix.indptr)
-        )
+        total = _sparse_template_bytes(self._template)
         if self._dense_template is not None:
             total += self._dense_template._hessian.nbytes + self._dense_template._constraint.nbytes
+        if getattr(self, "_short_step_planner", None) is not None:
+            total += self._short_step_planner.fixed_matrix_bytes
         return total
 
     def _prepare(self):
@@ -330,7 +341,11 @@ class JointMPC(_JointMPC):
         self._dense_template = None
         self._lower, self._upper = np.concatenate(lower), np.concatenate(upper)
         self._unconstrained_gain = None
-        if self._default_solver_token is not None and self._gradient_weights[0] > 0:
+        if (
+            self._default_solver_token is not None
+            and self._unconstrained_fast_path
+            and self._gradient_weights[0] > 0
+        ):
             self._prepare_unconstrained_gain(temporal_hessian)
 
     def _prepare_unconstrained_gain(self, hessian):
@@ -433,28 +448,59 @@ class JointMPC(_JointMPC):
                 gradient - direct_gradient
             )
 
+    def _solve_short_step(self, state, goal, problem):
+        from .sparse_mpc import SparseJointMPC
+
+        try:
+            if self._short_step_planner is None:
+                self._short_step_planner = SparseJointMPC(
+                    self.limits, self.horizon, self.dt, self.tracking_weight,
+                    self.control_weight, self.terminal_weight,
+                )
+            outcome = self._short_step_planner.solve(state, goal)
+        except ValueError as exc:
+            return PlanResult(QPResult("error", detail=str(exc)))
+        if outcome.plan is None:
+            return outcome
+        decision = outcome.solver.x[-problem.gradient.size:].copy()
+        decision.setflags(write=False)
+        result = _validated_qp_solution(
+            decision, problem.constraint, problem.lower, problem.upper,
+            iterations=outcome.solver.iterations, detail=outcome.solver.detail,
+        )
+        return self._plan_result(state, result)
+
     def solve(self, state, goal):
         # Custom solvers and overridden formulation methods retain the public
         # dense contract. Only the built-in adapter uses the compressed model.
         first_gradient = None
+        sparse_attempt = None
         if (
             type(self.solver) is OSQPSolver
             and getattr(self.solver.solve, "__func__", None) is _OSQP_SOLVE
             and getattr(self.formulate, "__func__", None) is _JOINT_MPC_FORMULATE
         ):
-            vectors = self._vectors(state, goal)
-            if (
+            default_model = (
                 type(self) is JointMPC
-                and getattr(self, "_unconstrained_gain", None) is not None
+                and getattr(self, "_default_solver_token", None) is not None
                 and getattr(self.solver, "_joint_mpc_owner", None) is self._default_solver_token
                 and getattr(self._vectors, "__func__", None) is _JOINT_MPC_VECTORS
-            ):
+            )
+            use_sparse = default_model and getattr(self, "_prefer_sparse", False)
+            if use_sparse:
+                goal = array(goal, 1, "goal")
+            vectors = self._vectors(state, goal)
+            if default_model and self._unconstrained_gain is not None:
                 first_gradient = vectors[0][:state.q.size]
                 direct = self._unconstrained_result(state, *vectors)
                 if direct is not None:
                     self._last_direct_warm_start = (direct.plan, first_gradient.copy())
                     return direct
             problem = self._template.problem(*vectors)
+            if use_sparse:
+                sparse_attempt = self._solve_short_step(state, goal, problem)
+                if sparse_attempt.plan is not None or sparse_attempt.solver.status == "infeasible":
+                    return sparse_attempt
         else:
             problem = self.formulate(state, goal)
         if first_gradient is not None and self._reuse_workspace_warm_start(state, first_gradient):
@@ -464,6 +510,11 @@ class JointMPC(_JointMPC):
         warm = None if velocities is None else velocities.reshape(-1)
         self._last_qp_warm_start = None
         result = self.solver.solve(problem, warm_start=warm)
+        if sparse_attempt is not None:
+            result = QPResult(
+                result.status, result.x, sparse_attempt.solver.iterations + result.iterations,
+                result.violation, "condensed retry after sparse solve: " + result.detail,
+            )
         outcome = self._plan_result(state, result)
         if outcome.plan is not None:
             self._last_direct_warm_start = None

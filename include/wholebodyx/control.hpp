@@ -10,6 +10,7 @@
 
 namespace wholebodyx {
 namespace detail { struct FixedQP; }
+class SparseJointMPC;
 using Vector = Eigen::VectorXd;
 using Matrix = Eigen::MatrixXd;
 
@@ -153,8 +154,12 @@ class JointMPC final : public Planner {
   Vector unconstrained_solution(const Vector& gradient, const Vector& lower,
                                 const Vector& upper) const;
   PlanResult reconstruct_plan(const RobotState&, QPResult) const;
+  PlanResult solve_with_sparse_model(const RobotState&, const Vector& goal, const Vector& lower,
+                                    const Vector& upper);
   std::shared_ptr<const detail::FixedQP> fixed_;
+  std::shared_ptr<SparseJointMPC> short_step_planner_;
   Vector gradient_weights_, unconstrained_gain_;
   Vector lower_, upper_;
+  bool prefer_sparse_ = false;
 };
 }  // namespace wholebodyx

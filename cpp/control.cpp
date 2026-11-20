@@ -1,4 +1,5 @@
 #include "wholebodyx/control.hpp"
+#include "wholebodyx/sparse_mpc.hpp"
 #include "time_utils.hpp"
 #include "fixed_qp.hpp"
 #include "plan_validation.hpp"
@@ -265,14 +266,17 @@ JointMPC::JointMPC(JointLimits limits, int horizon, double dt, double tracking_w
   }
   lower_ = std::move(lower_bounds);
   upper_ = std::move(upper_bounds);
+  prefer_sparse_ = !solver && detail::prefer_slew_variables(limits_, dt_, horizon_);
 }
 void JointMPC::reset() {
   solver_->reset();
   last_plan_.reset();
+  if (short_step_planner_) short_step_planner_->reset();
 }
 std::size_t JointMPC::fixed_matrix_bytes() const {
-  return detail::sparse_matrix_bytes(fixed_->hessian) +
-         detail::sparse_matrix_bytes(fixed_->constraint);
+  const auto bytes = detail::sparse_matrix_bytes(fixed_->hessian) +
+                     detail::sparse_matrix_bytes(fixed_->constraint);
+  return bytes + (short_step_planner_ ? short_step_planner_->fixed_matrix_bytes() : 0);
 }
 QuadraticProgram JointMPC::formulate(const RobotState& state, const Vector& goal) const {
   Vector gradient, lower_bounds, upper_bounds;
@@ -327,6 +331,33 @@ Vector JointMPC::unconstrained_solution(const Vector& gradient, const Vector& lo
     return {};
   return candidate;
 }
+PlanResult JointMPC::solve_with_sparse_model(const RobotState& state, const Vector& goal,
+                                             const Vector& lower, const Vector& upper) {
+  PlanResult outcome;
+  try {
+    if (!short_step_planner_)
+      short_step_planner_ = std::make_shared<SparseJointMPC>(
+          limits_, horizon_, dt_, tracking_weight_, control_weight_, terminal_weight_);
+    outcome = short_step_planner_->solve(state, goal);
+  } catch (const std::invalid_argument& error) {
+    return {{"error", {}, 0, INFINITY, error.what()}, std::nullopt};
+  }
+  if (!outcome.plan) return outcome;
+  auto& result = outcome.solver;
+  const auto size = state.q.size() * horizon_;
+  Vector velocities = result.x.tail(size);
+  const Vector values = fixed_->constraint * velocities;
+  if (!values.allFinite())
+    return {{"error", {}, result.iterations, INFINITY, "nonfinite constraint evaluation"},
+            std::nullopt};
+  result.violation = std::max({0., (lower - values).maxCoeff(), (values - upper).maxCoeff()});
+  if (result.violation > 1e-6)
+    return {{"error", {}, result.iterations, result.violation,
+             "solution exceeds absolute constraint tolerance"}, std::nullopt};
+  result.x = std::move(velocities);
+  return reconstruct_plan(state, std::move(result));
+}
+
 PlanResult JointMPC::solve(const RobotState& state, const Vector& goal) {
   Vector gradient, lower_bounds, upper_bounds;
   vectors(state, goal, gradient, lower_bounds, upper_bounds);
@@ -346,6 +377,15 @@ PlanResult JointMPC::solve(const RobotState& state, const Vector& goal) {
       }
     }
   }
+  std::optional<QPResult> sparse_failure;
+  if (prefer_sparse_) {
+    auto attempt = solve_with_sparse_model(state, goal, lower_bounds, upper_bounds);
+    if (attempt.plan || attempt.solver.status == "infeasible") {
+      if (attempt.plan) last_plan_ = *attempt.plan;
+      return attempt;
+    }
+    sparse_failure = std::move(attempt.solver);
+  }
   const auto joint_count = state.q.size();
   Vector warm;
   if (last_plan_ && state.stamp >= last_plan_->stamp) {
@@ -361,6 +401,10 @@ PlanResult JointMPC::solve(const RobotState& state, const Vector& goal) {
                   : solver_->solve({Matrix(fixed_->hessian), gradient,
                                     Matrix(fixed_->constraint), lower_bounds, upper_bounds},
                                    warm));
+  if (sparse_failure) {
+    outcome.solver.iterations += sparse_failure->iterations;
+    outcome.solver.detail = "condensed retry after sparse solve: " + outcome.solver.detail;
+  }
   if (outcome.plan) last_plan_ = *outcome.plan;
   return outcome;
 }

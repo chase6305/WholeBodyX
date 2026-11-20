@@ -1,4 +1,5 @@
 #include "wholebodyx/sparse_mpc.hpp"
+#include "fixed_qp.hpp"
 #include "time_utils.hpp"
 #include "plan_validation.hpp"
 #include "osqp_execution.hpp"
@@ -131,9 +132,8 @@ struct SparseJointMPC::Impl {
       for (Eigen::SparseMatrix<double>::InnerIterator it(scaled_constraint, j); it; ++it)
         it.valueRef() *= position_scale;
     }
-    if (slew && dt <= .02 && horizon >= 30 &&
-        trajectory_size <= std::numeric_limits<int>::max() / 10 &&
-        (dt * limits.acceleration.array() <= .1 * limits.velocity.array()).any()) {
+    if (trajectory_size <= std::numeric_limits<int>::max() / 10 &&
+        detail::prefer_slew_variables(limits, dt, horizon)) {
       // Keep the public position/velocity problem. Internally add one
       // decision per velocity difference and separate its box from dynamics.
       slew_hessian = scaled_hessian;
@@ -321,6 +321,16 @@ SparseJointMPC::SparseJointMPC(JointLimits limits, int horizon, double dt, doubl
                                    terminal_weight)) {}
 SparseJointMPC::~SparseJointMPC() = default;
 void SparseJointMPC::reset() { impl_->reset(); }
+
+std::size_t SparseJointMPC::fixed_matrix_bytes() const {
+  const auto& planner = *impl_;
+  return detail::sparse_matrix_bytes(planner.hessian) +
+         detail::sparse_matrix_bytes(planner.constraint) +
+         detail::sparse_matrix_bytes(planner.scaled_hessian) +
+         detail::sparse_matrix_bytes(planner.scaled_constraint) +
+         detail::sparse_matrix_bytes(planner.slew_hessian) +
+         detail::sparse_matrix_bytes(planner.slew_constraint);
+}
 
 SparseMPCProblem SparseJointMPC::formulate(const RobotState& state, const Vector& goal) const {
   Vector gradient, lower_bounds, upper_bounds;

@@ -69,6 +69,22 @@ int main() {
       check(constrained.plan && constrained.solver.iterations > 0,
             "inactive MPC bypassed a slightly violated velocity bound");
     }
+    {
+      JointMPC planner(limits, 60, .004);
+      const RobotState initial{Vector::Zero(2), Vector::Zero(2), 0};
+      const auto goal = (Vector(2) << 20., -20.).finished();
+      const auto initial_bytes = planner.fixed_matrix_bytes();
+      const auto outcome = planner.solve(initial, goal);
+      check(outcome.plan && outcome.solver.x.size() == 120,
+            "short-step condensed MPC did not return a velocity-only solution");
+      check(planner.fixed_matrix_bytes() > initial_bytes,
+            "fixed storage omitted the short-step solver's matrices");
+      const auto problem = planner.formulate(initial, goal);
+      const Vector values = problem.constraint * outcome.solver.x;
+      check((problem.lower - values).maxCoeff() <= 1e-6 &&
+                (values - problem.upper).maxCoeff() <= 1e-6,
+            "short-step sparse solution violates condensed bounds");
+    }
     for (int k = 0; k < 10; ++k) {
       same_optimum(first, state, goal);
       same_optimum(second, state, -goal);

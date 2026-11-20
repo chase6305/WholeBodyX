@@ -28,6 +28,8 @@ class SparseJointMPC final : public Planner {
   PlanResult solve(const RobotState&, const Vector& goal) override;
 
  private:
+  friend class JointMPC;
+  std::size_t fixed_matrix_bytes() const;
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

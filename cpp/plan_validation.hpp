@@ -8,6 +8,11 @@
 
 namespace wholebodyx::detail {
 
+inline bool prefer_slew_variables(const JointLimits& limits, double dt, int horizon) {
+  return limits.acceleration.size() && dt <= .02 && horizon >= 30 &&
+         (dt * limits.acceleration.array() <= .1 * limits.velocity.array()).any();
+}
+
 inline std::pair<Vector, Vector> sample_validated_joint_plan(const JointPlan& plan, double time) {
   if (!(std::isfinite(time) && time >= plan.stamp && time < plan.valid_until()))
     throw std::invalid_argument("reference is future-dated or expired");

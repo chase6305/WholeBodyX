@@ -3,9 +3,12 @@
 import numpy as np
 from scipy import sparse
 
-from .mpc import _JointMPC, _MPCSettings, _integrate_positions, _time_window, _velocity_changes
+from .mpc import (
+    _JointMPC, _MPCSettings, _integrate_positions, _prefer_slew_variables,
+    _time_window, _velocity_changes,
+)
 from .qp import OSQPSolver, QPResult, _OSQP_SOLVE, _immutable, _validated_qp_solution
-from .sparse_qp import _SparseFixedQP
+from .sparse_qp import _SparseFixedQP, _sparse_template_bytes
 from .types import array
 
 
@@ -100,14 +103,16 @@ class SparseJointMPC(_JointMPC):
         self._template = _SparseFixedQP(hessian, constraint)
         self._lower, self._upper = np.concatenate(lower), np.concatenate(upper)
         self._slew_problem = None
-        if (
-            self._default_solver is not None
-            and self.limits.acceleration is not None
-            and self.dt <= .02
-            and self.horizon >= 30
-            and (self.dt * self.limits.acceleration <= .1 * self.limits.velocity).any()
-        ):
+        if self._default_solver is not None and _prefer_slew_variables(self.limits, self.dt, self.horizon):
             self._prepare_slew_problem(hessian, constraint, trajectory_size)
+
+    @property
+    def fixed_matrix_bytes(self):
+        total = _sparse_template_bytes(self._template)
+        slew_problem = getattr(self, "_slew_problem", None)
+        if slew_problem is not None:
+            total += _sparse_template_bytes(slew_problem[0])
+        return total
 
     def _prepare_slew_problem(self, hessian, constraint, size):
         # Add one decision per velocity difference. The original slew rows
@@ -206,9 +211,6 @@ class SparseJointMPC(_JointMPC):
         )
 
     def solve(self, state, goal):
-        physical_problem = self.formulate(state, goal)
-        joint_count = state.q.size
-        trajectory_size = joint_count * self.horizon
         default_adapter = (
             self.solver is self._default_solver
             and type(self.solver) is OSQPSolver
@@ -220,6 +222,11 @@ class SparseJointMPC(_JointMPC):
             and getattr(self.formulate, "__func__", None) is _SPARSE_MPC_FORMULATE
         )
         origin = getattr(self, "_position_origin", None)
+        if origin is not None and default_problem:
+            goal = array(goal, 1, "goal")
+        physical_problem = self.formulate(state, goal)
+        joint_count = state.q.size
+        trajectory_size = joint_count * self.horizon
         problem = physical_problem
         if origin is not None and default_problem:
             problem = self._formulate(state, goal, origin)
