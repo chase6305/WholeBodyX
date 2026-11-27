@@ -38,10 +38,12 @@ def run(scenario, backend="python", mpc_backend=None, steps=None, csv_path=None,
             # Use the same post-step target for orientation and CSV as for
             # the session's position errors, including at a scheduled change.
             state, target = session.plant.read(), session._diagnostic_reference
-            for k, frame in enumerate(session.frames):
-                pose = session.model.pose(state.q, frame)
-                orientation_error = float(np.linalg.norm(
-                    Rotation.from_matrix(target.poses[k].rotation @ pose.rotation.T).as_rotvec()))
+            poses = [session.model.pose(state.q, frame) for frame in session.frames]
+            rotation_errors = Rotation.from_matrix([
+                desired.rotation @ actual.rotation.T for desired, actual in zip(target.poses, poses)
+            ]).as_rotvec()
+            for k, (pose, rotation_error) in enumerate(zip(poses, rotation_errors)):
+                orientation_error = float(np.linalg.norm(rotation_error))
                 max_orientation = max(max_orientation, orientation_error)
                 if stream is not None:
                     row[f"orientation_error_{k}_rad"] = orientation_error
