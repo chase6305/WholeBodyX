@@ -16,7 +16,7 @@ class ScaledContactQP(NamedTuple):
 
 ACTIVE_TOLERANCE = 1e-8
 _DUAL_SIGN_TOLERANCE = 1e-9
-_ACTIVE_SET_ATTEMPTS = 5
+_ACTIVE_SET_ATTEMPTS = 8
 _FLOAT_EPSILON = np.finfo(float).eps
 
 
