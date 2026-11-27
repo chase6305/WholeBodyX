@@ -185,6 +185,39 @@ def test_urdf_jacobian_result_isolated_from_workspace_and_borrowed_views(monkeyp
     np.testing.assert_array_equal(borrowed, original)
 
 
+def test_urdf_batch_poses_share_one_fk_pass_and_own_their_outputs(monkeypatch):
+    pytest.importorskip("pinocchio")
+    path = Path(__file__).resolve().parents[2] / "examples/models/planar_arm.urdf"
+    model = PinocchioModel(path)
+    q = np.linspace(.1, .5, model._model.nq)
+    frames = ("tool", "base", "tool")
+    expected = [model.pose(q, frame) for frame in frames]
+    original, calls = model._pin.forwardKinematics, []
+
+    def forward(*args):
+        calls.append(1)
+        return original(*args)
+
+    monkeypatch.setattr(model._pin, "forwardKinematics", forward)
+    actual = model.poses(q, iter(frames))
+    assert calls == [1]
+    moved = model.poses(q + .2, ("tool",))[0]
+    assert calls == [1, 1]
+    assert not np.array_equal(actual[0].translation, moved.translation)
+    for pose, reference in zip(actual, expected):
+        np.testing.assert_array_equal(pose.translation, reference.translation)
+        np.testing.assert_array_equal(pose.rotation, reference.rotation)
+    assert not np.shares_memory(actual[0].rotation, actual[2].rotation)
+    assert not np.shares_memory(actual[0].translation, actual[2].translation)
+
+    assert model.poses(q, ()) == ()
+    with pytest.raises(ValueError, match="unknown frame"):
+        model.poses(q, ("tool", "unknown"))
+    with pytest.raises(ValueError, match="finite"):
+        model.poses(np.full_like(q, np.nan), ("tool",))
+    assert calls == [1, 1]
+
+
 @pytest.mark.parametrize("mpc", [False, True])
 def test_dual_arm_closed_loop(backend, mpc):
     root = Path(__file__).resolve().parents[2]

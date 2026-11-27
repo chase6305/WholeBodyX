@@ -19,6 +19,7 @@ from wholebodyx.tasks import FramePoseTask, PostureTask
 DEFAULT_URDF = Path(__file__).resolve().parents[3] / "HumanoidAssets/UnitreeH1/robot.urdf"
 ARMS = ("left_elbow_link", "right_elbow_link")
 FEET = ("left_ankle_link", "right_ankle_link")
+GRASP_FRAME = ARMS[1]
 
 
 class H1Session:
@@ -54,7 +55,7 @@ class H1Session:
         self.controller.reset()
         if self.manager is not None:
             self.manager.reset()
-        self.feet = [self.model.pose(self.plant.read().q, frame) for frame in FEET]
+        self.feet = list(self.model.poses(self.plant.read().q, FEET))
         self.steps = self.replans = 0
         self.max_violation = self.max_foot_error = 0.
         self.max_pelvis_pitch = 0.
@@ -71,22 +72,31 @@ class H1Session:
     def hand_transform(self, q):
         """Virtual grasp point at the distal end of the supplied forearm mesh."""
         world_r, world_t = self.world_transform(q)
-        hand = self.model.pose(q, "right_elbow_link")
+        return self._hand_from_pose(self.model.pose(q, GRASP_FRAME), world_r, world_t)
+
+    @staticmethod
+    def _hand_from_pose(hand, world_r, world_t):
         return (world_r @ hand.rotation,
                 world_r @ (hand.translation + hand.rotation @ np.array([.27, 0, 0])) + world_t)
 
     def world_transform(self, q):
         """Kinematic support-foot anchoring, not a floating-base dynamics solve."""
         if self.motion == "arms":
+            return self._world_from_feet(())
+        frames = FEET if self.motion == "march" else FEET[:1]
+        return self._world_from_feet(self.model.poses(q, frames))
+
+    def _world_from_feet(self, feet):
+        if self.motion == "arms":
             return np.eye(3), np.zeros(3)
         if self.motion == "march":
             # Display-only root: keep the lower ankle at its initial height.
             # This is geometric floor alignment, not a contact/balance solve.
-            feet = [self.model.pose(q, frame).translation for frame in FEET]
-            shift = np.array([0., -.5 * (feet[0][1] + feet[1][1]),
-                              min(p.translation[2] for p in self.feet) - min(p[2] for p in feet)])
+            left, right = (pose.translation for pose in feet)
+            shift = np.array([0., -.5 * (left[1] + right[1]),
+                              min(p.translation[2] for p in self.feet) - min(left[2], right[2])])
             return np.eye(3), shift
-        foot = self.model.pose(q, FEET[0])
+        foot = feet[0]
         rotation = self.feet[0].rotation @ foot.rotation.T
         return rotation, self.feet[0].translation - rotation @ foot.translation
 
@@ -185,16 +195,15 @@ class H1Session:
             qref, vref, reason = update.position, update.velocity, update.reason
             self.replans += int(update.replanned)
         tasks = [PostureTask(qref, feedforward=vref).linearize(self.model, state)]
-        for frame in ARMS:
-            target = self.model.pose(qref, frame)
+        moving_feet = self.motion in ("bow", "pickup", "march")
+        task_frames = ARMS + FEET if moving_feet else ARMS
+        targets = self.model.poses(qref, task_frames)
+        for frame, target in zip(ARMS, targets):
             twist = self.model.jacobian(qref, frame) @ vref
             tasks.append(FramePoseTask(frame, target, feedforward=twist).linearize(self.model, state))
-        for frame, target in zip(FEET, self.feet):
-            if self.motion in ("bow", "pickup", "march"):
-                target = self.model.pose(qref, frame)
-                twist = self.model.jacobian(qref, frame) @ vref
-            else:
-                twist = None
+        foot_targets = targets[len(ARMS):] if moving_feet else self.feet
+        for frame, target in zip(FEET, foot_targets):
+            twist = self.model.jacobian(qref, frame) @ vref if moving_feet else None
             tasks.append(FramePoseTask(frame, target, weight=10., feedforward=twist).linearize(self.model, state))
         start = time.perf_counter()
         result = self.controller.step(state, tasks, self.dt)
@@ -204,7 +213,9 @@ class H1Session:
         self.plant.write(result.command, self.dt)
         self.steps += 1
         state = self.plant.read()
-        hand_r, hand_p = self.hand_transform(state.q)
+        *feet, hand = self.model.poses(state.q, FEET + (GRASP_FRAME,))
+        world_r, world_t = self._world_from_feet(feet)
+        hand_r, hand_p = self._hand_from_pose(hand, world_r, world_t)
         grasp_distance = float(np.linalg.norm(hand_p - self.object_position))
         if self.motion == "pickup":
             if not self.object_attached and 3. <= state.stamp < 4. and grasp_distance <= .015:
@@ -215,28 +226,27 @@ class H1Session:
             if self.object_attached:
                 self.object_position = hand_p + hand_r @ self._grasp_offset
                 self.object_rotation = hand_r @ self._grasp_rotation
-        world_r, world_t = self.world_transform(state.q)
         pitch = float(Rotation.from_matrix(world_r).as_euler("xyz")[1])
         self.max_pelvis_pitch = max(self.max_pelvis_pitch, abs(pitch))
-        foot_targets = self.feet
+        goal = self.goal(state.stamp)
         if self.motion == "march":
-            target_q = self.goal(state.stamp)
-            target_r, target_t = self.world_transform(target_q)
-            foot_targets = [self.model.pose(target_q, frame) for frame in FEET]
+            foot_targets = self.model.poses(goal, FEET)
+            target_r, target_t = self._world_from_feet(foot_targets)
             target_positions = [target_r @ target.translation + target_t for target in foot_targets]
         else:
-            target_positions = [target.translation for target in foot_targets]
-        lifts = [float((world_r @ self.model.pose(state.q, frame).translation + world_t - initial.translation)[2])
-                 for frame, initial in zip(FEET, self.feet)]
+            target_positions = [target.translation for target in self.feet]
+        positions = [world_r @ foot.translation + world_t for foot in feet]
+        lifts = [float((position - initial.translation)[2])
+                 for position, initial in zip(positions, self.feet)]
         self.max_foot_lift = max(self.max_foot_lift, *lifts)
-        foot_error = max(np.linalg.norm(world_r @ self.model.pose(state.q, frame).translation + world_t - target)
-                         for frame, target in zip(FEET, target_positions))
+        foot_error = max(np.linalg.norm(position - target)
+                         for position, target in zip(positions, target_positions))
         self.max_foot_error = max(self.max_foot_error, float(foot_error))
         self.max_violation = max(self.max_violation, result.solver.violation)
-        row = dict(time=state.stamp, joint_error_rad=float(np.max(np.abs(state.q - self.goal(state.stamp)))),
+        row = dict(time=state.stamp, joint_error_rad=float(np.max(np.abs(state.q - goal))),
                    foot_error_m=float(foot_error), wbc_ms=elapsed, replan_reason=reason,
                    violation=result.solver.violation)
-        foot_x = [float((world_r @ self.model.pose(state.q, frame).translation + world_t)[0]) for frame in FEET]
+        foot_x = [float(position[0]) for position in positions]
         self.max_foot_separation = max(self.max_foot_separation, abs(foot_x[0] - foot_x[1]))
         row["left_foot_x_m"], row["right_foot_x_m"] = foot_x
         row["pelvis_y_m"], row["pelvis_z_m"] = float(world_t[1]), float(world_t[2])
@@ -342,12 +352,14 @@ def view(urdf, mode, backend, mpc_backend, host, port, motion="arms", autoplay=T
             client.camera.position = (2.3, -2.6, 1.65)
             client.camera.look_at = (.15, -.08, .95)
 
+        visual_frames = tuple(frame for frame, *_ in visuals)
+
         def render():
             q = session.plant.read().q
             world_r, world_t = session.world_transform(q)
+            poses = session.model.poses(q, visual_frames) if visual_frames else ()
             with server.atomic():
-                for frame, handle, xyz, rotation in visuals:
-                    pose = session.model.pose(q, frame)
+                for (_, handle, xyz, rotation), pose in zip(visuals, poses):
                     handle.position = world_r @ (pose.translation + pose.rotation @ xyz) + world_t + [0, 0, height]
                     handle.wxyz = np.roll(Rotation.from_matrix(world_r @ pose.rotation @ rotation).as_quat(), 1)
                 if prop is not None:

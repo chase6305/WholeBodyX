@@ -137,28 +137,40 @@ class PinocchioModel:
             self._model.velocityLimit,
         )
 
-    def _prepare(self, q, frame):
+    def _configuration(self, q):
         q = array(q, 1, "q")
         if q.size != self._model.nq:
             raise ValueError("configuration dimensions differ")
+        return q
+
+    def _frame_id(self, frame):
         frame_id = self._frame_ids.get(frame)
         if frame_id is None:
             if not self._model.existFrame(frame):
                 raise ValueError(f"unknown frame: {frame}")
             frame_id = self._model.getFrameId(frame)
             self._frame_ids[frame] = frame_id
-        return q, frame_id
+        return frame_id
 
-    def pose(self, q, frame):
-        q, frame_id = self._prepare(q, frame)
-        self._pin.forwardKinematics(self._model, self._data, q)
-        # Only the requested frame is consumed. Joint FK remains current;
-        # avoid refreshing every auxiliary frame in a large URDF.
+    def _pose_from_fk(self, frame_id):
         placement = self._pin.updateFramePlacement(self._model, self._data, frame_id)
         return Pose(placement.translation, placement.rotation)
 
+    def pose(self, q, frame):
+        q, frame_id = self._configuration(q), self._frame_id(frame)
+        self._pin.forwardKinematics(self._model, self._data, q)
+        return self._pose_from_fk(frame_id)
+
+    def poses(self, q, frames):
+        """Snapshot the requested frames in order after one joint FK pass."""
+        q = self._configuration(q)
+        frame_ids = tuple(map(self._frame_id, frames))
+        if frame_ids:
+            self._pin.forwardKinematics(self._model, self._data, q)
+        return tuple(map(self._pose_from_fk, frame_ids))
+
     def jacobian(self, q, frame):
-        q, frame_id = self._prepare(q, frame)
+        q, frame_id = self._configuration(q), self._frame_id(frame)
         return np.array(
             self._pin.computeFrameJacobian(
                 self._model, self._data, q, frame_id, self._pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
