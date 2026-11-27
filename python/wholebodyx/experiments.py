@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .model import Pose
-from .tasks import FramePoseTask, PostureTask
+from .tasks import FramePoseTask, PostureTask, _linearize_frame_poses
 from .types import LinearTask
 
 INITIAL_Q = (0.2, 0.6, -0.4, -0.2, -0.6, 0.4)
@@ -90,7 +90,8 @@ def wbc_tasks(model, state, scenario, target):
             LinearTask(jacobians[1] - jacobians[0], 4 * relative_error, weight=20),
             PostureTask(target.q, weight=1e-5).linearize(model, state),
         ]
-    return [FramePoseTask(frame, pose, feedforward=twist).linearize(model, state)
-            for frame, pose, twist in zip(FRAMES, target.poses, target.twists)] + [
+    frame_tasks = [FramePoseTask(frame, pose, feedforward=twist)
+                   for frame, pose, twist in zip(FRAMES, target.poses, target.twists)]
+    return _linearize_frame_poses(model, state, frame_tasks) + [
         PostureTask(target.q, weight=1e-5 if scenario == "cartesian_circle" else 1e-3).linearize(model, state)
     ]

@@ -59,9 +59,7 @@ class FramePoseTask:
     weight: np.ndarray | float = 1.0
     feedforward: np.ndarray | None = None  # World-aligned [linear; angular] twist.
 
-    def linearize(self, model, state):
-        current = model.pose(state.q, self.frame)
-        angular_error = Rotation.from_matrix(self.target.rotation @ current.rotation.T).as_rotvec()
+    def _velocity_target(self, current, angular_error):
         error = np.concatenate((self.target.translation - current.translation, angular_error))
         velocity = positive(self.gain, "gain") * error
         if self.feedforward is not None:
@@ -69,7 +67,31 @@ class FramePoseTask:
             if feedforward.shape != (6,):
                 raise ValueError("pose feedforward must have six elements")
             velocity += feedforward
+        return velocity
+
+    def linearize(self, model, state):
+        current = model.pose(state.q, self.frame)
+        angular_error = Rotation.from_matrix(self.target.rotation @ current.rotation.T).as_rotvec()
+        velocity = self._velocity_target(current, angular_error)
         return LinearTask(model.jacobian(state.q, self.frame), velocity, self.weight)
+
+
+def _linearize_frame_poses(model, state, tasks):
+    """Compute rotation errors together and use shared FK when available."""
+    if not tasks:
+        return []
+    frames = tuple(task.frame for task in tasks)
+    batch = getattr(model, "poses", None)
+    poses = (batch(state.q, frames) if callable(batch)
+             else tuple(model.pose(state.q, frame) for frame in frames))
+    angular_errors = Rotation.from_matrix([
+        task.target.rotation @ pose.rotation.T for task, pose in zip(tasks, poses)
+    ]).as_rotvec()
+    result = []
+    for task, pose, angular_error in zip(tasks, poses, angular_errors):
+        velocity = task._velocity_target(pose, angular_error)
+        result.append(LinearTask(model.jacobian(state.q, task.frame), velocity, task.weight))
+    return result
 
 
 @dataclass

@@ -58,6 +58,27 @@ def test_planar_pose_owns_finite_float64_arrays():
         model.pose(np.full(6, 1e308), "left_ee")
 
 
+def test_batched_frame_tasks_match_individual_linearization():
+    from wholebodyx.tasks import FramePoseTask, _linearize_frame_poses
+
+    model = PlanarDualArm()
+    state = RobotState(np.zeros(6), np.zeros(6))
+    target = np.array([np.pi - 1e-8, 0., 0., -np.pi + 1e-8, 0., 0.])
+    left, right = "left_ee", "right_ee"
+    tasks = [
+        FramePoseTask(left, model.pose(target, left), gain=2., feedforward=np.arange(6) * .01),
+        FramePoseTask(right, model.pose(target, right), weight=np.arange(1., 7.)),
+    ]
+    batch = _linearize_frame_poses(model, state, tasks)
+    assert len(batch) == len(tasks)
+    for actual, task in zip(batch, tasks):
+        expected = task.linearize(model, state)
+        np.testing.assert_array_equal(actual.jacobian, expected.jacobian)
+        np.testing.assert_array_equal(actual.weight, expected.weight)
+        np.testing.assert_allclose(actual.target_velocity, expected.target_velocity, atol=1e-14, rtol=0)
+    assert _linearize_frame_poses(model, state, []) == []
+
+
 def test_pose_rotation_validation_matches_existing_tolerances():
     from wholebodyx.model import Pose
 

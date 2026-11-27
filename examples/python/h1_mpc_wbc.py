@@ -14,7 +14,7 @@ from scipy.spatial.transform import Rotation
 from wholebodyx import BackendRegistry, JointLimits, MPCReferenceManager, RobotState
 from wholebodyx.model import PinocchioModel
 from wholebodyx.simulation import JointIntegrator
-from wholebodyx.tasks import FramePoseTask, PostureTask
+from wholebodyx.tasks import FramePoseTask, PostureTask, _linearize_frame_poses
 
 DEFAULT_URDF = Path(__file__).resolve().parents[3] / "HumanoidAssets/UnitreeH1/robot.urdf"
 ARMS = ("left_elbow_link", "right_elbow_link")
@@ -198,13 +198,15 @@ class H1Session:
         moving_feet = self.motion in ("bow", "pickup", "march")
         task_frames = ARMS + FEET if moving_feet else ARMS
         targets = self.model.poses(qref, task_frames)
+        frame_tasks = []
         for frame, target in zip(ARMS, targets):
             twist = self.model.jacobian(qref, frame) @ vref
-            tasks.append(FramePoseTask(frame, target, feedforward=twist).linearize(self.model, state))
+            frame_tasks.append(FramePoseTask(frame, target, feedforward=twist))
         foot_targets = targets[len(ARMS):] if moving_feet else self.feet
         for frame, target in zip(FEET, foot_targets):
             twist = self.model.jacobian(qref, frame) @ vref if moving_feet else None
-            tasks.append(FramePoseTask(frame, target, weight=10., feedforward=twist).linearize(self.model, state))
+            frame_tasks.append(FramePoseTask(frame, target, weight=10., feedforward=twist))
+        tasks.extend(_linearize_frame_poses(self.model, state, frame_tasks))
         start = time.perf_counter()
         result = self.controller.step(state, tasks, self.dt)
         elapsed = (time.perf_counter() - start) * 1000
