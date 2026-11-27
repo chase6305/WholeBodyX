@@ -132,7 +132,7 @@ class JointPlan:
             # Overflow must not make two inconsistent displacements compare
             # equal as infinities. Both temporary arrays are safe to reuse.
             with np.errstate(over="raise", invalid="raise"):
-                error = np.diff(positions, axis=0)
+                error = np.subtract(positions[1:], positions[:-1])
                 expected = self.dt * velocities
                 error -= expected
                 np.abs(error, out=error)
@@ -186,14 +186,15 @@ def _check_plan_acceptance(plan, state, limits, control_dt):
     if plan.valid_until < state.stamp + control_dt:
         raise ValueError("plan does not cover the complete control interval")
     if (
-        np.any(plan.positions[1:] < limits.lower - tolerance)
-        or np.any(plan.positions[1:] > limits.upper + tolerance)
-        or np.any(np.abs(plan.velocities) > limits.velocity + tolerance)
+        (plan.positions[1:] < limits.lower - tolerance).any()
+        or (plan.positions[1:] > limits.upper + tolerance).any()
+        or (np.abs(plan.velocities) > limits.velocity + tolerance).any()
     ):
         raise ValueError("plan violates position or velocity limits")
     if limits.acceleration is not None:
         changes = _velocity_changes(plan.velocities, state.v)
-        if np.any(np.abs(changes) > limits.acceleration * plan.dt + tolerance):
+        np.abs(changes, out=changes)
+        if (changes > limits.acceleration * plan.dt + tolerance).any():
             raise ValueError("plan violates velocity-slew limits")
 
 
