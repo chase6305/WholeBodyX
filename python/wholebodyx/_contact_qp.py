@@ -17,6 +17,7 @@ class ScaledContactQP(NamedTuple):
 ACTIVE_TOLERANCE = 1e-8
 _DUAL_SIGN_TOLERANCE = 1e-9
 _ACTIVE_SET_ATTEMPTS = 5
+_FLOAT_EPSILON = np.finfo(float).eps
 
 
 def constraint_violation(constraint, lower, upper, solution):
@@ -70,18 +71,25 @@ def solve_contact_working_set(problem, dual_seed):
             active[rows[np.argmax(wrong_sign)]] = 0
             continue
         lower_gap, upper_gap = lower - values, values - upper
-        # The active side already passed its equality check. Keep exact
-        # comparisons for the other bounds: a small positive gap on a weak
-        # row can still be far from the optimal decision.
+        # The active side already passed its equality check. A tolerance
+        # unrelated to the row magnitude can hide large decision errors.
         lower_gap[active < 0] = -np.inf
         upper_gap[(active > 0) | equality] = -np.inf
-        lower_index, upper_index = np.argmax(lower_gap), np.argmax(upper_gap)
-        if max(lower_gap[lower_index], upper_gap[upper_index]) <= 0.0:
-            dual = np.zeros_like(lower)
-            dual[rows] = multipliers
-            return x, dual
-        if lower_gap[lower_index] > upper_gap[upper_index]:
-            active[lower_index], bounds[lower_index] = -1, lower[lower_index]
-        else:
-            active[upper_index], bounds[upper_index] = 1, upper[upper_index]
+        gap = np.maximum(lower_gap, upper_gap)
+        violated = gap > 0.0
+        if violated.any():
+            # The dot-product rounding bound also handles cancellation on
+            # redundant tight rows, whose exact evaluation may be zero.
+            roundoff = (4 * _FLOAT_EPSILON * variables) * (np.abs(constraint[violated]) @ np.abs(x))
+            gap[violated] -= np.minimum(roundoff, ACTIVE_TOLERANCE)
+            index = np.argmax(gap)
+            if gap[index] > 0.0:
+                if lower_gap[index] > upper_gap[index]:
+                    active[index], bounds[index] = -1, lower[index]
+                else:
+                    active[index], bounds[index] = 1, upper[index]
+                continue
+        dual = np.zeros_like(lower)
+        dual[rows] = multipliers
+        return x, dual
     return None
