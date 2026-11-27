@@ -1,8 +1,8 @@
 """Real spawned planners, bounded mailboxes and process lifetime."""
 
-import os
 from dataclasses import replace
 import multiprocessing as mp
+import os
 from pathlib import Path
 from threading import Condition, Event
 import time
@@ -49,6 +49,11 @@ def test_spawned_backend_returns_validated_current_request_and_closes(backend):
         np.testing.assert_array_equal(reply.goal, [.3] * 3)
         assert reply.outcome.solver.success and reply.outcome.plan.stamp == 4.
         assert reply.solve_ms >= 0 and worker.poll() is None
+        velocities = reply.outcome.plan.velocities
+        np.testing.assert_array_equal(
+            velocities.view(np.uint64),
+            reply.outcome.solver.x[-velocities.size:].reshape(velocities.shape).view(np.uint64),
+        )
         for value in (reply.state.q, reply.state.v, reply.goal, reply.outcome.solver.x):
             with pytest.raises(ValueError):
                 value.setflags(write=True)
@@ -169,6 +174,34 @@ def test_invalid_submission_cannot_replace_the_latest_valid_request():
         assert receive(worker).token == token
 
 
+def test_packing_preserves_distinct_velocity_bits():
+    from wholebodyx.mpc import PlanResult
+    from wholebodyx.process_mpc import _CompactPlan, _pack_outcome
+    from wholebodyx.qp import QPResult
+
+    plan = JointPlan([[0.], [0.]], [[0.]], 0., .1)
+    outcome = PlanResult(QPResult("solved", np.array([0.])), plan)
+    assert isinstance(_pack_outcome(outcome), _CompactPlan)
+    differing = replace(outcome, solver=replace(outcome.solver, x=np.array([-0.])))
+    assert _pack_outcome(differing) is differing
+
+
+def test_compact_payload_plan_geometry_is_validated_in_the_relay():
+    from wholebodyx.process_mpc import _CompactPlan
+    from wholebodyx.qp import QPResult
+
+    state = RobotState(np.zeros(3), np.zeros(3))
+    result = QPResult("solved", np.zeros(30))
+    with ProcessMPCWorker(limits(), horizon=5) as worker:
+        plan = _CompactPlan(result, np.zeros((6, 3)), 0., worker.dt, (3, 5))
+        with pytest.raises(ValueError, match="different planning model"):
+            worker._snapshot(plan, state)
+        positions = np.zeros((6, 3))
+        positions[1:] = .05
+        with pytest.raises(ValueError, match="integrator dynamics"):
+            worker._snapshot(plan._replace(positions=positions, velocity_shape=(5, 3)), state)
+
+
 @pytest.mark.parametrize("case", ["transfer", "limits", "interval", "replaced_poll"])
 def test_reference_receipt_reuses_only_applicable_relay_validation(case, monkeypatch):
     from wholebodyx import async_runtime
@@ -181,9 +214,6 @@ def test_reference_receipt_reuses_only_applicable_relay_validation(case, monkeyp
         manager.seed(seed, state, goal, .02)
         assert manager.update(state, goal, .02).success
         deadline = time.monotonic() + 3.
-        while worker._reply is None and time.monotonic() < deadline and not worker.error:
-            time.sleep(.001)
-        assert worker._reply is not None, worker.error
         control_dt = .02
         if case == "transfer":
             def unexpected_validation(*args, **kwargs):
@@ -200,11 +230,21 @@ def test_reference_receipt_reuses_only_applicable_relay_validation(case, monkeyp
 
             def replaced_poll():
                 reply = poll()
+                if reply is None:
+                    return None
                 outcome = replace(reply.outcome, solver=replace(reply.outcome.solver, x=np.zeros(1)))
                 return replace(reply, outcome=outcome)
 
             monkeypatch.setattr(worker, "poll", replaced_poll)
-        result = manager.update(RobotState(np.zeros(3), np.zeros(3), .2), goal, control_dt)
+        while worker._reply is None and time.monotonic() < deadline and not worker.error:
+            time.sleep(.001)
+        assert worker._reply is not None, worker.error
+        current = RobotState(np.zeros(3), np.zeros(3), .2)
+        result = manager.update(current, goal, control_dt)
+        # A legitimate concurrent relay-lock hold can defer reading the reply.
+        while result.success and not result.replanned and time.monotonic() < deadline:
+            result = manager.update(current, goal, control_dt)
+            time.sleep(.001)
         if case == "transfer":
             assert result.success and result.replanned
         else:

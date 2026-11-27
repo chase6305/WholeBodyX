@@ -9,13 +9,23 @@ from dataclasses import dataclass
 import hashlib
 import multiprocessing as mp
 from pathlib import Path
+import pickle
 import sys
 from threading import Condition, Event, Lock, Thread
 from time import perf_counter
+from typing import NamedTuple
 
 import numpy as np
 
-from .mpc import JointMPC, PlanResult, _MPCSettings, _time_window, _validated_joint_plan
+from .mpc import (
+    JointMPC,
+    JointPlan,
+    PlanResult,
+    _check_plan_acceptance,
+    _MPCSettings,
+    _time_window,
+    _validated_joint_plan,
+)
 from .qp import QPResult, _immutable
 from .types import JointLimits, RobotState, _snapshot, positive
 
@@ -33,6 +43,40 @@ class PlanningReply:
     goal: np.ndarray
     outcome: PlanResult
     solve_ms: float
+
+
+class _CompactPlan(NamedTuple):
+    solver: QPResult
+    positions: np.ndarray
+    stamp: float
+    dt: float
+    velocity_shape: tuple[int, int]
+
+
+def _pack_outcome(outcome):
+    """Encode the velocity only once when both arrays contain the same bits."""
+    if not isinstance(outcome, PlanResult) or not isinstance(outcome.solver, QPResult):
+        return outcome
+    solver, plan = outcome.solver, outcome.plan
+    if not solver.success or not isinstance(plan, JointPlan):
+        return outcome
+    decision = solver.x
+    velocity = plan.velocities
+    if (
+        type(decision) is np.ndarray
+        and type(velocity) is np.ndarray
+        and decision.ndim == 1
+        and velocity.ndim == 2
+        and velocity.size
+        and decision.dtype == velocity.dtype == np.dtype(float)
+        and decision.size in (velocity.size, 2 * velocity.size)
+        and np.array_equal(
+            decision[-velocity.size:].reshape(velocity.shape).view(np.uint64),
+            velocity.view(np.uint64),
+        )
+    ):
+        return _CompactPlan(solver, plan.positions, plan.stamp, plan.dt, velocity.shape)
+    return outcome
 
 
 def _child_main(connection, backend, settings):
@@ -96,7 +140,11 @@ def _child_main(connection, backend, settings):
                 outcome = planner.solve(RobotState(q, v, stamp), goal)
             except (ValueError, RuntimeError) as exc:
                 outcome = PlanResult(QPResult("error", detail=str(exc)[:1000]))
-            connection.send(("result", token, outcome, (perf_counter() - started) * 1000))
+            solve_ms = (perf_counter() - started) * 1000
+            message = ("result", token, _pack_outcome(outcome), solve_ms)
+            # Protocol 5 can serialize contiguous NumPy buffers with fewer
+            # copies while keeping the reply in a single pipe message.
+            connection.send_bytes(pickle.dumps(message, protocol=5))
     except (EOFError, BrokenPipeError, ConnectionError):
         pass
     except BaseException as exc:
@@ -291,7 +339,7 @@ class ProcessMPCWorker:
         self.cancel()
 
     def _snapshot(self, outcome, state):
-        if not isinstance(outcome, PlanResult) or not isinstance(outcome.solver, QPResult):
+        if not isinstance(outcome, (PlanResult, _CompactPlan)) or not isinstance(outcome.solver, QPResult):
             raise ValueError("worker returned an invalid planning result")
         result = outcome.solver
         if not result.success:
@@ -303,12 +351,23 @@ class ProcessMPCWorker:
                     detail=result.detail,
                 )
             )
-        size = self.horizon * state.q.size * (2 if "sparse" in self.backend else 1)
+        shape = (self.horizon, state.q.size)
+        velocity_count = shape[0] * shape[1]
+        size = velocity_count * (2 if "sparse" in self.backend else 1)
         x = _snapshot(result.x, 1, "worker solution")
-        if x.shape != (size,) or outcome.plan is None:
+        if x.shape != (size,):
             raise ValueError("worker returned an invalid solution shape or missing plan")
-        plan = _validated_joint_plan(outcome.plan, state, self._settings.limits, self.dt)
-        if plan.velocities.shape != (self.horizon, state.q.size) or plan.dt != self.dt:
+        if isinstance(outcome, _CompactPlan):
+            if outcome.velocity_shape != shape:
+                raise ValueError("worker returned a different planning model")
+            velocities = x[-velocity_count:].reshape(shape)
+            plan = JointPlan(outcome.positions, velocities, outcome.stamp, outcome.dt)
+            _check_plan_acceptance(plan, state, self._settings.limits, self.dt)
+        else:
+            if outcome.plan is None:
+                raise ValueError("worker returned an invalid solution shape or missing plan")
+            plan = _validated_joint_plan(outcome.plan, state, self._settings.limits, self.dt)
+        if plan.velocities.shape != shape or plan.dt != self.dt:
             raise ValueError("worker returned a different planning model")
         return PlanResult(
             QPResult("solved", x, result.iterations, result.violation, result.detail), plan

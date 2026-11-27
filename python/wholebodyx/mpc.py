@@ -167,6 +167,12 @@ def _validated_joint_plan(plan, state, limits, control_dt):
     if not isinstance(plan, JointPlan):
         raise ValueError("planner must return a JointPlan value")
     plan = JointPlan(plan.positions, plan.velocities, plan.stamp, plan.dt)
+    _check_plan_acceptance(plan, state, limits, control_dt)
+    return plan
+
+
+def _check_plan_acceptance(plan, state, limits, control_dt):
+    """Check a freshly constructed plan against the current execution context."""
     if plan.stamp != state.stamp:
         raise ValueError("planner returned a stale or future-dated plan")
     if plan.positions.shape[1] != state.q.size or not np.allclose(
@@ -186,7 +192,6 @@ def _validated_joint_plan(plan, state, limits, control_dt):
         changes = _velocity_changes(plan.velocities, state.v)
         if np.any(np.abs(changes) > limits.acceleration * plan.dt + tolerance):
             raise ValueError("plan violates velocity-slew limits")
-    return plan
 
 
 @dataclass(frozen=True)
