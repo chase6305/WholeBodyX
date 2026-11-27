@@ -119,3 +119,18 @@ def test_dense_csc_template_is_unscaled_even_when_scaled_storage_underflows():
     assert scaled.nnz < h.nnz
     second = np.array([[2., .25], [.25, 3.]])
     assert_packing(_upper_csc(second, cache), second)
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_unit_entries_in_one_column_do_not_count_as_identity(compact):
+    hessian = np.eye(2)
+    constraint = np.array([[1., 0.], [1., 0.]])
+    gradient, lower, upper = [0., -1.], [-1., -.5], [1., .5]
+    problem = (
+        SparseQuadraticProgram(sparse.csc_matrix(hessian), gradient,
+                               sparse.csc_matrix(constraint), lower, upper)
+        if compact else QuadraticProgram(hessian, gradient, constraint, lower, upper)
+    )
+    result = OSQPSolver().solve(problem)
+    assert result.success, result
+    np.testing.assert_allclose(result.x, [0., 1.], atol=1e-7, rtol=0)
