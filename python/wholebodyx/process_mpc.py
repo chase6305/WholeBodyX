@@ -5,7 +5,7 @@ pipe transfer or a held relay lock. Construction, wait_ready and close belong
 outside the control cycle. Python scheduling still prevents hard-RT guarantees.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import multiprocessing as mp
 from pathlib import Path
@@ -26,7 +26,7 @@ from .mpc import (
     _time_window,
     _validated_joint_plan,
 )
-from .qp import QPResult, _immutable
+from .qp import QPResult, _immutable, _immutable_array_key
 from .types import JointLimits, RobotState, _snapshot, positive
 
 
@@ -53,6 +53,9 @@ class _CompactPlan(NamedTuple):
     velocity_shape: tuple[int, int]
 
 
+_LARGE_DECISION_BYTES = 256 * 1024
+
+
 def _pack_outcome(outcome):
     """Encode the velocity only once when both arrays contain the same bits."""
     if not isinstance(outcome, PlanResult) or not isinstance(outcome.solver, QPResult):
@@ -75,8 +78,30 @@ def _pack_outcome(outcome):
             velocity.view(np.uint64),
         )
     ):
+        if decision.nbytes >= _LARGE_DECISION_BYTES and decision.flags.c_contiguous:
+            # With protocol 5 a contiguous read-only view can arrive backed
+            # by bytes. The solver keeps its original array and flags.
+            decision = decision.view()
+            decision.setflags(write=False)
+            solver = replace(solver, x=decision)
         return _CompactPlan(solver, plan.positions, plan.stamp, plan.dt, velocity.shape)
     return outcome
+
+
+def _snapshot_solution(value):
+    """Validate the decision and reuse large bytes-backed buffers."""
+    if (
+        type(value) is np.ndarray
+        and not value.flags.writeable
+        and value.nbytes >= _LARGE_DECISION_BYTES
+        and value.dtype == np.dtype(float)
+        and value.ndim == 1
+        and _immutable_array_key(value) is not None
+    ):
+        if not np.isfinite(value).all():
+            raise ValueError("worker solution must be a finite 1-D array")
+        return value.view()
+    return _snapshot(value, 1, "worker solution")
 
 
 def _child_main(connection, backend, settings):
@@ -354,7 +379,7 @@ class ProcessMPCWorker:
         shape = (self.horizon, state.q.size)
         velocity_count = shape[0] * shape[1]
         size = velocity_count * (2 if "sparse" in self.backend else 1)
-        x = _snapshot(result.x, 1, "worker solution")
+        x = _snapshot_solution(result.x)
         if x.shape != (size,):
             raise ValueError("worker returned an invalid solution shape or missing plan")
         if isinstance(outcome, _CompactPlan):

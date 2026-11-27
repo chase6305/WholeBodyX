@@ -4,6 +4,7 @@ from dataclasses import replace
 import multiprocessing as mp
 import os
 from pathlib import Path
+import pickle
 from threading import Condition, Event
 import time
 from weakref import ref
@@ -185,6 +186,37 @@ def test_packing_preserves_distinct_velocity_bits():
     assert isinstance(_pack_outcome(outcome), _CompactPlan)
     differing = replace(outcome, solver=replace(outcome.solver, x=np.array([-0.])))
     assert _pack_outcome(differing) is differing
+
+
+def test_large_decision_snapshot_shares_only_immutable_bytes():
+    from wholebodyx.mpc import PlanResult
+    from wholebodyx.process_mpc import _pack_outcome, _snapshot_solution
+    from wholebodyx.qp import QPResult
+
+    plan = JointPlan(np.zeros((201, 96)), np.zeros((200, 96)), 0., .02)
+    decision = np.zeros(200 * 96 * 2)
+    outcome = PlanResult(QPResult("solved", decision), plan)
+    packed = _pack_outcome(outcome)
+    assert decision.flags.writeable and not packed.solver.x.flags.writeable
+
+    # A read-only view of mutable storage still needs its own copy.
+    fallback = _snapshot_solution(packed.solver.x)
+    assert not np.shares_memory(fallback, decision)
+    decision[0] = 1.
+    assert fallback[0] == 0.
+
+    wire = pickle.loads(pickle.dumps(packed, protocol=5))
+    accepted = _snapshot_solution(wire.solver.x)
+    assert np.shares_memory(accepted, wire.solver.x)
+    assert accepted is not wire.solver.x
+    np.testing.assert_array_equal(accepted, decision)
+    with pytest.raises(ValueError):
+        accepted.setflags(write=True)
+
+    decision[-1] = np.nan
+    invalid = pickle.loads(pickle.dumps(packed, protocol=5))
+    with pytest.raises(ValueError, match="finite 1-D array"):
+        _snapshot_solution(invalid.solver.x)
 
 
 def test_compact_payload_plan_geometry_is_validated_in_the_relay():
