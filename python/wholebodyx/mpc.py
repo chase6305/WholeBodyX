@@ -175,13 +175,16 @@ def _check_plan_acceptance(plan, state, limits, control_dt):
     """Check a freshly constructed plan against the current execution context."""
     if plan.stamp != state.stamp:
         raise ValueError("planner returned a stale or future-dated plan")
-    if plan.positions.shape[1] != state.q.size or not np.allclose(
-        plan.positions[0], state.q, atol=1e-6, rtol=0
-    ):
+    tolerance = 1e-6
+    with np.errstate(over="ignore", invalid="ignore"):
+        starts_at_measured_state = (
+            plan.positions.shape[1] == state.q.size
+            and (np.abs(plan.positions[0] - state.q) <= tolerance).all()
+        )
+    if not starts_at_measured_state:
         raise ValueError("plan does not start at the supplied measured state")
     if plan.valid_until < state.stamp + control_dt:
         raise ValueError("plan does not cover the complete control interval")
-    tolerance = 1e-6
     if (
         np.any(plan.positions[1:] < limits.lower - tolerance)
         or np.any(plan.positions[1:] > limits.upper + tolerance)

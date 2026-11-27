@@ -106,6 +106,8 @@ Python 在直接求解后返回 OSQP 时，可复用同一工作区的原始和�
 
 六组对照的轨迹、求解器决策和接续采样逐位一致，独立检查的物理违反量为零。
 同一 native 稀疏 30 × 60 成功结果的管道载荷从 58,411 字节降至 43,850 字节。
+完整计划验收的起点比较直接应用 `1e-6` 绝对容差。30 × 60 同输入检查的线程 CPU 中位耗时
+约从 20.12 µs 降至 14.21 µs。
 
 ```bash
 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
