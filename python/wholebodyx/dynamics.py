@@ -7,13 +7,18 @@ implemented; the forward plant enforces the same persistent bilateral contacts.
 from pathlib import Path
 
 import numpy as np
-from ._solver_execution import OSQP_EXECUTION_LOCK
-
 import osqp
 from scipy import sparse
 
-from .qp import QPResult, QuadraticProgram
+from ._contact_qp import (
+    ACTIVE_TOLERANCE,
+    ScaledContactQP,
+    constraint_violation,
+    solve_contact_working_set,
+)
+from ._solver_execution import OSQP_EXECUTION_LOCK
 from .contact import ContactSpec
+from .qp import QPResult, QuadraticProgram
 from .dynamics_types import (
     CoMReference,
     ContactFormulation,
@@ -23,6 +28,11 @@ from .dynamics_types import (
     TorqueCommand,
 )
 from .types import positive
+
+
+_PHYSICAL_TOLERANCE = 1e-5
+_OSQP_MAX_ITERATIONS = 30000
+_OSQP_WORKING_SET_ITERATIONS = 600
 
 
 class FloatingBaseDynamics:
@@ -218,6 +228,7 @@ class ContactWBC:
     def reset(self):
         """Clear solver history and counters, retaining posture/contact anchors."""
         self.previous = None
+        self._last_dual = None
         self._solver = None
         self.solver_setups = 0
         self.solver_recoveries = 0
@@ -384,108 +395,160 @@ class ContactWBC:
             raise RuntimeError("dynamics WBC has inconsistent state/limit bounds")
         return ContactFormulation(problem, terms, contact_rhs)
 
+    def _prepare_osqp(self, problem, scaled, tolerance):
+        if self._solver is not None:
+            self._solver.update(
+                Px=scaled.hessian[self._p_pattern.indices, self._p_columns],
+                Ax=scaled.constraint[self._a_pattern.indices, self._a_columns],
+                q=scaled.gradient,
+                l=scaled.lower,
+                u=scaled.upper,
+            )
+            return
+
+        # Explicit zeros preserve the symbolic pattern as the robot moves.
+        nv, na = self.robot.nv, self.robot.na
+        decision_count = scaled.gradient.size
+        hessian_mask = np.eye(decision_count, dtype=bool)
+        hessian_mask[:nv, :nv] = np.triu(np.ones((nv, nv), dtype=bool))
+        constraint_mask = problem.constraint != 0
+        constraint_mask[:nv, :nv] = True
+        constraint_mask[:nv, nv + na :] = True
+        constraint_mask[nv : self._bounds_start, :nv] = True
+        self._p_pattern = sparse.csc_matrix(hessian_mask, dtype=float)
+        self._a_pattern = sparse.csc_matrix(constraint_mask, dtype=float)
+        self._p_columns = np.repeat(np.arange(decision_count), np.diff(self._p_pattern.indptr))
+        self._a_columns = np.repeat(np.arange(decision_count), np.diff(self._a_pattern.indptr))
+        self._p_pattern.data[:] = scaled.hessian[self._p_pattern.indices, self._p_columns]
+        self._a_pattern.data[:] = scaled.constraint[self._a_pattern.indices, self._a_columns]
+        self._solver = osqp.OSQP()
+        self._solver.setup(
+            P=self._p_pattern,
+            q=scaled.gradient,
+            A=self._a_pattern,
+            l=scaled.lower,
+            u=scaled.upper,
+            eps_abs=tolerance,
+            eps_rel=tolerance,
+            max_iter=_OSQP_MAX_ITERATIONS,
+            polishing=True,
+            verbose=False,
+            adaptive_rho_interval=200,
+            alpha=1.4,
+        )
+        self.solver_setups += 1
+
+    def _try_working_set(self, problem, scaled, dual_seed, iterations=0):
+        candidate = solve_contact_working_set(scaled, dual_seed)
+        if candidate is None:
+            return None
+        x, dual = candidate
+        physical = x * self._scale
+        violation = constraint_violation(problem.constraint, problem.lower, problem.upper, physical)
+        if not violation <= ACTIVE_TOLERANCE:
+            return None
+        return QPResult("solved", physical, iterations, violation, "working set"), dual
+
+    def _solve_osqp(self, problem, scaled):
+        for attempt in range(2):
+            self._prepare_osqp(problem, scaled, 1e-8 if attempt == 0 else 1e-9)
+            # Retain the accepted primal/dual pair while re-seeding adaptive rho.
+            self._solver.update_settings(rho=0.1)
+            if self.previous is not None:
+                self._solver.warm_start(x=self.previous / self._scale, y=self._last_dual)
+
+            prefix_iterations = 0
+            if self._last_dual is None:
+                with OSQP_EXECUTION_LOCK:
+                    result = self._solver.solve(raise_error=False)
+            else:
+                # When the previous working set is stale, get a new guess from
+                # a bounded ADMM run at the same solver tolerance. If polishing
+                # the guess fails, finish ADMM within the original budget.
+                self._solver.update_settings(max_iter=_OSQP_WORKING_SET_ITERATIONS)
+                try:
+                    with OSQP_EXECUTION_LOCK:
+                        result = self._solver.solve(raise_error=False)
+                    status = result.info.status_val
+                    if status in (2, 7):
+                        polished = self._try_working_set(
+                            problem, scaled, getattr(result, "y", None), result.info.iter
+                        )
+                        if polished is not None:
+                            return polished
+                    if status in (2, 4, 6, 7):
+                        prefix_iterations = result.info.iter
+                        self._solver.update_settings(max_iter=_OSQP_MAX_ITERATIONS - prefix_iterations)
+                        with OSQP_EXECUTION_LOCK:
+                            result = self._solver.solve(raise_error=False)
+                finally:
+                    self._solver.update_settings(max_iter=_OSQP_MAX_ITERATIONS)
+
+            status = result.info.status_val
+            violation = None
+            if status == 1:
+                if (
+                    result.x is None
+                    or np.shape(result.x) != scaled.gradient.shape
+                    or not np.isfinite(result.x).all()
+                ):
+                    self._solver = self.previous = self._last_dual = None
+                    raise RuntimeError("dynamics WBC returned an invalid solution")
+                physical = result.x * self._scale
+                violation = constraint_violation(
+                    problem.constraint, problem.lower, problem.upper, physical
+                )
+                if violation <= _PHYSICAL_TOLERANCE:
+                    dual = getattr(result, "y", None)
+                    if dual is None or dual.shape != scaled.lower.shape or not np.isfinite(dual).all():
+                        dual = None
+                    else:
+                        dual = dual.copy()
+                    return QPResult(
+                        "solved", physical, prefix_iterations + result.info.iter, violation,
+                        result.info.status,
+                    ), dual
+
+            # Inexact solves and physical violations get one fresh, stricter
+            # workspace. Hard failures leave no warm start to reuse.
+            self._solver = self.previous = self._last_dual = None
+            if attempt == 0 and (violation is not None or status in (2, 7)):
+                self.solver_recoveries += 1
+                continue
+            if violation is not None:
+                raise RuntimeError(f"dynamics WBC constraint violation: {violation}")
+            raise RuntimeError(f"dynamics WBC failed: {result.info.status}")
+
     def solve(self, state, target_com, dt=0.005, *, target_velocity=None, target_acceleration=None):
-        formulation = self.formulate(
+        problem, terms, contact_rhs = self.formulate(
             state,
             target_com,
             dt,
             target_velocity=target_velocity,
             target_acceleration=target_acceleration,
         )
-        problem, terms, contact_rhs = formulation
         robot = self.robot
         mass, bias, contact_jacobian = terms[:3]
-        nv, na, nc = robot.nv, robot.na, len(contact_jacobian)
-        decision_count = nv + na + nc
+        nv, na = robot.nv, robot.na
         # Scale accelerations, torques and wrenches into comparable QP units.
         scale = self._scale
         matrix = problem.constraint * scale
         row_scale = 1 / np.maximum(np.max(np.abs(matrix), axis=1), 1.0)
-        scaled_hessian = problem.hessian * scale[:, None] * scale
-        scaled_constraint = matrix * row_scale[:, None]
-        for attempt in range(2):
-            if self._solver is None:
-                # Explicit zeros preserve the symbolic pattern as the robot moves.
-                # Only the acceleration Hessian block is dense; all force/torque
-                # regularizers are diagonal. Constraint couplings stay fixed.
-                hessian_mask = np.eye(decision_count, dtype=bool)
-                hessian_mask[:nv, :nv] = np.triu(np.ones((nv, nv), dtype=bool))
-                constraint_mask = problem.constraint != 0
-                constraint_mask[:nv, :nv] = True
-                constraint_mask[:nv, nv + na :] = True
-                constraint_mask[nv : nv + nc, :nv] = True
-                self._p_pattern = sparse.csc_matrix(hessian_mask, dtype=float)
-                self._a_pattern = sparse.csc_matrix(constraint_mask, dtype=float)
-                self._p_columns = np.repeat(np.arange(decision_count), np.diff(self._p_pattern.indptr))
-                self._a_columns = np.repeat(np.arange(decision_count), np.diff(self._a_pattern.indptr))
-                self._p_pattern.data[:] = scaled_hessian[self._p_pattern.indices, self._p_columns]
-                self._a_pattern.data[:] = scaled_constraint[
-                    self._a_pattern.indices, self._a_columns
-                ]
-                self._solver = osqp.OSQP()
-                tolerance = 1e-8 if attempt == 0 else 1e-9
-                self._solver.setup(
-                    P=self._p_pattern,
-                    q=problem.gradient * scale,
-                    A=self._a_pattern,
-                    l=problem.lower * row_scale,
-                    u=problem.upper * row_scale,
-                    eps_abs=tolerance,
-                    eps_rel=tolerance,
-                    max_iter=30000,
-                    polishing=True,
-                    verbose=False,
-                    adaptive_rho_interval=200,
-                    alpha=1.4,
-                )
-                self.solver_setups += 1
-            else:
-                self._solver.update(
-                    Px=scaled_hessian[self._p_pattern.indices, self._p_columns],
-                    Ax=scaled_constraint[self._a_pattern.indices, self._a_columns],
-                    q=problem.gradient * scale,
-                    l=problem.lower * row_scale,
-                    u=problem.upper * row_scale,
-                )
-            # Do not inherit an extreme adaptive rho from the preceding robot
-            # configuration. Re-seed ADMM scaling while retaining the workspace
-            # and primal/dual warm start; physical acceptance thresholds stay fixed.
-            self._solver.update_settings(rho=0.1)
-            if self.previous is not None:
-                self._solver.warm_start(x=self.previous / scale)
-            with OSQP_EXECUTION_LOCK:
-                result = self._solver.solve(raise_error=False)
-            if result.info.status_val == 1:
-                if (
-                    result.x is None
-                    or np.shape(result.x) != (decision_count,)
-                    or not np.isfinite(result.x).all()
-                ):
-                    self._solver, self.previous = None, None
-                    raise RuntimeError("dynamics WBC returned an invalid solution")
-                physical = result.x * scale
-                evaluation = problem.constraint @ physical
-                violation = float(
-                    max(np.max(problem.lower - evaluation), np.max(evaluation - problem.upper), 0.0)
-                )
-                if violation <= 1e-5:
-                    break
-                # Scaled solver tolerances are not physical acceptance bounds.
-                # Refine once in a fresh workspace, retaining the same absolute
-                # limits; reject the step if the tighter solve still fails.
-                self._solver, self.previous = None, None
-                if attempt == 0:
-                    self.solver_recoveries += 1
-                    continue
-                raise RuntimeError(f"dynamics WBC constraint violation: {violation}")
-            self._solver, self.previous = None, None
-            if attempt == 0 and result.info.status_val in (2, 7):
-                self.solver_recoveries += 1
-                continue
-            raise RuntimeError(f"dynamics WBC failed: {result.info.status}")
+        scaled = ScaledContactQP(
+            problem.hessian * scale[:, None] * scale,
+            problem.gradient * scale,
+            matrix * row_scale[:, None],
+            problem.lower * row_scale,
+            problem.upper * row_scale,
+        )
+        candidate = self._try_working_set(problem, scaled, self._last_dual)
+        if candidate is None:
+            candidate = self._solve_osqp(problem, scaled)
+        result, dual = candidate
+        physical = result.x
         acceleration, torque, wrench = np.split(physical, [nv, nv + na])
         outcome = DynamicsControlResult(
-            solver=QPResult("solved", physical, result.info.iter, violation, result.info.status),
+            solver=result,
             command=TorqueCommand(torque, state.stamp, float(state.stamp) + float(dt)),
             acceleration=acceleration,
             wrench=wrench,
@@ -504,4 +567,5 @@ class ContactWBC:
             contact_residual=float(np.max(np.abs(contact_jacobian @ acceleration - contact_rhs))),
         )
         self.previous = physical.copy()
+        self._last_dual = dual
         return outcome
