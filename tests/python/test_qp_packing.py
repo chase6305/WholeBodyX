@@ -35,6 +35,28 @@ def test_same_count_position_exchange_rebuilds_the_index_template():
     assert_packing(_upper_csc(first, cache), first)
 
 
+def test_full_triangle_reuses_indices_and_rebuilds_when_an_entry_becomes_zero(monkeypatch):
+    cache = _UpperCSC()
+    h = np.array([[2., .1, .2], [.1, 3., -.3], [.2, -.3, 4.]])
+    assert_packing(_upper_csc(h, cache), h)
+    expected = sparse.csc_matrix(np.triu(2 * h))
+
+    def unexpected_triangle(*args, **kwargs):
+        raise AssertionError("the full upper triangle has no additional entries to check")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(np, "triu", unexpected_triangle)
+        actual = _upper_csc(2 * h, cache)
+    np.testing.assert_array_equal(actual.data, expected.data)
+    np.testing.assert_array_equal(actual.indices, expected.indices)
+    np.testing.assert_array_equal(actual.indptr, expected.indptr)
+
+    h[0, 1] = h[1, 0] = 0.
+    assert_packing(_upper_csc(h, cache), h)
+    h[0, 1] = h[1, 0] = .4
+    assert_packing(_upper_csc(h, cache), h)
+
+
 def test_cache_owns_immutable_metadata_separate_from_returned_csc():
     cache = _UpperCSC()
     h = np.diag([1., 2., 3.])

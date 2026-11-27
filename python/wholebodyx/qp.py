@@ -259,19 +259,25 @@ class _UpperCSC:
         self.shape = None
         self.rows = self.columns = self.indptr = None
         self._template = None
+        self._complete_triangle = False
 
     def convert(self, hessian):
-        triangle = np.triu(hessian)
-        if self.shape == hessian.shape:
-            values = triangle[self.rows, self.columns]
-            # Equal nnz and all old positions still nonzero prove that no
-            # position was removed or added, including same-count exchanges.
-            if np.count_nonzero(triangle) == values.size and (values != 0).all():
+        same_shape = self.shape == hessian.shape
+        # A full upper triangle cannot gain another entry. Gather its values
+        # directly, materializing the triangle only if a slot becomes zero.
+        triangle = None if same_shape and self._complete_triangle else np.triu(hessian)
+        if same_shape:
+            values = hessian[self.rows, self.columns]
+            if (values != 0).all() and (
+                triangle is None or np.count_nonzero(triangle) == values.size
+            ):
                 result = copy(self._template)
                 result.data = values
                 result.indices = self.rows.view()
                 result.indptr = self.indptr.view()
                 return result
+        if triangle is None:
+            triangle = np.triu(hessian)
         result = sparse.csc_matrix(triangle)
         columns = np.repeat(
             np.arange(hessian.shape[1], dtype=result.indices.dtype), np.diff(result.indptr)
@@ -285,6 +291,8 @@ class _UpperCSC:
         # Every returned matrix receives fresh values; none are retained here.
         self._template = sparse.csc_matrix(hessian.shape, dtype=hessian.dtype)
         self.shape = hessian.shape
+        rows, columns = self.shape
+        self._complete_triangle = rows == columns and result.nnz == rows * (rows + 1) // 2
         return result
 
 
@@ -455,8 +463,9 @@ class QPResult:
 
 
 def _validated_qp_solution(solution, constraint, lower, upper, *, iterations, detail):
-    values = constraint @ solution
-    if not np.isfinite(values).all():
+    # None denotes an exact identity constraint on an already validated solution.
+    values = solution if constraint is None else constraint @ solution
+    if constraint is not None and not np.isfinite(values).all():
         return QPResult("error", iterations=iterations, detail="nonfinite constraint evaluation")
     violation = float(max(
         (lower - values).max(initial=0),
@@ -468,6 +477,21 @@ def _validated_qp_solution(solution, constraint, lower, upper, *, iterations, de
             detail="solution exceeds absolute constraint tolerance",
         )
     return QPResult("solved", solution, iterations, violation, detail)
+
+
+def _is_identity_csc(matrix):
+    rows, columns = matrix.shape
+    return (
+        rows == columns
+        and matrix.nnz == rows
+        and (matrix.data == 1.).all()
+        and np.array_equal(matrix.indices, np.arange(rows))
+        and (np.diff(matrix.indptr) == 1).all()
+    )
+
+
+def _csc_pattern(matrix):
+    return matrix.shape, matrix.indptr.tobytes(), matrix.indices.tobytes()
 
 
 class QPSolver(Protocol):
@@ -561,10 +585,11 @@ class OSQPSolver:
         scale = self._variable_scaling
         if scale is not None and scale.shape != problem.gradient.shape:
             raise ValueError("variable scaling and QP dimensions differ")
+        lower, upper = problem.lower, problem.upper
         if (
-            (problem.lower > problem.upper).any()
-            or np.isposinf(problem.lower).any()
-            or np.isneginf(problem.upper).any()
+            (lower > upper).any()
+            or (lower == np.inf).any()
+            or (upper == -np.inf).any()
         ):
             return QPResult("infeasible", detail="inconsistent constraint bounds")
         if warm_start is not None:
@@ -642,9 +667,9 @@ class OSQPSolver:
                     or not np.isfinite(solver_constraint.data).all()
                 ):
                     raise ValueError("nonfinite scaled QP matrices")
-            pattern = tuple(
-                (matrix.shape, matrix.indptr.tobytes(), matrix.indices.tobytes())
-                for matrix in (solver_hessian, solver_constraint)
+            pattern = (
+                self._pattern[0] if same_hessian else _csc_pattern(solver_hessian),
+                self._pattern[1] if same_constraint else _csc_pattern(solver_constraint),
             )
 
         solver_gradient = problem.gradient
@@ -694,25 +719,29 @@ class OSQPSolver:
         if not same_constraint:
             self._constraint = _matrix_snapshot(problem.constraint, keys[1])
             self._sparse_constraint = solver_constraint
-            self._physical_constraint = physical_constraint
+            # Test the original A, since scaling can change the solver's A.
+            self._physical_constraint = (
+                None if _is_identity_csc(physical_constraint) else physical_constraint
+            )
             self._constraint_divisor = divisor
         self._matrix_keys = keys
         return solver_warm_start
 
     def _validate_result(self, problem, result):
         """Map solver coordinates to physical units and enforce acceptance."""
-        status = result.info.status.lower()
-        if result.info.status_val != 1 or result.x is None:
+        info = result.info
+        if info.status_val != 1 or result.x is None:
+            status = info.status.lower()
             if "infeasible" in status:
                 status = "infeasible"
             elif "maximum iterations" in status:
                 status = "iteration_limit"
             else:
                 status = "error"
-            return QPResult(status, iterations=result.info.iter, detail=result.info.status)
+            return QPResult(status, iterations=info.iter, detail=info.status)
         if np.shape(result.x) != problem.gradient.shape or not np.isfinite(result.x).all():
             return QPResult(
-                "error", iterations=result.info.iter, detail="invalid or nonfinite solution"
+                "error", iterations=info.iter, detail="invalid or nonfinite solution"
             )
         solution = result.x
         if self._variable_scaling is not None:
@@ -720,12 +749,12 @@ class OSQPSolver:
                 solution = result.x * self._variable_scaling
             if not np.isfinite(solution).all():
                 return QPResult(
-                    "error", iterations=result.info.iter, detail="nonfinite physical solution"
+                    "error", iterations=info.iter, detail="nonfinite physical solution"
                 )
         solution = array(solution, 1, "solution")
         return _validated_qp_solution(
             solution, self._physical_constraint, problem.lower, problem.upper,
-            iterations=result.info.iter, detail=result.info.status,
+            iterations=info.iter, detail=info.status,
         )
 
 
