@@ -5,7 +5,13 @@ import pytest
 
 pytest.importorskip("pinocchio")
 
-from wholebodyx.dynamics import ContactWBC, DynamicsState, DynamicsTerms, FloatingBaseDynamics
+from wholebodyx.dynamics import (
+    ContactWBC,
+    DynamicsState,
+    DynamicsTerms,
+    FloatingBaseDynamics,
+    _forward_full_rank_solution,
+)
 
 
 @pytest.fixture
@@ -36,6 +42,39 @@ def test_forward_dynamics_rejects_broadcastable_model_terms(robot_state, field, 
     monkeypatch.setattr(np.linalg, "lstsq", forbidden)
     with pytest.raises(ValueError, match="dynamics term dimensions"):
         robot.forward(state, np.zeros(robot.na), np.zeros(len(terms.contact_jacobian)), malformed)
+
+
+def test_forward_direct_solution_agrees_with_svd():
+    mass = np.diag([2.0, 1.0, 3.0])
+    jacobian = np.array([[1., 0., 1.], [0., 1., 0.]])
+    kkt = np.block([[mass, -jacobian.T], [jacobian, np.zeros((2, 2))]])
+    rhs = np.array([3., 2., 1., -.1, .2])
+    direct = _forward_full_rank_solution(kkt, rhs)
+    assert direct is not None
+    np.testing.assert_allclose(direct, np.linalg.lstsq(kkt, rhs, rcond=1e-10)[0], atol=1e-12)
+
+
+@pytest.mark.parametrize("epsilon", [0., 1e-6, 5e-5])
+def test_forward_retains_rank_aware_solve_for_dependent_contacts(robot_state, monkeypatch, epsilon):
+    robot, state = robot_state
+    jacobian = np.zeros((2, robot.nv))
+    jacobian[:, 0] = 1.
+    jacobian[1, 1] = epsilon
+    terms = robot.terms(state)._replace(
+        mass=np.eye(robot.nv), bias=np.zeros(robot.nv), contact_jacobian=jacobian,
+    )
+    solve = np.linalg.lstsq
+    observed = []
+
+    def record(matrix, rhs, *, rcond):
+        observed.append(rcond)
+        return solve(matrix, rhs, rcond=rcond)
+
+    monkeypatch.setattr(np.linalg, "lstsq", record)
+    acceleration, wrench = robot.forward(state, np.zeros(robot.na), [.2, .2], terms)
+    assert observed == [1e-10]
+    np.testing.assert_allclose(acceleration[:2], [.2, 0.], atol=1e-6)
+    assert np.all(np.isfinite(wrench))
 
 
 def test_formulation_does_not_advance_solver_and_owns_its_qp(robot_state):

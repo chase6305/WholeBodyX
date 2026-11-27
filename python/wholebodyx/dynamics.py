@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import osqp
 from scipy import sparse
+from scipy.linalg.lapack import dgesv
 
 from ._contact_qp import (
     ACTIVE_TOLERANCE,
@@ -33,6 +34,43 @@ from .types import positive
 _PHYSICAL_TOLERANCE = 1e-5
 _OSQP_MAX_ITERATIONS = 30000
 _OSQP_WORKING_SET_ITERATIONS = 600
+_FORWARD_RANK_CUTOFF = 1e-10
+
+
+def _forward_full_rank_solution(system, rhs):
+    if (
+        system.dtype != np.dtype(float) or rhs.dtype != np.dtype(float)
+        or not np.isfinite(system).all() or not np.isfinite(rhs).all()
+    ):
+        return None
+    dimension = rhs.size
+    # Use one LU factorization for the physical RHS and the inverse estimate.
+    inputs = np.eye(dimension, dimension + 1, k=1, order="F")
+    inputs[:, 0] = rhs
+    _, _, answer, status = dgesv(system, inputs, overwrite_b=True)
+    if status or not np.isfinite(answer).all():
+        return None
+    solution, inverse = answer[:, 0], answer[:, 1:]
+    with np.errstate(over="ignore", invalid="ignore"):
+        defect = system @ inverse
+        defect.flat[::dimension + 1] -= 1.0
+        defect_norm = np.linalg.norm(defect)
+        if not defect_norm <= 0.25:
+            return None
+        # For ||I - A X|| < 1, ||X|| / (1 - ||I - A X||) bounds
+        # ||A^-1||. Frobenius norms bound the corresponding spectral norms.
+        inverse_bound = np.linalg.norm(inverse) / (1.0 - defect_norm)
+        if not (
+            100 * _FORWARD_RANK_CUTOFF * np.linalg.norm(system) * inverse_bound < 1.0
+        ):
+            return None
+        residual = system @ solution - rhs
+        if not (
+            np.max(np.abs(residual)) <= _PHYSICAL_TOLERANCE
+            and inverse_bound * np.linalg.norm(residual) <= 1e-8
+        ):
+            return None
+    return solution.copy()
 
 
 class FloatingBaseDynamics:
@@ -150,14 +188,17 @@ class FloatingBaseDynamics:
         rhs = np.concatenate(
             (self.selection @ torque + external_force - bias, contact_acceleration)
         )
+        solution = _forward_full_rank_solution(system, rhs)
+        if solution is not None:
+            return solution[: self.nv], solution[self.nv :]
         # H1 has five joints per leg; the two six-axis constraints contain
         # a redundant row at symmetric poses. Acceleration is unique, while
         # internal contact wrench can be indeterminate. Use a rank-aware solve.
-        solution = np.linalg.lstsq(system, rhs, rcond=1e-10)[0]
+        solution = np.linalg.lstsq(system, rhs, rcond=_FORWARD_RANK_CUTOFF)[0]
         if not np.isfinite(solution).all():
             raise RuntimeError("nonfinite constrained forward dynamics")
         residual = system @ solution - rhs
-        if not np.isfinite(residual).all() or np.max(np.abs(residual)) > 1e-5:
+        if not np.isfinite(residual).all() or np.max(np.abs(residual)) > _PHYSICAL_TOLERANCE:
             raise RuntimeError("inconsistent constrained forward dynamics")
         return solution[: self.nv], solution[self.nv :]
 
