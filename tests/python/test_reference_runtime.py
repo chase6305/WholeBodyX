@@ -169,6 +169,20 @@ def test_manager_owns_adapter_plan_snapshot():
     np.testing.assert_array_equal(result.position, [0])
 
 
+@pytest.mark.parametrize("side", [-1., 1.])
+def test_plan_start_uses_the_absolute_tolerance_inclusively(side):
+    measured = at(0.)
+    boundary = side * 1e-6
+    beyond = side * np.nextafter(1e-6, np.inf)
+    for position, accepted in ((boundary, True), (beyond, False)):
+        plan = JointPlan([[position], [position]], [[0.]], 0., .1)
+        runtime = MPCReferenceManager(SimpleNamespace(solve=lambda *args: solved(plan)), bounds())
+        returned = runtime.update(measured, [.3], .02)
+        assert returned.success == accepted
+        if not accepted:
+            assert "does not start" in returned.solver.detail
+
+
 def test_single_precision_display_stamp_keeps_a_current_plan():
     planner = HoldPlanner()
     runtime = MPCReferenceManager(planner, bounds())

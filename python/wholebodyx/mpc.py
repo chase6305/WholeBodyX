@@ -132,7 +132,7 @@ class JointPlan:
             # Overflow must not make two inconsistent displacements compare
             # equal as infinities. Both temporary arrays are safe to reuse.
             with np.errstate(over="raise", invalid="raise"):
-                error = np.diff(positions, axis=0)
+                error = np.subtract(positions[1:], positions[:-1])
                 expected = self.dt * velocities
                 error -= expected
                 np.abs(error, out=error)
@@ -167,26 +167,35 @@ def _validated_joint_plan(plan, state, limits, control_dt):
     if not isinstance(plan, JointPlan):
         raise ValueError("planner must return a JointPlan value")
     plan = JointPlan(plan.positions, plan.velocities, plan.stamp, plan.dt)
+    _check_plan_acceptance(plan, state, limits, control_dt)
+    return plan
+
+
+def _check_plan_acceptance(plan, state, limits, control_dt):
+    """Check a freshly constructed plan against the current execution context."""
     if plan.stamp != state.stamp:
         raise ValueError("planner returned a stale or future-dated plan")
-    if plan.positions.shape[1] != state.q.size or not np.allclose(
-        plan.positions[0], state.q, atol=1e-6, rtol=0
-    ):
+    tolerance = 1e-6
+    with np.errstate(over="ignore", invalid="ignore"):
+        starts_at_measured_state = (
+            plan.positions.shape[1] == state.q.size
+            and (np.abs(plan.positions[0] - state.q) <= tolerance).all()
+        )
+    if not starts_at_measured_state:
         raise ValueError("plan does not start at the supplied measured state")
     if plan.valid_until < state.stamp + control_dt:
         raise ValueError("plan does not cover the complete control interval")
-    tolerance = 1e-6
     if (
-        np.any(plan.positions[1:] < limits.lower - tolerance)
-        or np.any(plan.positions[1:] > limits.upper + tolerance)
-        or np.any(np.abs(plan.velocities) > limits.velocity + tolerance)
+        (plan.positions[1:] < limits.lower - tolerance).any()
+        or (plan.positions[1:] > limits.upper + tolerance).any()
+        or (np.abs(plan.velocities) > limits.velocity + tolerance).any()
     ):
         raise ValueError("plan violates position or velocity limits")
     if limits.acceleration is not None:
         changes = _velocity_changes(plan.velocities, state.v)
-        if np.any(np.abs(changes) > limits.acceleration * plan.dt + tolerance):
+        np.abs(changes, out=changes)
+        if (changes > limits.acceleration * plan.dt + tolerance).any():
             raise ValueError("plan violates velocity-slew limits")
-    return plan
 
 
 @dataclass(frozen=True)

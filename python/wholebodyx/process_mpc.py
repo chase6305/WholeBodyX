@@ -5,19 +5,29 @@ pipe transfer or a held relay lock. Construction, wait_ready and close belong
 outside the control cycle. Python scheduling still prevents hard-RT guarantees.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import multiprocessing as mp
 from pathlib import Path
+import pickle
 import sys
 from threading import Condition, Event, Lock, Thread
 from time import perf_counter
+from typing import NamedTuple
 
 import numpy as np
 
-from .mpc import JointMPC, JointPlan, PlanResult, _MPCSettings, _time_window, _validated_joint_plan
-from .qp import QPResult, _immutable
-from .types import RobotState, _snapshot, positive
+from .mpc import (
+    JointMPC,
+    JointPlan,
+    PlanResult,
+    _check_plan_acceptance,
+    _MPCSettings,
+    _time_window,
+    _validated_joint_plan,
+)
+from .qp import QPResult, _immutable, _immutable_array_key
+from .types import JointLimits, RobotState, _snapshot, positive
 
 
 @dataclass(frozen=True)
@@ -33,6 +43,67 @@ class PlanningReply:
     goal: np.ndarray
     outcome: PlanResult
     solve_ms: float
+
+
+class _CompactPlan(NamedTuple):
+    solver: QPResult
+    positions: np.ndarray
+    stamp: float
+    dt: float
+    velocity_shape: tuple[int, int]
+
+
+_LARGE_DECISION_BYTES = 256 * 1024
+
+
+def _pack_outcome(outcome):
+    """Encode the velocity only once when both arrays contain the same bits."""
+    if not isinstance(outcome, PlanResult) or not isinstance(outcome.solver, QPResult):
+        return outcome
+    solver, plan = outcome.solver, outcome.plan
+    if not solver.success or not isinstance(plan, JointPlan):
+        return outcome
+    decision = solver.x
+    velocity = plan.velocities
+    if (
+        type(decision) is np.ndarray
+        and type(velocity) is np.ndarray
+        and decision.ndim == 1
+        and velocity.ndim == 2
+        and velocity.size
+        and decision.dtype == velocity.dtype == np.dtype(float)
+        and decision.size in (velocity.size, 2 * velocity.size)
+        and np.array_equal(
+            decision[-velocity.size:].reshape(velocity.shape).view(np.uint64),
+            velocity.view(np.uint64),
+        )
+    ):
+        if decision.nbytes >= _LARGE_DECISION_BYTES and decision.flags.c_contiguous:
+            # With protocol 5 a contiguous read-only view can arrive backed
+            # by bytes. The solver keeps its original array and flags.
+            decision = decision.view()
+            decision.setflags(write=False)
+            solver = replace(solver, x=decision)
+        return _CompactPlan(solver, plan.positions, plan.stamp, plan.dt, velocity.shape)
+    return outcome
+
+
+def _snapshot_solution(value):
+    """Validate the decision and reuse large bytes-backed buffers."""
+    if (
+        type(value) is np.ndarray
+        and not value.flags.writeable
+        and value.flags.c_contiguous
+        and value.flags.aligned
+        and value.nbytes >= _LARGE_DECISION_BYTES
+        and value.dtype == np.dtype(float)
+        and value.ndim == 1
+        and _immutable_array_key(value) is not None
+    ):
+        if not np.isfinite(value).all():
+            raise ValueError("worker solution must be a finite 1-D array")
+        return value.view()
+    return _snapshot(value, 1, "worker solution")
 
 
 def _child_main(connection, backend, settings):
@@ -96,7 +167,11 @@ def _child_main(connection, backend, settings):
                 outcome = planner.solve(RobotState(q, v, stamp), goal)
             except (ValueError, RuntimeError) as exc:
                 outcome = PlanResult(QPResult("error", detail=str(exc)[:1000]))
-            connection.send(("result", token, outcome, (perf_counter() - started) * 1000))
+            solve_ms = (perf_counter() - started) * 1000
+            message = ("result", token, _pack_outcome(outcome), solve_ms)
+            # Protocol 5 can serialize contiguous NumPy buffers with fewer
+            # copies while keeping the reply in a single pipe message.
+            connection.send_bytes(pickle.dumps(message, protocol=5))
     except (EOFError, BrokenPipeError, ConnectionError):
         pass
     except BaseException as exc:
@@ -175,10 +250,24 @@ class ProcessMPCWorker:
 
     @property
     def limits(self):
-        from .types import JointLimits
-
         limits = self._settings.limits
         return JointLimits(limits.lower, limits.upper, limits.velocity, limits.acceleration)
+
+    def _matches_plan_limits(self, limits):
+        """Check the limits used to validate replies before publishing them."""
+        if type(limits) is not JointLimits:
+            return False
+        checked = self._settings.limits
+        for name in ("lower", "upper", "velocity", "acceleration"):
+            actual, expected = getattr(limits, name), getattr(checked, name)
+            if actual is expected:
+                continue
+            if (
+                type(actual) is not np.ndarray or expected is None
+                or actual.dtype != expected.dtype or not np.array_equal(actual, expected)
+            ):
+                return False
+        return True
 
     horizon = property(lambda self: self._settings.horizon)
     backend = property(lambda self: self._backend)
@@ -277,7 +366,7 @@ class ProcessMPCWorker:
         self.cancel()
 
     def _snapshot(self, outcome, state):
-        if not isinstance(outcome, PlanResult) or not isinstance(outcome.solver, QPResult):
+        if not isinstance(outcome, (PlanResult, _CompactPlan)) or not isinstance(outcome.solver, QPResult):
             raise ValueError("worker returned an invalid planning result")
         result = outcome.solver
         if not result.success:
@@ -289,12 +378,23 @@ class ProcessMPCWorker:
                     detail=result.detail,
                 )
             )
-        size = self.horizon * state.q.size * (2 if "sparse" in self.backend else 1)
-        x = _snapshot(result.x, 1, "worker solution")
-        if x.shape != (size,) or outcome.plan is None:
+        shape = (self.horizon, state.q.size)
+        velocity_count = shape[0] * shape[1]
+        size = velocity_count * (2 if "sparse" in self.backend else 1)
+        x = _snapshot_solution(result.x)
+        if x.shape != (size,):
             raise ValueError("worker returned an invalid solution shape or missing plan")
-        plan = _validated_joint_plan(outcome.plan, state, self._settings.limits, self.dt)
-        if plan.velocities.shape != (self.horizon, state.q.size) or plan.dt != self.dt:
+        if isinstance(outcome, _CompactPlan):
+            if outcome.velocity_shape != shape:
+                raise ValueError("worker returned a different planning model")
+            velocities = x[-velocity_count:].reshape(shape)
+            plan = JointPlan(outcome.positions, velocities, outcome.stamp, outcome.dt)
+            _check_plan_acceptance(plan, state, self._settings.limits, self.dt)
+        else:
+            if outcome.plan is None:
+                raise ValueError("worker returned an invalid solution shape or missing plan")
+            plan = _validated_joint_plan(outcome.plan, state, self._settings.limits, self.dt)
+        if plan.velocities.shape != shape or plan.dt != self.dt:
             raise ValueError("worker returned a different planning model")
         return PlanResult(
             QPResult("solved", x, result.iterations, result.violation, result.detail), plan
@@ -337,6 +437,9 @@ class ProcessMPCWorker:
                                 self._reply = reply
                             else:
                                 self._counts["discarded"] += 1
+                        # The mailbox now owns the accepted reply. Release
+                        # the wire data and local references before idling.
+                        del message, outcome, reply
                         sent = None
                     else:
                         raise ValueError("unexpected planner worker message")
