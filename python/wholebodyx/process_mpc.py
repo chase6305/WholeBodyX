@@ -93,6 +93,8 @@ def _snapshot_solution(value):
     if (
         type(value) is np.ndarray
         and not value.flags.writeable
+        and value.flags.c_contiguous
+        and value.flags.aligned
         and value.nbytes >= _LARGE_DECISION_BYTES
         and value.dtype == np.dtype(float)
         and value.ndim == 1

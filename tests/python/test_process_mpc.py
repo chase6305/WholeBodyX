@@ -213,6 +213,11 @@ def test_large_decision_snapshot_shares_only_immutable_bytes():
     with pytest.raises(ValueError):
         accepted.setflags(write=True)
 
+    reversed_decision = accepted[::-1]
+    contiguous = _snapshot_solution(reversed_decision)
+    assert contiguous.flags.c_contiguous and not np.shares_memory(contiguous, accepted)
+    np.testing.assert_array_equal(contiguous, reversed_decision)
+
     decision[-1] = np.nan
     invalid = pickle.loads(pickle.dumps(packed, protocol=5))
     with pytest.raises(ValueError, match="finite 1-D array"):
