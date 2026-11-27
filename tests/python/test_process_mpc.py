@@ -210,7 +210,7 @@ def test_reference_receipt_reuses_only_applicable_relay_validation(case, monkeyp
         manager = AsyncMPCReferenceManager(worker, lookahead=.2)
         state = RobotState(np.zeros(3), np.zeros(3))
         goal = np.full(3, .3)
-        seed = JointPlan(np.zeros((9, 3)), np.zeros((8, 3)), 0., .1)
+        seed = JointPlan(np.zeros((21, 3)), np.zeros((20, 3)), 0., .1)
         manager.seed(seed, state, goal, .02)
         assert manager.update(state, goal, .02).success
         deadline = time.monotonic() + 3.

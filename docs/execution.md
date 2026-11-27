@@ -103,6 +103,8 @@ PYTHONPATH=build/native uv run --extra urdf python examples/python/urdf_tracking
 `ProcessMPCWorker` 在 `spawn` 子进程中运行内置 `python`、`native`、`sparse`
 或 `native-sparse` 关节规划器。父进程的 relay 线程负责全部管道收发、结果快照和物理校验；
 控制线程的 `submit/poll/cancel` 不等待管道、求解器或被占用的 relay 锁。
+速度轨迹和求解器决策中的速度分量逐位一致时，子进程只发送一份速度数据。
+relay 重建速度轨迹并验收其维度、积分、边界和速度变化率。
 每个 worker 最多保留一个在算请求、一个可替换的待算请求和一个最新完成结果。
 输入复制后独立保存；目标更新和复位通过 generation/sequence 隔离旧结果。
 `cancel/reset` 隔离结果，不抢占正在执行的优化；需要中止求解时，在控制周期外关闭并重建 worker。
@@ -110,6 +112,8 @@ PYTHONPATH=build/native uv run --extra urdf python examples/python/urdf_tracking
 会收到 worker 错误并锁存故障。
 
 `AsyncMPCReferenceManager` 预测当前有效轨迹在 `lookahead` 之后的状态，并提交该未来状态。
+标准进程 worker 的回复可直接移交其已验收的轨迹快照。控制线程核对请求、验收时使用的限位
+和当前控制区间。使用自定义 worker、替换轮询方法或变更限位时，控制线程对回复执行完整验收。
 
 ```mermaid
 flowchart LR

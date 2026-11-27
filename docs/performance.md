@@ -91,6 +91,32 @@ Python 在直接求解后返回 OSQP 时，可复用同一工作区的原始和�
 新请求会通知空闲的 relay 线程立即发送。提交端在原有 mailbox 锁内发出通知，
 空闲检查进程状态的周期不再决定请求发送时间。
 
+异步接续基准使用真实子进程，先等待回复进入完成槽，再从控制线程调用
+`AsyncMPCReferenceManager.update()`，记录接收和采用合计耗时。以 `41d6b3a` 为基线，
+单逻辑核、单线程 BLAS，每组交替运行五轮，每轮 240 次接续，取各轮分位数的中位数。
+
+| 规划后端与规模 | 接续线程 CPU P50（µs） | 接续线程 CPU P99（µs） |
+| --- | ---: | ---: |
+| Python 消元，3 关节 × 20 步 | 58.98 → 25.96 | 65.14 → 29.94 |
+| native 消元，6 × 30 | 60.67 → 25.67 | 69.97 → 31.11 |
+| Python 稀疏，30 × 60 | 76.27 → 30.28 | 96.89 → 59.39 |
+| native 稀疏，30 × 60 | 77.67 → 29.68 | 111.23 → 49.98 |
+| native 稀疏，60 × 100 | 103.38 → 34.04 | 181.62 → 76.90 |
+| native 稀疏，96 × 200 | 203.96 → 53.47 | 333.90 → 84.57 |
+
+六组对照的轨迹、求解器决策和接续采样逐位一致，独立检查的物理违反量为零。
+同一 native 稀疏 30 × 60 成功结果的管道载荷从 58,411 字节降至 43,850 字节。
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
+  PYTHONPATH=python:build/native .venv/bin/python scripts/benchmark_async_reference.py \
+  --backend native-sparse --joints 60 --horizon 100 --samples 240 \
+  --output /tmp/wbx-async-adoption.json
+```
+
+将 `PYTHONPATH` 的 Python 包目录指向基线工作区，可用同一入口测量基线。
+报告记录实际加载的子进程源码、解的哈希、物理违反量和控制线程分位数。
+
 `CoMPreviewMPC` 默认先尝试固定代价的无约束极小值。一次缓存 Cholesky 分解后，
 每次只求解动态梯度对应的线性系统；候选值按原 QP 上下界逐值比较，不增加可行性松弛，
 并对返回轨迹独立检查 Bernstein 区间约束与终端捕获点。候选不可行时继续使用 OSQP。
