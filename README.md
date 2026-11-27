@@ -3,6 +3,15 @@
 C++ 与 Python 均可实现控制器和规划器的机器人控制框架。
 以独立算法库、统一接口和机器人适配为边界，支持逐步接入自有 WBC/MPC 仓库。
 
+## 演示
+
+| 双臂 MPC 扰动恢复 | Unitree H1 弯腰拾取 |
+| --- | --- |
+| ![平面双臂在关节位置突然偏移后重新规划并恢复目标跟踪](docs/assets/demo-dual-arm-mpc-recovery.gif) | ![Unitree H1 弯腰接近台上的方块，拾起后回到直立姿态](docs/assets/demo-h1-kinematic-pickup.gif) |
+| 两次关节位置偏移会触发重新规划，黄色轨迹显示 MPC 预测。[运行示例](examples/README.md#浏览器演示) | 运动学演示中，方块在虚拟抓取后变绿并随手抬起。[运行示例](docs/h1_example.md#弯腰拾取并恢复) |
+
+## 文档
+
 - [功能、接口和算法设计](docs/design.md)
 - [开源仓库参考与取舍](docs/open_source_references.md)
 - [可视化工具与操作](docs/visualization.md)
