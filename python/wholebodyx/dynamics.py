@@ -146,7 +146,8 @@ class FloatingBaseDynamics:
         )
         com = pin.centerOfMass(model, data, q, v, np.zeros(model.nv)).copy()
         com_velocity, com_drift = data.vcom[0].copy(), data.acom[0].copy()
-        com_jacobian = pin.jacobianCenterOfMass(model, data, q).copy()
+        # The CoM evaluation has already computed kinematics at q.
+        com_jacobian = pin.jacobianCenterOfMass(model, data).copy()
         return DynamicsTerms(
             mass,
             bias,
