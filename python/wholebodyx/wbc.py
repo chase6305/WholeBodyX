@@ -115,15 +115,17 @@ class KinematicWBC:
         problem = self.formulate(state, tasks, dt)
         result = self.solver.solve(problem)
         if result.success:
+            decision = np.asarray(result.x)
             if (
-                np.shape(result.x) != state.q.shape
-                or np.iscomplexobj(result.x)
-                or not np.isfinite(result.x).all()
+                decision.shape != state.q.shape
+                or decision.dtype.kind == "c"
+                or not np.isfinite(decision).all()
             ):
                 return ControlResult(
                     QPResult("error", iterations=result.iterations, detail="invalid WBC solution")
                 )
-            if np.any(problem.lower > problem.upper):
+            lower, upper = problem.lower, problem.upper
+            if (lower > upper).any():
                 return ControlResult(
                     QPResult(
                         "error",
@@ -134,9 +136,9 @@ class KinematicWBC:
             # OSQP accepts tiny feasibility residuals. Normalize only those
             # residuals to the exact box before integrating a command, so an
             # active braking bound remains feasible on the next cycle.
-            velocity = np.clip(result.x, problem.lower, problem.upper)
-            if not np.array_equal(velocity, result.x):
-                correction = float(np.abs(velocity - result.x).max())
+            if (decision < lower).any() or (decision > upper).any():
+                velocity = np.clip(decision, lower, upper)
+                correction = float(np.abs(velocity - decision).max())
                 if correction > 1e-6:
                     return ControlResult(
                         QPResult(

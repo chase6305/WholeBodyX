@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .model import Pose
-from .tasks import FramePoseTask, PostureTask
+from .tasks import FramePoseTask, PostureTask, _linearize_frame_poses
 from .types import LinearTask
 
 INITIAL_Q = (0.2, 0.6, -0.4, -0.2, -0.6, 0.4)
@@ -59,16 +59,18 @@ def reference(model, scenario, goal, stamp):
     """Eight-second Cartesian circles or a finite, two-event target schedule."""
     q = reference_configuration(model, scenario, goal, stamp)
     poses = tuple(model.pose(q, frame) for frame in FRAMES)
-    twists = (np.zeros(6), np.zeros(6))
-    if scenario in ("cartesian_circle", "coordination"):
-        omega, radius = 2 * np.pi / 8, 0.025
-        angle = omega * stamp
-        delta = radius * np.array([np.cos(angle) - 1, np.sin(angle), 0])
-        velocity = radius * omega * np.array([-np.sin(angle), np.cos(angle), 0])
-        signs = (1, -1) if scenario == "cartesian_circle" else (1, 1)
-        poses = tuple(Pose(p.translation + delta * [1, sign, 1], p.rotation)
-                      for p, sign in zip(poses, signs))
-        twists = tuple(np.r_[velocity * [1, sign, 1], np.zeros(3)] for sign in signs)
+    if scenario not in ("cartesian_circle", "coordination"):
+        return Reference(q, poses, (np.zeros(6), np.zeros(6)))
+
+    omega, radius = 2 * np.pi / 8, 0.025
+    angle = omega * stamp
+    cosine, sine = np.cos(angle), np.sin(angle)
+    delta = radius * np.array([cosine - 1, sine, 0])
+    vx, vy = -radius * omega * sine, radius * omega * cosine
+    signs = (1, -1) if scenario == "cartesian_circle" else (1, 1)
+    poses = tuple(Pose(p.translation + delta * [1, sign, 1], p.rotation)
+                  for p, sign in zip(poses, signs))
+    twists = tuple(np.array([vx, sign * vy, 0., 0., 0., 0.]) for sign in signs)
     return Reference(q, poses, twists)
 
 
@@ -88,7 +90,8 @@ def wbc_tasks(model, state, scenario, target):
             LinearTask(jacobians[1] - jacobians[0], 4 * relative_error, weight=20),
             PostureTask(target.q, weight=1e-5).linearize(model, state),
         ]
-    return [FramePoseTask(frame, pose, feedforward=twist).linearize(model, state)
-            for frame, pose, twist in zip(FRAMES, target.poses, target.twists)] + [
+    frame_tasks = [FramePoseTask(frame, pose, feedforward=twist)
+                   for frame, pose, twist in zip(FRAMES, target.poses, target.twists)]
+    return _linearize_frame_poses(model, state, frame_tasks) + [
         PostureTask(target.q, weight=1e-5 if scenario == "cartesian_circle" else 1e-3).linearize(model, state)
     ]

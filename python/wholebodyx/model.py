@@ -1,6 +1,7 @@
 """World-aligned [linear; angular] Jacobians and fixed-base model adapters."""
 
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from typing import Protocol
 
@@ -27,6 +28,23 @@ class Pose:
             raise ValueError("rotation must belong to SO(3)")
         object.__setattr__(self, "translation", translation)
         object.__setattr__(self, "rotation", rotation)
+
+    @classmethod
+    def _from_planar(cls, translation, cosine, sine):
+        """Build a pose from an owned translation and a single angle's trig values."""
+        if not np.isfinite(translation).all():
+            raise ValueError("translation must be a finite 1-D array")
+        if not isfinite(cosine) or not isfinite(sine):
+            raise ValueError("rotation must be a finite 2-D array")
+        rotation = np.array(
+            [[cosine, -sine, 0.], [sine, cosine, 0.], [0., 0., 1.]]
+        )
+        translation.setflags(write=False)
+        rotation.setflags(write=False)
+        pose = object.__new__(cls)
+        object.__setattr__(pose, "translation", translation)
+        object.__setattr__(pose, "rotation", rotation)
+        return pose
 
 
 class RobotModel(Protocol):
@@ -60,15 +78,12 @@ class PlanarDualArm:
         theta, offset = self._chain(q, frame)
         cosine, sine = np.cos(theta), np.sin(theta)
         translation = np.array(
-            [self.lengths @ cosine, self.lengths @ sine + (0.4 if offset == 0 else -0.4), 0.0]
+            [self.lengths @ cosine, self.lengths @ sine + (0.4 if offset == 0 else -0.4), 0.0],
+            dtype=float,
         )
         # All joints rotate around world Z. Reuse the terminal sine/cosine
         # already evaluated for translation instead of a general rotvec conversion.
-        terminal_cosine, terminal_sine = cosine[-1], sine[-1]
-        return Pose(
-            translation,
-            [[terminal_cosine, -terminal_sine, 0], [terminal_sine, terminal_cosine, 0], [0, 0, 1]],
-        )
+        return Pose._from_planar(translation, cosine[-1], sine[-1])
 
     def translations(self, configurations, frame):
         """Batch end-effector positions for an (N, 6) trajectory, including N=0.
@@ -122,28 +137,40 @@ class PinocchioModel:
             self._model.velocityLimit,
         )
 
-    def _prepare(self, q, frame):
+    def _configuration(self, q):
         q = array(q, 1, "q")
         if q.size != self._model.nq:
             raise ValueError("configuration dimensions differ")
+        return q
+
+    def _frame_id(self, frame):
         frame_id = self._frame_ids.get(frame)
         if frame_id is None:
             if not self._model.existFrame(frame):
                 raise ValueError(f"unknown frame: {frame}")
             frame_id = self._model.getFrameId(frame)
             self._frame_ids[frame] = frame_id
-        return q, frame_id
+        return frame_id
 
-    def pose(self, q, frame):
-        q, frame_id = self._prepare(q, frame)
-        self._pin.forwardKinematics(self._model, self._data, q)
-        # Only the requested frame is consumed. Joint FK remains current;
-        # avoid refreshing every auxiliary frame in a large URDF.
+    def _pose_from_fk(self, frame_id):
         placement = self._pin.updateFramePlacement(self._model, self._data, frame_id)
         return Pose(placement.translation, placement.rotation)
 
+    def pose(self, q, frame):
+        q, frame_id = self._configuration(q), self._frame_id(frame)
+        self._pin.forwardKinematics(self._model, self._data, q)
+        return self._pose_from_fk(frame_id)
+
+    def poses(self, q, frames):
+        """Snapshot the requested frames in order after one joint FK pass."""
+        q = self._configuration(q)
+        frame_ids = tuple(map(self._frame_id, frames))
+        if frame_ids:
+            self._pin.forwardKinematics(self._model, self._data, q)
+        return tuple(map(self._pose_from_fk, frame_ids))
+
     def jacobian(self, q, frame):
-        q, frame_id = self._prepare(q, frame)
+        q, frame_id = self._configuration(q), self._frame_id(frame)
         return np.array(
             self._pin.computeFrameJacobian(
                 self._model, self._data, q, frame_id, self._pin.ReferenceFrame.LOCAL_WORLD_ALIGNED

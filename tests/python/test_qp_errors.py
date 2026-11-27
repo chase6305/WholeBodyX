@@ -53,3 +53,15 @@ def test_missing_osqp_exception_export_does_not_mask_validation_errors(monkeypat
     assert solver._solver is workspace
     problem.hessian[0, 0] = 1.
     assert solver.solve(problem).success
+
+
+@pytest.mark.parametrize("bound", [-np.inf, np.inf])
+def test_equal_infinite_endpoints_are_infeasible_without_touching_the_workspace(bound):
+    solver = OSQPSolver()
+    unbounded = QuadraticProgram([[1.]], [-.2], [[1.]], [-np.inf], [np.inf])
+    assert solver.solve(unbounded).success
+    workspace = solver._solver
+    impossible = QuadraticProgram([[1.]], [-.2], [[1.]], [bound], [bound])
+    assert solver.solve(impossible).status == "infeasible"
+    assert solver._solver is workspace
+    np.testing.assert_allclose(solver.solve(unbounded).x, [.2], atol=1e-7)

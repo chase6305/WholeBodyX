@@ -190,21 +190,26 @@ def test_shifted_warm_start_matches_plan_and_is_isolated(planner_name, elapsed, 
     np.testing.assert_array_equal(first.velocities, original)
 
 
-def test_sparse_feasibility_check_uses_updated_constraint(monkeypatch):
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("scale", [None, [.25]])
+def test_sparse_feasibility_check_uses_updated_constraint(monkeypatch, normalize, scale):
     from types import SimpleNamespace
 
-    solver = OSQPSolver()
+    solver = OSQPSolver(normalize_constraints=normalize, variable_scaling=scale)
     first = QuadraticProgram([[1]], [0], [[1]], [-1], [1])
     assert solver.solve(first).success
     # Force an allegedly solved result that violates the updated A, but would
     # satisfy the old A. The independent feasibility check must reject it.
     info = SimpleNamespace(status="solved", status_val=1, iter=1)
+    solver_x = .75 if scale is None else .75 / scale[0]
     monkeypatch.setattr(solver._solver, "solve",
-                        lambda **kwargs: SimpleNamespace(info=info, x=np.array([.75])))
+                        lambda **kwargs: SimpleNamespace(info=info, x=np.array([solver_x])))
+    assert solver.solve(first).violation == 0.
     updated = QuadraticProgram([[1]], [0], [[2]], [-1], [1])
     result = solver.solve(updated)
     assert result.status == "error"
     assert result.violation == pytest.approx(.5)
+    assert solver.solve(first).violation == 0.
     solver.reset()
     assert solver.solve(updated).success
 

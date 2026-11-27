@@ -44,6 +44,41 @@ def test_planar_pose_matches_general_axis_angle_rotation(frame, offset):
         np.testing.assert_allclose(pose.translation, model.translations(q[None], frame)[0], atol=1e-14)
 
 
+def test_planar_pose_owns_finite_float64_arrays():
+    model = PlanarDualArm()
+    model.lengths = model.lengths.astype(np.longdouble)
+    first, second = (model.pose(np.zeros(6), "left_ee") for _ in range(2))
+    for field in ("translation", "rotation"):
+        values = getattr(first, field)
+        assert values.dtype == np.dtype(float)
+        assert not values.flags.writeable
+        assert not np.shares_memory(values, getattr(second, field))
+
+    with np.errstate(over="ignore", invalid="ignore"), pytest.raises(ValueError, match="finite"):
+        model.pose(np.full(6, 1e308), "left_ee")
+
+
+def test_batched_frame_tasks_match_individual_linearization():
+    from wholebodyx.tasks import FramePoseTask, _linearize_frame_poses
+
+    model = PlanarDualArm()
+    state = RobotState(np.zeros(6), np.zeros(6))
+    target = np.array([np.pi - 1e-8, 0., 0., -np.pi + 1e-8, 0., 0.])
+    left, right = "left_ee", "right_ee"
+    tasks = [
+        FramePoseTask(left, model.pose(target, left), gain=2., feedforward=np.arange(6) * .01),
+        FramePoseTask(right, model.pose(target, right), weight=np.arange(1., 7.)),
+    ]
+    batch = _linearize_frame_poses(model, state, tasks)
+    assert len(batch) == len(tasks)
+    for actual, task in zip(batch, tasks):
+        expected = task.linearize(model, state)
+        np.testing.assert_array_equal(actual.jacobian, expected.jacobian)
+        np.testing.assert_array_equal(actual.weight, expected.weight)
+        np.testing.assert_allclose(actual.target_velocity, expected.target_velocity, atol=1e-14, rtol=0)
+    assert _linearize_frame_poses(model, state, []) == []
+
+
 def test_pose_rotation_validation_matches_existing_tolerances():
     from wholebodyx.model import Pose
 
@@ -169,6 +204,39 @@ def test_urdf_jacobian_result_isolated_from_workspace_and_borrowed_views(monkeyp
     assert not np.shares_memory(returned, borrowed)
     returned[:] = -1
     np.testing.assert_array_equal(borrowed, original)
+
+
+def test_urdf_batch_poses_share_one_fk_pass_and_own_their_outputs(monkeypatch):
+    pytest.importorskip("pinocchio")
+    path = Path(__file__).resolve().parents[2] / "examples/models/planar_arm.urdf"
+    model = PinocchioModel(path)
+    q = np.linspace(.1, .5, model._model.nq)
+    frames = ("tool", "base", "tool")
+    expected = [model.pose(q, frame) for frame in frames]
+    original, calls = model._pin.forwardKinematics, []
+
+    def forward(*args):
+        calls.append(1)
+        return original(*args)
+
+    monkeypatch.setattr(model._pin, "forwardKinematics", forward)
+    actual = model.poses(q, iter(frames))
+    assert calls == [1]
+    moved = model.poses(q + .2, ("tool",))[0]
+    assert calls == [1, 1]
+    assert not np.array_equal(actual[0].translation, moved.translation)
+    for pose, reference in zip(actual, expected):
+        np.testing.assert_array_equal(pose.translation, reference.translation)
+        np.testing.assert_array_equal(pose.rotation, reference.rotation)
+    assert not np.shares_memory(actual[0].rotation, actual[2].rotation)
+    assert not np.shares_memory(actual[0].translation, actual[2].translation)
+
+    assert model.poses(q, ()) == ()
+    with pytest.raises(ValueError, match="unknown frame"):
+        model.poses(q, ("tool", "unknown"))
+    with pytest.raises(ValueError, match="finite"):
+        model.poses(np.full_like(q, np.nan), ("tool",))
+    assert calls == [1, 1]
 
 
 @pytest.mark.parametrize("mpc", [False, True])
