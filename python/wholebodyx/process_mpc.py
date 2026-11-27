@@ -410,6 +410,9 @@ class ProcessMPCWorker:
                                 self._reply = reply
                             else:
                                 self._counts["discarded"] += 1
+                        # The mailbox now owns the accepted reply. Release
+                        # the wire data and local references before idling.
+                        del message, outcome, reply
                         sent = None
                     else:
                         raise ValueError("unexpected planner worker message")

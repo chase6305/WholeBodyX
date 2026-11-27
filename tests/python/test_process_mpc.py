@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from threading import Condition, Event
 import time
+from weakref import ref
 
 import numpy as np
 import pytest
@@ -200,6 +201,33 @@ def test_compact_payload_plan_geometry_is_validated_in_the_relay():
         positions[1:] = .05
         with pytest.raises(ValueError, match="integrator dynamics"):
             worker._snapshot(plan._replace(positions=positions, velocity_shape=(5, 3)), state)
+
+
+def test_idle_relay_releases_wire_and_consumed_reply_buffers(monkeypatch):
+    with ProcessMPCWorker(limits(), horizon=5) as worker:
+        snapshot = worker._snapshot
+        buffers = []
+
+        def record_buffers(outcome, state):
+            accepted = snapshot(outcome, state)
+            buffers.extend((ref(outcome.solver.x), ref(accepted.plan.positions)))
+            return accepted
+
+        monkeypatch.setattr(worker, "_snapshot", record_buffers)
+        state = RobotState(np.zeros(3), np.zeros(3))
+        deadline = time.monotonic() + 3.
+        token = None
+        while token is None and time.monotonic() < deadline:
+            token = worker.submit(state, [.01] * 3)
+            if token is None:
+                time.sleep(.001)
+        assert token is not None
+        reply = receive(worker, timeout=3.)
+        assert reply.token == token and len(buffers) == 2
+        del reply
+        while any(buffer() is not None for buffer in buffers) and time.monotonic() < deadline:
+            time.sleep(.001)
+        assert all(buffer() is None for buffer in buffers)
 
 
 @pytest.mark.parametrize("case", ["transfer", "limits", "interval", "replaced_poll"])
