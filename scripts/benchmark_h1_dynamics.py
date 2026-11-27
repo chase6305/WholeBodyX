@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -62,7 +63,8 @@ def _compatible_classes(implementation):
     return CompatibleRobot, controller_class
 
 
-def benchmark(steps=1600, repeats=3, reference=None, *, controller="wbc", amplitude=.035, push_force=0.):
+def benchmark(steps=1600, repeats=3, reference=None, *, controller="wbc", amplitude=.035,
+              push_force=0., motion="shift"):
     if steps < 1 or repeats < 1:
         raise ValueError("steps and repeats must be positive")
     import wholebodyx.dynamics as current
@@ -78,7 +80,9 @@ def benchmark(steps=1600, repeats=3, reference=None, *, controller="wbc", amplit
         for name in order:
             implementation = implementations[name]
             demo.FloatingBaseDynamics, demo.ContactWBC = _compatible_classes(implementation)
-            session = demo.DynamicsDemo(controller=controller, amplitude=amplitude, push_force=push_force)
+            session = demo.DynamicsDemo(
+                controller=controller, amplitude=amplitude, push_force=push_force, motion=motion
+            )
             latency, torque, configurations = [], [], []
             started = time.perf_counter()
             for _ in range(steps):
@@ -88,22 +92,30 @@ def benchmark(steps=1600, repeats=3, reference=None, *, controller="wbc", amplit
                 torque.append(session.controller.previous[session.robot.nv:session.robot.nv + session.robot.na].copy())
                 configurations.append(session.state.q.copy())
             elapsed = time.perf_counter() - started
+            latency = np.asarray(latency)
             results[name].append(dict(wall_s=elapsed, mean_step_ms=float(np.mean(latency)),
+                                      p50_step_ms=float(np.median(latency)),
                                       p95_step_ms=float(np.percentile(latency, 95)),
                                       p99_step_ms=float(np.percentile(latency, 99)),
                                       max_step_ms=float(np.max(latency)),
+                                      steps_over_dt=int(np.count_nonzero(latency > session.dt * 1000)),
                                       solver_recoveries=getattr(session.controller, "solver_recoveries", 0),
                                       solver_setups=getattr(session.controller, "solver_setups", steps),
                                       max_contact_error_m=session.max_contact_error,
+                                      max_constraint_violation=session.max_violation,
                                       max_dynamics_residual=session.max_dynamics_residual))
             traces[name] = (np.asarray(torque), np.asarray(configurations))
         if reference is not None:
             torque_differences.append(float(np.max(np.abs(traces["current"][0] - traces["reference"][0]))))
             configuration_differences.append(float(np.max(np.abs(traces["current"][1] - traces["reference"][1]))))
-    report = dict(steps=steps, repeats=repeats, controller=controller, amplitude_m=amplitude,
+    report = dict(steps=steps, repeats=repeats, controller=controller, motion=motion, amplitude_m=amplitude,
                   push_force_n=push_force, results=results,
                   dynamics_sha256={name: hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
                                    for name, module in implementations.items()})
+    if hasattr(os, "sched_getaffinity"):
+        report["cpu_affinity"] = sorted(os.sched_getaffinity(0))
+    from wholebodyx import _contact_qp
+    report["contact_qp_sha256"] = hashlib.sha256(Path(_contact_qp.__file__).read_bytes()).hexdigest()
     if reference is not None:
         report["max_torque_difference_nm"] = max(torque_differences)
         report["max_configuration_difference"] = max(configuration_differences)
@@ -119,11 +131,12 @@ if __name__ == "__main__":
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--controller", choices=("wbc", "mpc"), default="wbc")
+    parser.add_argument("--motion", choices=("stand", "shift"), default="shift")
     parser.add_argument("--amplitude", type=float, default=.035)
     parser.add_argument("--push-force", type=float, default=0.)
     args = parser.parse_args()
     report = benchmark(args.steps, args.repeats, args.reference, controller=args.controller,
-                       amplitude=args.amplitude, push_force=args.push_force)
+                       amplitude=args.amplitude, push_force=args.push_force, motion=args.motion)
     rendered = json.dumps(report, indent=2)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

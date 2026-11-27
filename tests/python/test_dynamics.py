@@ -163,6 +163,7 @@ def test_reused_solver_matches_fresh_workspace(demo_module):
         kwargs = dict(target_velocity=velocity, target_acceleration=acceleration)
         cached = demo.controller.solve(demo.state, target, **kwargs)
         fresh._solver = None
+        fresh._last_dual = None
         recreated = fresh.solve(demo.state, target, **kwargs)
         np.testing.assert_allclose(cached["torque"], recreated["torque"], atol=1e-6)
         np.testing.assert_allclose(cached["wrench"], recreated["wrench"], atol=1e-6)
@@ -175,6 +176,7 @@ def test_solver_failure_discards_workspace_and_recovers(demo_module, monkeypatch
     from types import SimpleNamespace
     demo = demo_module.DynamicsDemo()
     demo.controller.solve(demo.state, demo.initial_com)
+    demo.controller._last_dual = None
     monkeypatch.setattr(demo.controller._solver, "solve", lambda **kwargs: SimpleNamespace(
         info=SimpleNamespace(status_val=3, status="primal infeasible"), x=None))
     with pytest.raises(RuntimeError, match="primal infeasible"):
@@ -251,6 +253,7 @@ def test_numerical_failure_rebuilds_once_and_validates(demo_module, monkeypatch)
     from types import SimpleNamespace
     demo = demo_module.DynamicsDemo()
     demo.controller.solve(demo.state, demo.initial_com)
+    demo.controller._last_dual = None
     monkeypatch.setattr(demo.controller._solver, "solve", lambda **kwargs: SimpleNamespace(
         info=SimpleNamespace(status_val=7, status="maximum iterations reached"), x=None))
     result = demo.controller.solve(demo.state, demo.initial_com)
@@ -350,6 +353,7 @@ def test_physical_constraint_error_refines_once(demo_module, monkeypatch):
     demo = demo_module.DynamicsDemo()
     demo.step()
     solver = demo.controller._solver
+    demo.controller._last_dual = None
     monkeypatch.setattr(solver, 'solve', lambda **kwargs: SimpleNamespace(
         info=SimpleNamespace(status_val=1, status='solved', iter=1), x=np.zeros(56)))
     row = demo.step()

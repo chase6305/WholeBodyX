@@ -146,7 +146,8 @@ class DynamicsDemo:
         if self.state.stamp < self._manual_push_until - 1e-10:
             push = max(push, self._manual_push_force)
         external_force = np.zeros(self.robot.nv)
-        external_force[:3] = Rotation.from_quat(self.state.q[3:7]).as_matrix().T @ [0., push, 0.]
+        if push:
+            external_force[:3] = Rotation.from_quat(self.state.q[3:7]).as_matrix().T @ [0., push, 0.]
         acceleration, wrench = self.robot.forward(self.state, command.torque, command.contact_rhs, command.terms,
                                                    external_force=external_force)
         mass, bias, jac = command.terms[:3]
@@ -165,8 +166,9 @@ class DynamicsDemo:
         self.max_contact_error = max(self.max_contact_error, float(error))
         self.max_dynamics_residual = max(self.max_dynamics_residual, command["dynamics_residual"])
         self.max_violation = max(self.max_violation, command["violation"])
-        row = dict(time=self.state.stamp, com_y_m=float(terms[5][1]), target_com_y_m=float(self.target(self.state.stamp)[1]),
-                   com_error_m=float(np.linalg.norm(terms[5] - self.target(self.state.stamp))),
+        measured_target = self.target(self.state.stamp)
+        row = dict(time=self.state.stamp, com_y_m=float(terms[5][1]), target_com_y_m=float(measured_target[1]),
+                   com_error_m=float(np.linalg.norm(terms[5] - measured_target)),
                    forward_contact_violation=contact_violation, wbc_ms=solve_ms,
                    reference_com_y_m=float(target[1]), mpc_ms=mpc_ms, last_mpc_ms=self.last_mpc_ms, applied_push_y_n=float(push),
                    forward_dynamics_residual=forward_residual,
