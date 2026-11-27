@@ -15,9 +15,9 @@ from time import perf_counter
 
 import numpy as np
 
-from .mpc import JointMPC, JointPlan, PlanResult, _MPCSettings, _time_window, _validated_joint_plan
+from .mpc import JointMPC, PlanResult, _MPCSettings, _time_window, _validated_joint_plan
 from .qp import QPResult, _immutable
-from .types import RobotState, _snapshot, positive
+from .types import JointLimits, RobotState, _snapshot, positive
 
 
 @dataclass(frozen=True)
@@ -175,10 +175,24 @@ class ProcessMPCWorker:
 
     @property
     def limits(self):
-        from .types import JointLimits
-
         limits = self._settings.limits
         return JointLimits(limits.lower, limits.upper, limits.velocity, limits.acceleration)
+
+    def _matches_plan_limits(self, limits):
+        """Check the limits used to validate replies before publishing them."""
+        if type(limits) is not JointLimits:
+            return False
+        checked = self._settings.limits
+        for name in ("lower", "upper", "velocity", "acceleration"):
+            actual, expected = getattr(limits, name), getattr(checked, name)
+            if actual is expected:
+                continue
+            if (
+                type(actual) is not np.ndarray or expected is None
+                or actual.dtype != expected.dtype or not np.array_equal(actual, expected)
+            ):
+                return False
+        return True
 
     horizon = property(lambda self: self._settings.horizon)
     backend = property(lambda self: self._backend)

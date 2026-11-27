@@ -2,15 +2,19 @@
 
 from math import ceil, inf, isfinite, nextafter, ulp
 from time import monotonic
+from types import MethodType
 from typing import NamedTuple
 
 import numpy as np
 
 from .mpc import JointPlan, PlanResult, _validated_joint_plan
-from .process_mpc import PlanningReply, PlanningToken
+from .process_mpc import PlanningReply, PlanningToken, ProcessMPCWorker
 from .qp import QPResult
 from .runtime import MPCReferenceManager, ReferenceUpdate, _deadline_reached
 from .types import RobotState, array, positive
+
+
+_PROCESS_POLL = ProcessMPCWorker.poll
 
 
 class _PendingPlan(NamedTuple):
@@ -173,7 +177,8 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
         )
 
     def _receive(self, control_dt):
-        reply = self.planner.poll()
+        poll = self.planner.poll
+        reply = poll()
         if reply is None:
             return
         if not isinstance(reply, PlanningReply) or self._pending is None:
@@ -196,17 +201,30 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
             raise RuntimeError(
                 f"worker planning failed: {outcome.solver.status}: {outcome.solver.detail}"
             )
-        solution = array(outcome.solver.x, 1, "worker solution")
-        expected_solution_size = (
-            self.planner.horizon
-            * pending.state.q.size
-            * (2 if "sparse" in self.planner.backend else 1)
-        )
-        if solution.shape != (expected_solution_size,):
-            raise ValueError("worker solution dimensions differ")
-        plan = _validated_joint_plan(outcome.plan, pending.state, self.limits, control_dt)
-        if plan.dt != self.planner.dt or len(plan.velocities) != self.planner.horizon:
-            raise ValueError("worker returned a different planning model")
+        if (
+            type(self.planner) is ProcessMPCWorker
+            and type(poll) is MethodType
+            and poll.__self__ is self.planner
+            and poll.__func__ is _PROCESS_POLL
+            and self.planner._matches_plan_limits(self.limits)
+        ):
+            # The relay checked these limits and the planning model. poll()
+            # takes its owned snapshot out of the mailbox for this owner.
+            plan = outcome.plan
+            if plan.valid_until < pending.state.stamp + control_dt:
+                raise ValueError("plan does not cover the complete control interval")
+        else:
+            solution = array(outcome.solver.x, 1, "worker solution")
+            expected_solution_size = (
+                self.planner.horizon
+                * pending.state.q.size
+                * (2 if "sparse" in self.planner.backend else 1)
+            )
+            if solution.shape != (expected_solution_size,):
+                raise ValueError("worker solution dimensions differ")
+            plan = _validated_joint_plan(outcome.plan, pending.state, self.limits, control_dt)
+            if plan.dt != self.planner.dt or len(plan.velocities) != self.planner.horizon:
+                raise ValueError("worker returned a different planning model")
         self._future = _CompletedPlan(plan, reply, pending.reason, pending.nominal_start)
         self._pending = None
 
@@ -271,7 +289,7 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
             self._receive(control_dt)
         except (ValueError, RuntimeError) as exc:
             return self._failure("worker_result", str(exc))
-        result = solve_ms = None
+        result = solve_ms = sampled = None
         reason = "goal_changed" if changed else "reused"
         if self._future is not None and state.stamp >= self._future.plan.stamp:
             completed = self._future
@@ -291,8 +309,8 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
             else:
                 if state.stamp >= plan.valid_until or state.stamp + control_dt > plan.valid_until:
                     return self._failure("coverage", "completed plan expired before adoption")
-                predicted, _ = plan.sample(state.stamp)
-                error = float(np.max(np.abs(state.q - predicted)))
+                sampled = plan.sample(state.stamp)
+                error = float(np.max(np.abs(state.q - sampled[0])))
                 if error > self.tracking_tolerance:
                     return self._failure(
                         "tracking_error",
@@ -312,12 +330,14 @@ class AsyncMPCReferenceManager(MPCReferenceManager):
             return self._failure(
                 "coverage", "active plan does not cover the complete control interval"
             )
-        position, velocity = self.plan.sample(state.stamp)
-        error = float(np.max(np.abs(state.q - position)))
-        if error > self.tracking_tolerance:
-            return self._failure(
-                "tracking_error", "measured state diverged from the active plan", error=error
-            )
+        if sampled is None:
+            sampled = self.plan.sample(state.stamp)
+            error = float(np.max(np.abs(state.q - sampled[0])))
+            if error > self.tracking_tolerance:
+                return self._failure(
+                    "tracking_error", "measured state diverged from the active plan", error=error
+                )
+        position, velocity = sampled
         if (
             self._pending is not None
             and monotonic() - self._pending.submitted_at > self.max_pending_time

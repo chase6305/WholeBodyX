@@ -1,6 +1,7 @@
 """Real spawned planners, bounded mailboxes and process lifetime."""
 
 import os
+from dataclasses import replace
 import multiprocessing as mp
 from pathlib import Path
 from threading import Condition, Event
@@ -9,7 +10,7 @@ import time
 import numpy as np
 import pytest
 
-from wholebodyx import JointLimits, ProcessMPCWorker, RobotState
+from wholebodyx import AsyncMPCReferenceManager, JointLimits, JointPlan, ProcessMPCWorker, RobotState
 
 
 def limits(n=3):
@@ -166,6 +167,49 @@ def test_invalid_submission_cannot_replace_the_latest_valid_request():
         with pytest.raises(ValueError):
             worker.submit(RobotState([0.] * 2, [0.] * 2), [.1] * 2)
         assert receive(worker).token == token
+
+
+@pytest.mark.parametrize("case", ["transfer", "limits", "interval", "replaced_poll"])
+def test_reference_receipt_reuses_only_applicable_relay_validation(case, monkeypatch):
+    from wholebodyx import async_runtime
+
+    with ProcessMPCWorker(limits(), horizon=8, dt=.1) as worker:
+        manager = AsyncMPCReferenceManager(worker, lookahead=.2)
+        state = RobotState(np.zeros(3), np.zeros(3))
+        goal = np.full(3, .3)
+        seed = JointPlan(np.zeros((9, 3)), np.zeros((8, 3)), 0., .1)
+        manager.seed(seed, state, goal, .02)
+        assert manager.update(state, goal, .02).success
+        deadline = time.monotonic() + 3.
+        while worker._reply is None and time.monotonic() < deadline and not worker.error:
+            time.sleep(.001)
+        assert worker._reply is not None, worker.error
+        control_dt = .02
+        if case == "transfer":
+            def unexpected_validation(*args, **kwargs):
+                raise AssertionError("the reply has already passed relay validation")
+
+            monkeypatch.setattr(async_runtime, "_validated_joint_plan", unexpected_validation)
+        elif case == "limits":
+            manager.limits.velocity.setflags(write=True)
+            manager.limits.velocity[:] = 1e-4
+        elif case == "interval":
+            control_dt = .9
+        else:
+            poll = worker.poll
+
+            def replaced_poll():
+                reply = poll()
+                outcome = replace(reply.outcome, solver=replace(reply.outcome.solver, x=np.zeros(1)))
+                return replace(reply, outcome=outcome)
+
+            monkeypatch.setattr(worker, "poll", replaced_poll)
+        result = manager.update(RobotState(np.zeros(3), np.zeros(3), .2), goal, control_dt)
+        if case == "transfer":
+            assert result.success and result.replanned
+        else:
+            assert not result.success and result.reason == "worker_result"
+            assert manager.plan is None
 
 
 def test_close_during_real_pending_solve_reaps_child_and_relay():
