@@ -105,6 +105,7 @@ class TrackingSession:
         self.replan_stamps = deque(maxlen=300)
         self.tracking_replans = 0
         self.disturbances = 0
+        self._diagnostic_reference = None
         self.failure = None
 
     def set_goal(self, goal):
@@ -202,6 +203,7 @@ class TrackingSession:
         for k, value in enumerate(disturbance):
             sample[f"offset_{k}_rad"] = float(value)
         self.history.append(sample)
+        self._diagnostic_reference = target
         return sample
 
     def prediction(self, frame):

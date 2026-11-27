@@ -44,6 +44,20 @@ def test_planar_pose_matches_general_axis_angle_rotation(frame, offset):
         np.testing.assert_allclose(pose.translation, model.translations(q[None], frame)[0], atol=1e-14)
 
 
+def test_planar_pose_owns_finite_float64_arrays():
+    model = PlanarDualArm()
+    model.lengths = model.lengths.astype(np.longdouble)
+    first, second = (model.pose(np.zeros(6), "left_ee") for _ in range(2))
+    for field in ("translation", "rotation"):
+        values = getattr(first, field)
+        assert values.dtype == np.dtype(float)
+        assert not values.flags.writeable
+        assert not np.shares_memory(values, getattr(second, field))
+
+    with np.errstate(over="ignore", invalid="ignore"), pytest.raises(ValueError, match="finite"):
+        model.pose(np.full(6, 1e308), "left_ee")
+
+
 def test_pose_rotation_validation_matches_existing_tolerances():
     from wholebodyx.model import Pose
 

@@ -1,6 +1,7 @@
 """World-aligned [linear; angular] Jacobians and fixed-base model adapters."""
 
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from typing import Protocol
 
@@ -27,6 +28,23 @@ class Pose:
             raise ValueError("rotation must belong to SO(3)")
         object.__setattr__(self, "translation", translation)
         object.__setattr__(self, "rotation", rotation)
+
+    @classmethod
+    def _from_planar(cls, translation, cosine, sine):
+        """Build a pose from an owned translation and a single angle's trig values."""
+        if not np.isfinite(translation).all():
+            raise ValueError("translation must be a finite 1-D array")
+        if not isfinite(cosine) or not isfinite(sine):
+            raise ValueError("rotation must be a finite 2-D array")
+        rotation = np.array(
+            [[cosine, -sine, 0.], [sine, cosine, 0.], [0., 0., 1.]]
+        )
+        translation.setflags(write=False)
+        rotation.setflags(write=False)
+        pose = object.__new__(cls)
+        object.__setattr__(pose, "translation", translation)
+        object.__setattr__(pose, "rotation", rotation)
+        return pose
 
 
 class RobotModel(Protocol):
@@ -60,15 +78,12 @@ class PlanarDualArm:
         theta, offset = self._chain(q, frame)
         cosine, sine = np.cos(theta), np.sin(theta)
         translation = np.array(
-            [self.lengths @ cosine, self.lengths @ sine + (0.4 if offset == 0 else -0.4), 0.0]
+            [self.lengths @ cosine, self.lengths @ sine + (0.4 if offset == 0 else -0.4), 0.0],
+            dtype=float,
         )
         # All joints rotate around world Z. Reuse the terminal sine/cosine
         # already evaluated for translation instead of a general rotvec conversion.
-        terminal_cosine, terminal_sine = cosine[-1], sine[-1]
-        return Pose(
-            translation,
-            [[terminal_cosine, -terminal_sine, 0], [terminal_sine, terminal_cosine, 0], [0, 0, 1]],
-        )
+        return Pose._from_planar(translation, cosine[-1], sine[-1])
 
     def translations(self, configurations, frame):
         """Batch end-effector positions for an (N, 6) trajectory, including N=0.

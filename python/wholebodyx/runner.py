@@ -35,7 +35,9 @@ def run(scenario, backend="python", mpc_backend=None, steps=None, csv_path=None,
             # Only export needs an expanded row. Keep the session's history
             # untouched and avoid creating dozens of unused scalar fields.
             row = dict(sample) if stream is not None else sample
-            state, target = session.plant.read(), session.reference()
+            # Use the same post-step target for orientation and CSV as for
+            # the session's position errors, including at a scheduled change.
+            state, target = session.plant.read(), session._diagnostic_reference
             for k, frame in enumerate(session.frames):
                 pose = session.model.pose(state.q, frame)
                 orientation_error = float(np.linalg.norm(
