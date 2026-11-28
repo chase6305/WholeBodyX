@@ -50,6 +50,14 @@ def joint_mpc_workload(name, state, goal, iterations, seed):
             )
             distance = .32 if name == "alternating" and k % 6 >= 3 else .02
             target = measurement.q + distance * np.cos(phases + .003 * k)
+        elif name == "retarget":
+            phase, tick = divmod(k, 6)
+            angles = np.arange(joints) * .37 + phase * 1.9
+            target = .55 * np.sin(angles)
+            previous = .55 * np.sin(angles - 1.9)
+            position = previous + min(1., tick / 4) * (target - previous)
+            velocity = .02 * np.cos(angles + tick * .3)
+            measurement = RobotState(position, velocity, k * .05)
         else:
             measurement = state
             target = goal + .01 * np.sin(k)
