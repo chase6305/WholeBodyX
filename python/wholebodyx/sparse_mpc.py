@@ -1,5 +1,8 @@
 """Uncondensed sparse integrator MPC, with the same JointPlan contract."""
 
+from dataclasses import replace
+from math import isfinite
+
 import numpy as np
 from scipy import sparse
 
@@ -10,6 +13,30 @@ from .mpc import (
 from .qp import OSQPSolver, QPResult, _OSQP_SOLVE, _immutable, _validated_qp_solution
 from .sparse_qp import _SparseFixedQP, _sparse_template_bytes
 from .types import array
+
+
+def _tail_cost(horizon, dt, tracking, effort, terminal):
+    if horizon < 96:
+        return None
+    steps = min(64, max(32, horizon // 4))
+    feedback = np.empty(horizon - steps)
+    value = terminal
+    for index in range(len(feedback) - 1, -1, -1):
+        denominator = effort + dt * dt * value
+        if not isfinite(denominator):
+            return None
+        gain = dt * value / denominator
+        if not (isfinite(gain) and 0. < gain and dt * gain <= 1.):
+            return None
+        feedback[index] = gain
+        value = tracking + value * (effort / denominator)
+    if not isfinite(value):
+        return None
+    # Turn the per-step feedback into a linear response to the position
+    # error at the beginning of the suffix.
+    with np.errstate(under="ignore"):
+        feedback[1:] *= np.cumprod(1. - dt * feedback[:-1])
+    return steps, value, _immutable(feedback)
 
 
 class SparseJointMPC(_JointMPC):
@@ -59,6 +86,13 @@ class SparseJointMPC(_JointMPC):
             else None
         )
         self._last_plan = None
+        self._prefix = None
+        self._tail = (
+            _tail_cost(self.horizon, self.dt, self.tracking_weight, self.control_weight,
+                       self.terminal_weight)
+            if self._default_solver is not None and self._position_origin is None
+            else None
+        )
         self._prepare()
 
     def _prepare(self):
@@ -112,6 +146,9 @@ class SparseJointMPC(_JointMPC):
         slew_problem = getattr(self, "_slew_problem", None)
         if slew_problem is not None:
             total += _sparse_template_bytes(slew_problem[0])
+        prefix = getattr(self, "_prefix", None)
+        if prefix is not None:
+            total += prefix.fixed_matrix_bytes
         return total
 
     def _prepare_slew_problem(self, hessian, constraint, size):
@@ -132,6 +169,8 @@ class SparseJointMPC(_JointMPC):
         super().reset()
         if getattr(self, "_slew_problem", None) is not None:
             self._slew_problem[1].reset()
+        if getattr(self, "_prefix", None) is not None:
+            self._prefix.reset()
 
     def formulate(self, state, goal):
         return self._formulate(state, goal, position_origin=None)
@@ -224,6 +263,55 @@ class SparseJointMPC(_JointMPC):
             iterations=result.iterations, detail=result.detail,
         )
 
+    def _solve_prefix(self, state, goal, problem, size):
+        steps, terminal_weight, response = self._tail
+        limits, dt = self.limits, self.dt
+        duration = steps * dt
+        with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+            distance = np.abs(goal - state.q)
+            if (
+                (goal < limits.lower).any() or (goal > limits.upper).any()
+                or not np.isfinite(terminal_weight * goal).all()
+                or (distance > duration * limits.velocity).any()
+                or (limits.acceleration is not None
+                    and (distance > .25 * duration * duration * limits.acceleration).any())
+            ):
+                return None, 0
+        if self._prefix is None:
+            self._prefix = SparseJointMPC(
+                limits, steps, dt, self.tracking_weight, self.control_weight, terminal_weight,
+            )
+        first = self._prefix.solve(state, goal).solver
+        if not first.success:
+            return None, first.iterations
+        joints = state.q.size
+        prefix_size = steps * joints
+        decision = np.empty(2 * size)
+        positions = decision[:size].reshape(self.horizon, joints)
+        velocities = decision[size:].reshape(self.horizon, joints)
+        positions[:steps] = first.x[:prefix_size].reshape(steps, joints)
+        velocities[:steps] = first.x[prefix_size:].reshape(steps, joints)
+        tail_q, tail_v = positions[steps:], velocities[steps:]
+        with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+            np.multiply(response[:, None], goal - positions[steps - 1], out=tail_v)
+            _integrate_positions(positions[steps - 1], tail_v, dt, out=tail_q)
+            feasible = (
+                (np.abs(tail_v) <= limits.velocity).all()
+                and (tail_q >= limits.lower).all() and (tail_q <= limits.upper).all()
+            )
+            if feasible and limits.acceleration is not None:
+                changes = _velocity_changes(tail_v, velocities[steps - 1])
+                feasible = (np.abs(changes) <= dt * limits.acceleration).all()
+        if not feasible:
+            return None, first.iterations
+        decision.setflags(write=False)
+        result = _validated_qp_solution(
+            decision, problem.constraint, problem.lower, problem.upper,
+            iterations=first.iterations, detail="unconstrained suffix",
+        )
+        outcome = self._plan_result(state, result, velocity_offset=size, kind="sparse MPC")
+        return (outcome if outcome.plan is not None else None), first.iterations
+
     def solve(self, state, goal):
         default_adapter = (
             self.solver is self._default_solver
@@ -236,11 +324,17 @@ class SparseJointMPC(_JointMPC):
             and getattr(self.formulate, "__func__", None) is _SPARSE_MPC_FORMULATE
         )
         origin = getattr(self, "_position_origin", None)
-        if origin is not None and default_problem:
+        try_prefix = default_problem and self._tail is not None
+        if (origin is not None and default_problem) or try_prefix:
             goal = array(goal, 1, "goal")
         physical_problem = self.formulate(state, goal)
         joint_count = state.q.size
         trajectory_size = joint_count * self.horizon
+        prefix_iterations = 0
+        if try_prefix:
+            outcome, prefix_iterations = self._solve_prefix(state, goal, physical_problem, trajectory_size)
+            if outcome is not None:
+                return outcome
         problem = physical_problem
         if origin is not None and default_problem:
             problem = self._formulate(state, goal, origin)
@@ -260,6 +354,10 @@ class SparseJointMPC(_JointMPC):
                 first = self._physical_result(first, physical_problem, origin, trajectory_size)
             outcome = self._plan_result(state, first, velocity_offset=trajectory_size, kind="sparse MPC")
             if outcome.plan is not None or first.status == "infeasible":
+                if prefix_iterations:
+                    outcome = replace(outcome, solver=replace(
+                        outcome.solver, iterations=outcome.solver.iterations + prefix_iterations,
+                    ))
                 return outcome
             # Give a refused expanded solve one attempt in the original model.
             self.reset()
@@ -288,6 +386,8 @@ class SparseJointMPC(_JointMPC):
                 )
         if origin is not None:
             result = self._physical_result(result, physical_problem, origin, trajectory_size)
+        if prefix_iterations:
+            result = replace(result, iterations=result.iterations + prefix_iterations)
         return self._plan_result(state, result, velocity_offset=trajectory_size, kind="sparse MPC")
 
 

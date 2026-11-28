@@ -50,6 +50,9 @@ struct SparseJointMPC::Impl {
   Eigen::SparseMatrix<double> scaled_hessian, scaled_constraint;
   Eigen::SparseMatrix<double> slew_hessian, slew_constraint;
   Vector lower, upper, position_weights, position_origin;
+  Vector tail_feedback;
+  double prefix_terminal_weight = 0.;
+  std::unique_ptr<SparseJointMPC> prefix;
   std::optional<JointPlan> last_plan;
   OSQPWorkspace* workspace = nullptr;
   bool workspace_has_slew_variables = false;
@@ -146,6 +149,29 @@ struct SparseJointMPC::Impl {
       }
       slew_constraint.makeCompressed();
     }
+    prepare_tail_feedback();
+  }
+
+  void prepare_tail_feedback() {
+    if (horizon < 96 || position_origin.size()) return;
+    const int prefix_horizon = std::clamp(horizon / 4, 32, 64);
+    Vector feedback(horizon - prefix_horizon);
+    const long double step = dt, effort = control_weight;
+    long double value = terminal_weight;
+    // Eliminating one unconstrained interval leaves a scalar quadratic
+    // value in the position error at its origin.
+    for (Eigen::Index i = feedback.size(); i-- > 0;) {
+      const long double denominator = effort + step * step * value;
+      const long double gain = step * value / denominator;
+      if (!std::isfinite(denominator) || !(gain > 0.) ||
+          gain > std::numeric_limits<double>::max()) return;
+      feedback[i] = static_cast<double>(gain);
+      if (!(feedback[i] > 0. && dt * feedback[i] <= 1.)) return;
+      value = tracking_weight + value * (effort / denominator);
+    }
+    if (!std::isfinite(value) || value > std::numeric_limits<double>::max()) return;
+    prefix_terminal_weight = static_cast<double>(value);
+    tail_feedback = std::move(feedback);
   }
 
   ~Impl() {
@@ -156,6 +182,7 @@ struct SparseJointMPC::Impl {
     if (workspace) osqp_cleanup(workspace);
     workspace = nullptr;
     last_plan.reset();
+    if (prefix) prefix->reset();
   }
 
   void vectors(const RobotState& state, const Vector& goal, Vector& gradient, Vector& lower_bounds,
@@ -220,6 +247,73 @@ struct SparseJointMPC::Impl {
       return;
     }
     result.status = "solved";
+  }
+
+  PlanResult make_plan(const RobotState& state, QPResult result) {
+    if (!result.success()) return {std::move(result), std::nullopt};
+    JointPlan plan{Matrix(horizon + 1, joint_count), Matrix(horizon, joint_count), state.stamp, dt};
+    plan.positions.row(0) = state.q.transpose();
+    for (int k = 0; k < horizon; ++k) {
+      const auto velocity = result.x.segment(trajectory_size + k * joint_count, joint_count);
+      plan.velocities.row(k) = velocity.transpose();
+      plan.positions.row(k + 1) = plan.positions.row(k) + dt * velocity.transpose();
+    }
+    const double violation = detail::joint_plan_violation(plan, limits, state);
+    if (violation > 1e-6)
+      return {{"error", {}, result.iterations, violation,
+               "reconstructed sparse MPC plan violates joint bounds"}, std::nullopt};
+    last_plan = plan;
+    return {std::move(result), std::move(plan)};
+  }
+
+  std::optional<PlanResult> solve_prefix(const RobotState& state, const Vector& goal,
+                                        const Vector& lower_bound, const Vector& upper_bound,
+                                        int& iterations) {
+    if (!tail_feedback.size()) return std::nullopt;
+    const int steps = horizon - tail_feedback.size();
+    const double duration = dt * steps;
+    const Vector distance = (goal - state.q).cwiseAbs();
+    // Screen candidates with a rest-to-rest travel estimate.
+    if ((goal.array() < limits.lower.array()).any() ||
+        (goal.array() > limits.upper.array()).any() ||
+        !((prefix_terminal_weight * goal).allFinite()) ||
+        (distance.array() > duration * limits.velocity.array()).any() ||
+        (limits.acceleration.size() &&
+         (distance.array() > .25 * duration * duration * limits.acceleration.array()).any()))
+      return std::nullopt;
+    if (!prefix)
+      prefix = std::make_unique<SparseJointMPC>(limits, steps, dt, tracking_weight, control_weight,
+                                                prefix_terminal_weight);
+    auto first = prefix->solve(state, goal);
+    iterations = first.solver.iterations;
+    if (!first.solver.success()) return std::nullopt;
+    const Eigen::Index prefix_size = steps * joint_count;
+    QPResult result{"solved", Vector(2 * trajectory_size), iterations, INFINITY,
+                    "unconstrained suffix"};
+    result.x.head(prefix_size) = first.solver.x.head(prefix_size);
+    result.x.segment(trajectory_size, prefix_size) = first.solver.x.tail(prefix_size);
+    Vector position = first.solver.x.segment(prefix_size - joint_count, joint_count);
+    Vector previous_velocity = first.solver.x.tail(joint_count);
+    for (int k = steps; k < horizon; ++k) {
+      const auto row = k * joint_count;
+      auto velocity = result.x.segment(trajectory_size + row, joint_count);
+      velocity = tail_feedback[k - steps] * (goal - position);
+      position += dt * velocity;
+      if (!(velocity.cwiseAbs().array() <= limits.velocity.array()).all() ||
+          !(position.array() >= limits.lower.array()).all() ||
+          !(position.array() <= limits.upper.array()).all())
+        return std::nullopt;
+      if (limits.acceleration.size() &&
+          !((velocity - previous_velocity).cwiseAbs().array() <=
+            dt * limits.acceleration.array()).all())
+        return std::nullopt;
+      result.x.segment(row, joint_count) = position;
+      previous_velocity = velocity;
+    }
+    validate_solution(result, lower_bound, upper_bound);
+    auto complete = make_plan(state, std::move(result));
+    if (!complete.plan) return std::nullopt;
+    return complete;
   }
 
   QPResult solve_qp(const Vector& gradient, const Vector& lower_bound, const Vector& upper_bound,
@@ -329,7 +423,8 @@ std::size_t SparseJointMPC::fixed_matrix_bytes() const {
          detail::sparse_matrix_bytes(planner.scaled_hessian) +
          detail::sparse_matrix_bytes(planner.scaled_constraint) +
          detail::sparse_matrix_bytes(planner.slew_hessian) +
-         detail::sparse_matrix_bytes(planner.slew_constraint);
+         detail::sparse_matrix_bytes(planner.slew_constraint) +
+         (planner.prefix ? planner.prefix->fixed_matrix_bytes() : 0);
 }
 
 SparseMPCProblem SparseJointMPC::formulate(const RobotState& state, const Vector& goal) const {
@@ -343,6 +438,9 @@ PlanResult SparseJointMPC::solve(const RobotState& state, const Vector& goal) {
   auto& planner = *impl_;
   Vector gradient, lower_bounds, upper_bounds;
   planner.vectors(state, goal, gradient, lower_bounds, upper_bounds);
+  int prefix_iterations = 0;
+  if (auto result = planner.solve_prefix(state, goal, lower_bounds, upper_bounds, prefix_iterations))
+    return std::move(*result);
   const bool centered = planner.position_origin.size() != 0;
   Vector physical_lower, physical_upper;
   if (centered) {
@@ -400,26 +498,8 @@ PlanResult SparseJointMPC::solve(const RobotState& state, const Vector& goal) {
     result.iterations += first_iterations;
     result.detail = "retry after velocity-difference solve: " + result.detail;
   }
-  if (!result.success()) return {std::move(result), std::nullopt};
-  JointPlan plan{Matrix(planner.horizon + 1, planner.joint_count),
-                 Matrix(planner.horizon, planner.joint_count), state.stamp, planner.dt};
-  plan.positions.row(0) = state.q.transpose();
-  for (int k = 0; k < planner.horizon; ++k) {
-    const auto velocity =
-        result.x.segment(planner.trajectory_size + k * planner.joint_count, planner.joint_count);
-    plan.velocities.row(k) = velocity.transpose();
-    plan.positions.row(k + 1) = plan.positions.row(k) + planner.dt * velocity.transpose();
-  }
-  const double violation = detail::joint_plan_violation(plan, planner.limits, state);
-  if (violation > 1e-6)
-    return {{"error",
-             {},
-             result.iterations,
-             violation,
-             "reconstructed sparse MPC plan violates joint bounds"},
-            std::nullopt};
-  planner.last_plan = plan;
-  return {std::move(result), std::move(plan)};
+  result.iterations += prefix_iterations;
+  return planner.make_plan(state, std::move(result));
 }
 
 }  // namespace wholebodyx
