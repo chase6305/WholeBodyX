@@ -404,7 +404,10 @@ class SparseJointMPC(_JointMPC):
             decision, problem.constraint, problem.lower, problem.upper,
             iterations=iterations, detail=detail,
         )
-        outcome = self._plan_result(state, result, velocity_offset=size, kind="sparse MPC")
+        outcome = self._plan_result(
+            state, result, velocity_offset=size, kind="sparse MPC",
+            integrated_positions=positions if steps == 0 else None,
+        )
         return outcome if outcome.plan is not None else None
 
     def solve(self, state, goal):
