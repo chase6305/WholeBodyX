@@ -6,6 +6,7 @@
 
 #include <osqp/osqp.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -42,6 +43,13 @@ struct CscStorage {
 }  // namespace
 
 struct SparseJointMPC::Impl {
+  struct PrefixTrial {
+    int horizon = 0;
+    double terminal_weight = 0.;
+    Vector travel;
+    std::unique_ptr<SparseJointMPC> planner;
+  };
+
   JointLimits limits;
   int horizon;
   double dt, tracking_weight, control_weight, terminal_weight, position_scale;
@@ -50,10 +58,16 @@ struct SparseJointMPC::Impl {
   Eigen::SparseMatrix<double> scaled_hessian, scaled_constraint;
   Eigen::SparseMatrix<double> slew_hessian, slew_constraint;
   Vector lower, upper, position_weights, position_origin;
+  Vector unconstrained_feedback;
+  std::array<PrefixTrial, 3> prefixes;
   std::optional<JointPlan> last_plan;
   OSQPWorkspace* workspace = nullptr;
   bool workspace_has_slew_variables = false;
+  bool prefix_trial = false;
+  bool solver_matrices_ready = false;
   static constexpr double slew_scale = .1;
+  static constexpr int minimum_suffix_horizon = 96;
+  static constexpr int prefix_iterations_limit = 6000;
 
   Impl(JointLimits bounds, int count, double step, double tracking, double control, double terminal)
       : limits(std::move(bounds)),
@@ -90,40 +104,57 @@ struct SparseJointMPC::Impl {
     if (!center_positions) position_origin.resize(0);
     const bool slew = limits.acceleration.size() != 0;
     const auto rows = (slew ? 4 : 3) * trajectory_size;
-    std::vector<Eigen::Triplet<double>> hessian_entries, constraint_entries;
-    hessian_entries.reserve(2 * trajectory_size);
-    constraint_entries.reserve((slew ? 7 : 5) * trajectory_size);
     lower = Vector::Zero(rows);
     upper = Vector::Zero(rows);
     position_weights = Vector::Constant(trajectory_size, tracking_weight);
     position_weights.tail(joint_count).setConstant(terminal_weight);
     for (Eigen::Index i = 0; i < trajectory_size; ++i) {
       const auto joint = i % joint_count;
-      hessian_entries.emplace_back(i, i, position_weights[i]);
-      hessian_entries.emplace_back(trajectory_size + i, trajectory_size + i, control_weight);
-      constraint_entries.emplace_back(i, i, 1.);
-      if (i >= joint_count) constraint_entries.emplace_back(i, i - joint_count, -1.);
-      constraint_entries.emplace_back(i, trajectory_size + i, -dt);
-      constraint_entries.emplace_back(trajectory_size + i, i, 1.);
-      constraint_entries.emplace_back(2 * trajectory_size + i, trajectory_size + i, 1.);
       lower[trajectory_size + i] = limits.lower[joint];
       upper[trajectory_size + i] = limits.upper[joint];
       lower[2 * trajectory_size + i] = -limits.velocity[joint];
       upper[2 * trajectory_size + i] = limits.velocity[joint];
       if (slew) {
-        constraint_entries.emplace_back(3 * trajectory_size + i, trajectory_size + i, 1.);
-        if (i >= joint_count)
-          constraint_entries.emplace_back(3 * trajectory_size + i,
-                                          trajectory_size + i - joint_count, -1.);
         upper[3 * trajectory_size + i] = dt * limits.acceleration[joint];
         lower[3 * trajectory_size + i] = -upper[3 * trajectory_size + i];
       }
     }
     require(lower.allFinite() && upper.allFinite(), "nonfinite MPC bounds");
     hessian.resize(2 * trajectory_size, 2 * trajectory_size);
-    hessian.setFromTriplets(hessian_entries.begin(), hessian_entries.end());
+    hessian.reserve(2 * trajectory_size);
     constraint.resize(rows, 2 * trajectory_size);
-    constraint.setFromTriplets(constraint_entries.begin(), constraint_entries.end());
+    constraint.reserve((slew ? 7 : 5) * trajectory_size - (slew ? 2 : 1) * joint_count);
+    // Every column is already known in increasing row order. Append directly
+    // to compressed storage and reserve the exact number of entries.
+    for (Eigen::Index i = 0; i < trajectory_size; ++i) {
+      hessian.startVec(i);
+      hessian.insertBack(i, i) = position_weights[i];
+      constraint.startVec(i);
+      constraint.insertBack(i, i) = 1.;
+      if (i + joint_count < trajectory_size)
+        constraint.insertBack(i + joint_count, i) = -1.;
+      constraint.insertBack(trajectory_size + i, i) = 1.;
+    }
+    for (Eigen::Index i = 0; i < trajectory_size; ++i) {
+      const auto column = trajectory_size + i;
+      hessian.startVec(column);
+      hessian.insertBack(column, column) = control_weight;
+      constraint.startVec(column);
+      constraint.insertBack(i, column) = -dt;
+      constraint.insertBack(2 * trajectory_size + i, column) = 1.;
+      if (slew) {
+        constraint.insertBack(3 * trajectory_size + i, column) = 1.;
+        if (i + joint_count < trajectory_size)
+          constraint.insertBack(3 * trajectory_size + i + joint_count, column) = -1.;
+      }
+    }
+    hessian.finalize();
+    constraint.finalize();
+    prepare_unconstrained_feedback();
+  }
+
+  void prepare_solver_matrices() {
+    if (solver_matrices_ready) return;
     // Internal x = D*z conditioning; public diagnostics and results retain x.
     scaled_hessian = hessian;
     scaled_constraint = constraint;
@@ -138,14 +169,54 @@ struct SparseJointMPC::Impl {
       // decision per velocity difference and separate its box from dynamics.
       slew_hessian = scaled_hessian;
       slew_hessian.conservativeResize(3 * trajectory_size, 3 * trajectory_size);
-      slew_constraint = scaled_constraint;
-      slew_constraint.conservativeResize(5 * trajectory_size, 3 * trajectory_size);
-      for (Eigen::Index i = 0; i < trajectory_size; ++i) {
-        slew_constraint.insert(3 * trajectory_size + i, 2 * trajectory_size + i) = -slew_scale;
-        slew_constraint.insert(4 * trajectory_size + i, 2 * trajectory_size + i) = slew_scale;
+      slew_constraint.resize(5 * trajectory_size, 3 * trajectory_size);
+      slew_constraint.reserve(scaled_constraint.nonZeros() + 2 * trajectory_size);
+      for (Eigen::Index column = 0; column < scaled_constraint.cols(); ++column) {
+        slew_constraint.startVec(column);
+        for (Eigen::SparseMatrix<double>::InnerIterator it(scaled_constraint, column); it; ++it)
+          slew_constraint.insertBack(it.row(), column) = it.value();
       }
-      slew_constraint.makeCompressed();
+      for (Eigen::Index i = 0; i < trajectory_size; ++i) {
+        const auto column = 2 * trajectory_size + i;
+        slew_constraint.startVec(column);
+        slew_constraint.insertBack(3 * trajectory_size + i, column) = -slew_scale;
+        slew_constraint.insertBack(4 * trajectory_size + i, column) = slew_scale;
+      }
+      slew_constraint.finalize();
     }
+    solver_matrices_ready = true;
+  }
+
+  void prepare_unconstrained_feedback() {
+    if (position_origin.size()) return;
+    const bool use_prefix = horizon >= minimum_suffix_horizon;
+    if (use_prefix) {
+      prefixes[0].horizon = 32;
+      prefixes[1].horizon = std::clamp(horizon / 5, 40, 64);
+      // Keep subsidiary solves below the threshold that creates their own prefix.
+      prefixes[2].horizon = std::min(horizon / 2, minimum_suffix_horizon - 1);
+    }
+    Vector feedback(horizon);
+    const long double step = dt, effort = control_weight;
+    long double value = terminal_weight;
+    // Eliminating one unconstrained interval leaves a scalar quadratic
+    // value in the position error at its origin.
+    for (Eigen::Index i = feedback.size(); i-- > 0;) {
+      const long double denominator = effort + step * step * value;
+      const long double gain = step * value / denominator;
+      if (!std::isfinite(denominator) || !(gain > 0.) ||
+          gain > std::numeric_limits<double>::max()) return;
+      feedback[i] = static_cast<double>(gain);
+      if (!(feedback[i] > 0. && dt * feedback[i] <= 1.)) return;
+      value = tracking_weight + value * (effort / denominator);
+      if (!std::isfinite(value) || value > std::numeric_limits<double>::max()) return;
+      if (use_prefix)
+        for (auto& trial : prefixes)
+          if (i == trial.horizon) trial.terminal_weight = static_cast<double>(value);
+    }
+    if (use_prefix)
+      for (auto& trial : prefixes) trial.travel = travel_estimate(trial.horizon);
+    unconstrained_feedback = std::move(feedback);
   }
 
   ~Impl() {
@@ -156,6 +227,8 @@ struct SparseJointMPC::Impl {
     if (workspace) osqp_cleanup(workspace);
     workspace = nullptr;
     last_plan.reset();
+    for (auto& prefix : prefixes)
+      if (prefix.planner) prefix.planner->reset();
   }
 
   void vectors(const RobotState& state, const Vector& goal, Vector& gradient, Vector& lower_bounds,
@@ -222,6 +295,119 @@ struct SparseJointMPC::Impl {
     result.status = "solved";
   }
 
+  PlanResult make_plan(const RobotState& state, QPResult result) {
+    if (!result.success()) return {std::move(result), std::nullopt};
+    JointPlan plan{Matrix(horizon + 1, joint_count), Matrix(horizon, joint_count), state.stamp, dt};
+    plan.positions.row(0) = state.q.transpose();
+    for (int k = 0; k < horizon; ++k) {
+      const auto velocity = result.x.segment(trajectory_size + k * joint_count, joint_count);
+      plan.velocities.row(k) = velocity.transpose();
+      plan.positions.row(k + 1) = plan.positions.row(k) + dt * velocity.transpose();
+    }
+    const double violation = detail::joint_plan_violation(plan, limits, state);
+    if (violation > 1e-6)
+      return {{"error", {}, result.iterations, violation,
+               "reconstructed sparse MPC plan violates joint bounds"}, std::nullopt};
+    last_plan = plan;
+    return {std::move(result), std::move(plan)};
+  }
+
+  Vector travel_estimate(int steps) const {
+    const long double duration = static_cast<long double>(dt) * steps;
+    Vector travel(joint_count);
+    for (Eigen::Index j = 0; j < joint_count; ++j) {
+      long double speed = limits.velocity[j], time = duration;
+      if (limits.acceleration.size()) {
+        const long double acceleration = limits.acceleration[j];
+        speed = std::min(speed, .5L * duration * acceleration);
+        time -= speed / acceleration;
+      }
+      const long double range = speed * time;
+      travel[j] = range <= std::numeric_limits<double>::max() ? static_cast<double>(range) : INFINITY;
+    }
+    return travel;
+  }
+
+  std::optional<PlanResult> solve_prefix(const RobotState& state, const Vector& goal,
+                                        const Vector& lower_bound, const Vector& upper_bound,
+                                        int& iterations) {
+    if (horizon < minimum_suffix_horizon || !unconstrained_feedback.size()) return std::nullopt;
+    if ((goal.array() < limits.lower.array()).any() ||
+        (goal.array() > limits.upper.array()).any())
+      return std::nullopt;
+    const Vector distance = (goal - state.q).cwiseAbs();
+    // Choose one speculative workspace using the distance that a
+    // rest-to-rest motion can cover at the speed and acceleration limits.
+    auto prefix = std::find_if(prefixes.begin(), prefixes.end(), [&](const PrefixTrial& trial) {
+      return (distance.array() <= trial.travel.array()).all() &&
+             (trial.terminal_weight * goal).allFinite();
+    });
+    if (prefix == prefixes.end())
+      return std::nullopt;
+    const int steps = prefix->horizon;
+    if (!prefix->planner) {
+      prefix->planner = std::make_unique<SparseJointMPC>(limits, steps, dt, tracking_weight,
+                                                        control_weight, prefix->terminal_weight);
+      prefix->planner->impl_->prefix_trial = true;
+    }
+    auto first = prefix->planner->solve(state, goal);
+    iterations = first.solver.iterations;
+    if (!first.solver.success()) {
+      prefix->planner->reset();
+      return std::nullopt;
+    }
+    const Eigen::Index prefix_size = steps * joint_count;
+    QPResult result{"solved", Vector(2 * trajectory_size), iterations, INFINITY,
+                    "unconstrained suffix"};
+    result.x.head(prefix_size) = first.solver.x.head(prefix_size);
+    result.x.segment(trajectory_size, prefix_size) = first.solver.x.tail(prefix_size);
+    return complete_unconstrained(state, goal, lower_bound, upper_bound, std::move(result), steps);
+  }
+
+  std::optional<PlanResult> solve_unconstrained(const RobotState& state, const Vector& goal,
+                                               const Vector& lower_bound,
+                                               const Vector& upper_bound) {
+    if (!unconstrained_feedback.size()) return std::nullopt;
+    const Vector first = unconstrained_feedback[0] * (goal - state.q);
+    if (!(first.cwiseAbs().array() <= limits.velocity.array()).all() ||
+        (limits.acceleration.size() &&
+         !((first - state.v).cwiseAbs().array() <= dt * limits.acceleration.array()).all()))
+      return std::nullopt;
+    QPResult result{"solved", Vector(2 * trajectory_size), 0, INFINITY, "unconstrained optimum"};
+    return complete_unconstrained(state, goal, lower_bound, upper_bound, std::move(result), 0);
+  }
+
+  std::optional<PlanResult> complete_unconstrained(const RobotState& state, const Vector& goal,
+                                                  const Vector& lower_bound,
+                                                  const Vector& upper_bound,
+                                                  QPResult result, int steps) {
+    Vector position = state.q, previous_velocity = state.v;
+    if (steps) {
+      position = result.x.segment((steps - 1) * joint_count, joint_count);
+      previous_velocity = result.x.segment(trajectory_size + (steps - 1) * joint_count, joint_count);
+    }
+    for (int k = steps; k < horizon; ++k) {
+      const auto row = k * joint_count;
+      auto velocity = result.x.segment(trajectory_size + row, joint_count);
+      velocity = unconstrained_feedback[k] * (goal - position);
+      position += dt * velocity;
+      if (!(velocity.cwiseAbs().array() <= limits.velocity.array()).all() ||
+          !(position.array() >= limits.lower.array()).all() ||
+          !(position.array() <= limits.upper.array()).all())
+        return std::nullopt;
+      if (limits.acceleration.size() &&
+          !((velocity - previous_velocity).cwiseAbs().array() <=
+            dt * limits.acceleration.array()).all())
+        return std::nullopt;
+      result.x.segment(row, joint_count) = position;
+      previous_velocity = velocity;
+    }
+    validate_solution(result, lower_bound, upper_bound);
+    auto complete = make_plan(state, std::move(result));
+    if (!complete.plan) return std::nullopt;
+    return complete;
+  }
+
   QPResult solve_qp(const Vector& gradient, const Vector& lower_bound, const Vector& upper_bound,
                     const Vector& warm, const Vector& measured_velocity, bool slew_variables,
                     bool* retryable = nullptr) {
@@ -278,6 +464,7 @@ struct SparseJointMPC::Impl {
       data.u = upper_bounds.data();
       auto settings = detail::osqp_settings();
       settings.adaptive_rho_interval = 100;
+      if (prefix_trial) settings.max_iter = prefix_iterations_limit;
       error = osqp_setup(&workspace, &data, &settings);
       workspace_has_slew_variables = slew_variables;
     } else {
@@ -324,7 +511,10 @@ void SparseJointMPC::reset() { impl_->reset(); }
 
 std::size_t SparseJointMPC::fixed_matrix_bytes() const {
   const auto& planner = *impl_;
-  return detail::sparse_matrix_bytes(planner.hessian) +
+  std::size_t prefix_bytes = 0;
+  for (const auto& prefix : planner.prefixes)
+    if (prefix.planner) prefix_bytes += prefix.planner->fixed_matrix_bytes();
+  return prefix_bytes + detail::sparse_matrix_bytes(planner.hessian) +
          detail::sparse_matrix_bytes(planner.constraint) +
          detail::sparse_matrix_bytes(planner.scaled_hessian) +
          detail::sparse_matrix_bytes(planner.scaled_constraint) +
@@ -343,6 +533,12 @@ PlanResult SparseJointMPC::solve(const RobotState& state, const Vector& goal) {
   auto& planner = *impl_;
   Vector gradient, lower_bounds, upper_bounds;
   planner.vectors(state, goal, gradient, lower_bounds, upper_bounds);
+  if (auto result = planner.solve_unconstrained(state, goal, lower_bounds, upper_bounds))
+    return std::move(*result);
+  int prefix_iterations = 0;
+  if (auto result = planner.solve_prefix(state, goal, lower_bounds, upper_bounds, prefix_iterations))
+    return std::move(*result);
+  planner.prepare_solver_matrices();
   const bool centered = planner.position_origin.size() != 0;
   Vector physical_lower, physical_upper;
   if (centered) {
@@ -382,7 +578,7 @@ PlanResult SparseJointMPC::solve(const RobotState& state, const Vector& goal) {
   };
   bool retryable = false;
   auto result = solve(warm, slew_variables, &retryable);
-  if (reused_workspace && retryable) {
+  if (!planner.prefix_trial && reused_workspace && retryable) {
     // Keep the same formulation for the cold retry. A poor warm start
     // can fail even when the velocity-difference model converges cold.
     const auto first_iterations = result.iterations;
@@ -392,7 +588,8 @@ PlanResult SparseJointMPC::solve(const RobotState& state, const Vector& goal) {
     result.iterations += first_iterations;
     result.detail = "cold retry after " + first_status + "; " + result.detail;
   }
-  const bool retry_original = slew_variables && !result.success() && result.status != "infeasible";
+  const bool retry_original = !planner.prefix_trial && slew_variables &&
+                              !result.success() && result.status != "infeasible";
   if (retry_original) {
     const auto first_iterations = result.iterations;
     planner.reset();
@@ -400,26 +597,8 @@ PlanResult SparseJointMPC::solve(const RobotState& state, const Vector& goal) {
     result.iterations += first_iterations;
     result.detail = "retry after velocity-difference solve: " + result.detail;
   }
-  if (!result.success()) return {std::move(result), std::nullopt};
-  JointPlan plan{Matrix(planner.horizon + 1, planner.joint_count),
-                 Matrix(planner.horizon, planner.joint_count), state.stamp, planner.dt};
-  plan.positions.row(0) = state.q.transpose();
-  for (int k = 0; k < planner.horizon; ++k) {
-    const auto velocity =
-        result.x.segment(planner.trajectory_size + k * planner.joint_count, planner.joint_count);
-    plan.velocities.row(k) = velocity.transpose();
-    plan.positions.row(k + 1) = plan.positions.row(k) + planner.dt * velocity.transpose();
-  }
-  const double violation = detail::joint_plan_violation(plan, planner.limits, state);
-  if (violation > 1e-6)
-    return {{"error",
-             {},
-             result.iterations,
-             violation,
-             "reconstructed sparse MPC plan violates joint bounds"},
-            std::nullopt};
-  planner.last_plan = plan;
-  return {std::move(result), std::move(plan)};
+  result.iterations += prefix_iterations;
+  return planner.make_plan(state, std::move(result));
 }
 
 }  // namespace wholebodyx

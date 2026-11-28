@@ -84,6 +84,36 @@ def test_sparse_solver_override_receives_the_absolute_qp(monkeypatch):
     assert calls[0].lower[0] == 1000.
 
 
+def test_sparse_solver_override_receives_the_complete_horizon(monkeypatch):
+    horizon = 128
+    planner = SparseJointMPC(JointLimits([-1.], [1.], [.8], [2.]), horizon=horizon)
+    state, goal = RobotState([0.], [0.]), [.001]
+    calls = []
+
+    def solve(problem, warm_start=None):
+        calls.append(problem)
+        return QPResult("infeasible")
+
+    monkeypatch.setattr(planner.solver, "solve", solve)
+    assert planner.solve(state, goal).plan is None
+    assert len(calls) == 1 and calls[0].gradient.shape == (2 * horizon,)
+    assert calls[0].constraint.shape == (4 * horizon, 2 * horizon)
+
+
+def test_stalled_sparse_prefix_spends_one_iteration_budget_before_full_solve():
+    horizon, dt = 128, .05
+    limits = JointLimits([-1.], [1.], [.8], [.1])
+    state, goal = RobotState([0.], [0.]), [.06]
+    full = OSQPSolver(
+        variable_scaling=np.r_[np.full(horizon, dt), np.ones(horizon)], adaptive_rho_interval=100,
+    )
+    expected = SparseJointMPC(limits, horizon, dt, solver=full).solve(state, goal)
+    actual = SparseJointMPC(limits, horizon, dt).solve(state, goal)
+    assert actual.plan is not None and expected.plan is not None
+    assert actual.solver.iterations == expected.solver.iterations + 6000
+    np.testing.assert_array_equal(actual.solver.x, expected.solver.x)
+
+
 @pytest.mark.parametrize("offset", [0., 1000.])
 def test_short_step_slew_model_exports_the_original_sparse_decision(offset):
     n, horizon, dt = 6, 60, .004
@@ -110,6 +140,19 @@ def test_short_step_slew_model_exports_the_original_sparse_decision(offset):
         problem = planner.formulate(state, goal)
         values = problem.constraint @ actual.solver.x
         assert max((problem.lower - values).max(), (values - problem.upper).max(), 0.) <= 1e-6
+
+
+def test_analytic_sparse_result_defers_the_expanded_matrices():
+    planner = SparseJointMPC(JointLimits([-1.], [1.], [.8], [2.]), horizon=128, dt=.02)
+    state = RobotState([0.], [0.])
+    before = planner.fixed_matrix_bytes
+    direct = planner.solve(state, [.001])
+    assert direct.plan is not None and direct.solver.iterations == 0
+    assert planner.fixed_matrix_bytes == before
+
+    active = planner.solve(state, [1.05])
+    assert active.plan is not None and active.solver.iterations > 0
+    assert planner.fixed_matrix_bytes > before
 
 
 def test_short_step_slew_refusal_retries_original_model(monkeypatch):

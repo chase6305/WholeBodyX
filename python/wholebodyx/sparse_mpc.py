@@ -1,5 +1,8 @@
 """Uncondensed sparse integrator MPC, with the same JointPlan contract."""
 
+from dataclasses import dataclass, replace
+from math import isfinite
+
 import numpy as np
 from scipy import sparse
 
@@ -10,6 +13,96 @@ from .mpc import (
 from .qp import OSQPSolver, QPResult, _OSQP_SOLVE, _immutable, _validated_qp_solution
 from .sparse_qp import _SparseFixedQP, _sparse_template_bytes
 from .types import array
+
+
+_MIN_SUFFIX_HORIZON = 96
+_PREFIX_ITERATIONS_LIMIT = 6000
+
+
+def _default_sparse_solver(scale, prefix_trial):
+    options = {"max_iter": _PREFIX_ITERATIONS_LIMIT} if prefix_trial else {}
+    return OSQPSolver(variable_scaling=scale, adaptive_rho_interval=100, **options)
+
+
+@dataclass
+class _PrefixTrial:
+    steps: int
+    terminal_weight: float
+    response: np.ndarray
+    travel: np.ndarray
+    planner: "SparseJointMPC | None" = None
+
+
+def _unconstrained_response(feedback, dt):
+    """Map the initial position error to the open-loop velocity sequence."""
+    response = feedback.copy()
+    with np.errstate(under="ignore"):
+        response[1:] *= np.cumprod(1. - dt * feedback[:-1])
+    return _immutable(response)
+
+
+def _unconstrained_model(horizon, dt, tracking, effort, terminal, limits):
+    choices = ()
+    if horizon >= _MIN_SUFFIX_HORIZON:
+        choices = (32, min(64, max(40, horizon // 5)), min(horizon // 2, _MIN_SUFFIX_HORIZON - 1))
+    feedback = np.empty(horizon)
+    weights = {}
+    value = terminal
+    for index in range(len(feedback) - 1, -1, -1):
+        denominator = effort + dt * dt * value
+        if not isfinite(denominator):
+            return None, ()
+        gain = dt * value / denominator
+        if not (isfinite(gain) and 0. < gain and dt * gain <= 1.):
+            return None, ()
+        feedback[index] = gain
+        value = tracking + value * (effort / denominator)
+        if not isfinite(value):
+            return None, ()
+        if index in choices:
+            weights[index] = value
+    # Turn each suffix feedback into a response to its own initial error.
+    trials = []
+    with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+        for steps in choices:
+            response = _unconstrained_response(feedback[steps:], dt)
+            duration = steps * dt
+            if limits.acceleration is None:
+                travel = duration * limits.velocity
+            else:
+                speed = np.minimum(limits.velocity, .5 * duration * limits.acceleration)
+                travel = speed * (duration - speed / limits.acceleration)
+            trials.append(_PrefixTrial(steps, weights[steps], response, _immutable(travel)))
+    return _unconstrained_response(feedback, dt), tuple(trials)
+
+
+def _integrator_constraint(size, joints, dt, slew):
+    """Write the integrator, box and slew rows in compressed column order."""
+    row = np.arange(size, dtype=np.int64)
+    has_next = row < size - joints
+    velocity_counts = 3 + has_next if slew else np.full(size, 2, dtype=np.int64)
+    offsets = np.empty(2 * size + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(np.concatenate((2 + has_next, velocity_counts)), out=offsets[1:])
+    rows = np.empty(offsets[-1], dtype=np.int64)
+    values = np.empty(offsets[-1])
+
+    position = offsets[:size]
+    rows[position], values[position] = row, 1.
+    successor = position[:size - joints] + 1
+    rows[successor], values[successor] = row[joints:], -1.
+    position_box = offsets[1:size + 1] - 1
+    rows[position_box], values[position_box] = size + row, 1.
+
+    velocity = offsets[size:-1]
+    rows[velocity], values[velocity] = row, -dt
+    rows[velocity + 1], values[velocity + 1] = 2 * size + row, 1.
+    if slew:
+        rows[velocity + 2], values[velocity + 2] = 3 * size + row, 1.
+        successor = velocity[:size - joints] + 3
+        rows[successor], values[successor] = 3 * size + row[joints:], -1.
+    shape = ((4 if slew else 3) * size, 2 * size)
+    return sparse.csc_matrix((values, rows, offsets), shape=shape)
 
 
 class SparseJointMPC(_JointMPC):
@@ -29,6 +122,8 @@ class SparseJointMPC(_JointMPC):
         control_weight=0.1,
         terminal_weight=30.0,
         solver=None,
+        *,
+        _prefix_trial=False,
     ):
         self._settings = _MPCSettings(
             limits, horizon, dt, tracking_weight, control_weight, terminal_weight
@@ -40,8 +135,9 @@ class SparseJointMPC(_JointMPC):
         scale = np.concatenate(
             (np.full(trajectory_size, np.clip(self.dt, 0.01, 1.0)), np.ones(trajectory_size))
         )
+        self._prefix_trial = _prefix_trial
         self.solver = (
-            OSQPSolver(variable_scaling=scale, adaptive_rho_interval=100)
+            _default_sparse_solver(scale, _prefix_trial)
             if solver is None
             else solver
         )
@@ -59,6 +155,12 @@ class SparseJointMPC(_JointMPC):
             else None
         )
         self._last_plan = None
+        self._free_response, self._prefixes = (
+            _unconstrained_model(self.horizon, self.dt, self.tracking_weight, self.control_weight,
+                                 self.terminal_weight, limits)
+            if self._default_solver is not None and self._position_origin is None
+            else (None, ())
+        )
         self._prepare()
 
     def _prepare(self):
@@ -70,15 +172,9 @@ class SparseJointMPC(_JointMPC):
             (self._position_weights, np.full(trajectory_size, self.control_weight))
         )
         hessian = sparse.diags(diagonal, format="csc")
-        difference = sparse.eye(trajectory_size, format="csc") - sparse.diags(
-            np.ones(trajectory_size - joint_count),
-            -joint_count,
-            shape=(trajectory_size, trajectory_size),
-            format="csc",
-        )
-        dynamics = sparse.hstack((difference, -self.dt * sparse.eye(trajectory_size)), format="csc")
         # Rows: integrator equalities, position boxes, velocity boxes, then slew.
-        rows = [dynamics, sparse.eye(2 * trajectory_size, format="csc")]
+        slew = self.limits.acceleration is not None
+        constraint = _integrator_constraint(trajectory_size, joint_count, self.dt, slew)
         lower = [
             np.zeros(trajectory_size),
             np.tile(self.limits.lower, horizon),
@@ -89,34 +185,39 @@ class SparseJointMPC(_JointMPC):
             np.tile(self.limits.upper, horizon),
             np.tile(self.limits.velocity, horizon),
         ]
-        if self.limits.acceleration is not None:
-            rows.append(
-                sparse.hstack(
-                    (sparse.csc_matrix((trajectory_size, trajectory_size)), difference),
-                    format="csc",
-                )
-            )
+        if slew:
             bound = self.dt * np.tile(self.limits.acceleration, horizon)
             lower.append(-bound)
             upper.append(bound)
-        constraint = sparse.vstack(rows, format="csc")
         self._template = _SparseFixedQP(hessian, constraint)
         self._lower, self._upper = np.concatenate(lower), np.concatenate(upper)
-        self._slew_problem = None
-        if self._default_solver is not None and _prefer_slew_variables(self.limits, self.dt, self.horizon):
-            self._prepare_slew_problem(hessian, constraint, trajectory_size)
+        self._slew_model = None
+        self._use_slew_variables = (
+            self._default_solver is not None
+            and _prefer_slew_variables(self.limits, self.dt, self.horizon)
+        )
 
     @property
     def fixed_matrix_bytes(self):
         total = _sparse_template_bytes(self._template)
-        slew_problem = getattr(self, "_slew_problem", None)
-        if slew_problem is not None:
-            total += _sparse_template_bytes(slew_problem[0])
+        if self._slew_model is not None:
+            total += _sparse_template_bytes(self._slew_model[0])
+        for prefix in self._prefixes:
+            if prefix.planner is not None:
+                total += prefix.planner.fixed_matrix_bytes
         return total
 
-    def _prepare_slew_problem(self, hessian, constraint, size):
+    @property
+    def _slew_problem(self):
+        if self._use_slew_variables and self._slew_model is None:
+            self._slew_model = self._build_slew_problem()
+        return self._slew_model
+
+    def _build_slew_problem(self):
         # Add one decision per velocity difference. The original slew rows
         # become equalities and the new decisions receive separate box rows.
+        hessian, constraint = self._template._hessian, self._template._constraint
+        size = hessian.shape[0] // 2
         identity = sparse.eye(size, format="csc")
         slew_columns = sparse.vstack((sparse.csc_matrix((3 * size, size)), -identity))
         equalities = sparse.hstack((constraint, slew_columns), format="csc")
@@ -125,13 +226,16 @@ class SparseJointMPC(_JointMPC):
         expanded_hessian = sparse.block_diag((hessian, sparse.csc_matrix((size, size))), format="csc")
         template = _SparseFixedQP(expanded_hessian, expanded_constraint)
         scale = np.concatenate((self._default_solver.variable_scaling, np.full(size, .1)))
-        solver = OSQPSolver(variable_scaling=scale, adaptive_rho_interval=100)
-        self._slew_problem = template, solver
+        solver = _default_sparse_solver(scale, self._prefix_trial)
+        return template, solver
 
     def reset(self):
         super().reset()
-        if getattr(self, "_slew_problem", None) is not None:
-            self._slew_problem[1].reset()
+        if self._slew_model is not None:
+            self._slew_model[1].reset()
+        for prefix in self._prefixes:
+            if prefix.planner is not None:
+                prefix.planner.reset()
 
     def formulate(self, state, goal):
         return self._formulate(state, goal, position_origin=None)
@@ -204,7 +308,8 @@ class SparseJointMPC(_JointMPC):
         reused_workspace = solver._solver is not None
         result = solver.solve(expanded_problem, warm_start=warm)
         if (
-            reused_workspace
+            not self._prefix_trial
+            and reused_workspace
             and result.x is None
             and (result.status == "iteration_limit" or result.detail.lower() == "solved inaccurate")
         ):
@@ -224,6 +329,87 @@ class SparseJointMPC(_JointMPC):
             iterations=result.iterations, detail=result.detail,
         )
 
+    def _select_prefix(self, state, goal):
+        limits = self.limits
+        if (goal < limits.lower).any() or (goal > limits.upper).any():
+            return None
+        with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+            distance = np.abs(goal - state.q)
+            for trial in self._prefixes:
+                if (distance <= trial.travel).all() and np.isfinite(trial.terminal_weight * goal).all():
+                    return trial
+        return None
+
+    def _solve_prefix(self, state, goal, problem, size):
+        trial = self._select_prefix(state, goal)
+        if trial is None:
+            return None, 0
+        limits, dt = self.limits, self.dt
+        steps = trial.steps
+        if trial.planner is None:
+            trial.planner = SparseJointMPC(
+                limits, steps, dt, self.tracking_weight, self.control_weight, trial.terminal_weight,
+                _prefix_trial=True,
+            )
+        first = trial.planner.solve(state, goal).solver
+        if not first.success:
+            trial.planner.reset()
+            return None, first.iterations
+        joints = state.q.size
+        prefix_size = steps * joints
+        decision = np.empty(2 * size)
+        decision[:prefix_size] = first.x[:prefix_size]
+        decision[size:size + prefix_size] = first.x[prefix_size:]
+        outcome = self._complete_unconstrained(
+            state, goal, problem, decision, steps, trial.response, first.iterations, "unconstrained suffix",
+        )
+        return outcome, first.iterations
+
+    def _solve_unconstrained(self, state, goal, problem, size):
+        response, limits = self._free_response, self.limits
+        with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+            first = response[0] * (goal - state.q)
+            if not (np.abs(first) <= limits.velocity).all():
+                return None
+            if (limits.acceleration is not None
+                    and not (np.abs(first - state.v) <= self.dt * limits.acceleration).all()):
+                return None
+        return self._complete_unconstrained(
+            state, goal, problem, np.empty(2 * size), 0, response, 0, "unconstrained optimum",
+        )
+
+    def _complete_unconstrained(self, state, goal, problem, decision, steps, response,
+                                iterations, detail):
+        limits, dt = self.limits, self.dt
+        size = decision.size // 2
+        positions = decision[:size].reshape(self.horizon, state.q.size)
+        velocities = decision[size:].reshape(self.horizon, state.q.size)
+        position = positions[steps - 1] if steps else state.q
+        velocity = velocities[steps - 1] if steps else state.v
+        tail_q, tail_v = positions[steps:], velocities[steps:]
+        with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+            np.multiply(response[:, None], goal - position, out=tail_v)
+            _integrate_positions(position, tail_v, dt, out=tail_q)
+            feasible = (
+                (np.abs(tail_v) <= limits.velocity).all()
+                and (tail_q >= limits.lower).all() and (tail_q <= limits.upper).all()
+            )
+            if feasible and limits.acceleration is not None:
+                changes = _velocity_changes(tail_v, velocity)
+                feasible = (np.abs(changes) <= dt * limits.acceleration).all()
+        if not feasible:
+            return None
+        decision.setflags(write=False)
+        result = _validated_qp_solution(
+            decision, problem.constraint, problem.lower, problem.upper,
+            iterations=iterations, detail=detail,
+        )
+        outcome = self._plan_result(
+            state, result, velocity_offset=size, kind="sparse MPC",
+            integrated_positions=positions if steps == 0 else None,
+        )
+        return outcome if outcome.plan is not None else None
+
     def solve(self, state, goal):
         default_adapter = (
             self.solver is self._default_solver
@@ -236,11 +422,22 @@ class SparseJointMPC(_JointMPC):
             and getattr(self.formulate, "__func__", None) is _SPARSE_MPC_FORMULATE
         )
         origin = getattr(self, "_position_origin", None)
-        if origin is not None and default_problem:
+        try_prefix = default_problem and bool(self._prefixes)
+        try_free = default_problem and self._free_response is not None
+        if (origin is not None and default_problem) or try_free or try_prefix:
             goal = array(goal, 1, "goal")
         physical_problem = self.formulate(state, goal)
         joint_count = state.q.size
         trajectory_size = joint_count * self.horizon
+        if try_free:
+            outcome = self._solve_unconstrained(state, goal, physical_problem, trajectory_size)
+            if outcome is not None:
+                return outcome
+        prefix_iterations = 0
+        if try_prefix:
+            outcome, prefix_iterations = self._solve_prefix(state, goal, physical_problem, trajectory_size)
+            if outcome is not None:
+                return outcome
         problem = physical_problem
         if origin is not None and default_problem:
             problem = self._formulate(state, goal, origin)
@@ -254,12 +451,16 @@ class SparseJointMPC(_JointMPC):
             initial = state.q if origin is None else state.q - origin
             _integrate_positions(initial, velocities, self.dt, out=positions)
             warm[trajectory_size:] = velocities.ravel()
-        if default_problem and getattr(self, "_slew_problem", None) is not None:
+        if default_problem and self._use_slew_variables:
             first = self._solve_slew_problem(state, problem, warm, trajectory_size)
             if origin is not None:
                 first = self._physical_result(first, physical_problem, origin, trajectory_size)
             outcome = self._plan_result(state, first, velocity_offset=trajectory_size, kind="sparse MPC")
-            if outcome.plan is not None or first.status == "infeasible":
+            if outcome.plan is not None or first.status == "infeasible" or self._prefix_trial:
+                if prefix_iterations:
+                    outcome = replace(outcome, solver=replace(
+                        outcome.solver, iterations=outcome.solver.iterations + prefix_iterations,
+                    ))
                 return outcome
             # Give a refused expanded solve one attempt in the original model.
             self.reset()
@@ -269,7 +470,9 @@ class SparseJointMPC(_JointMPC):
                 fallback.violation, "retry after velocity-difference solve: " + fallback.detail,
             )
         else:
-            retryable_workspace = default_adapter and self.solver._solver is not None
+            retryable_workspace = (
+                default_adapter and not self._prefix_trial and self.solver._solver is not None
+            )
             result = self.solver.solve(problem, warm_start=warm)
             if (
                 retryable_workspace
@@ -288,6 +491,8 @@ class SparseJointMPC(_JointMPC):
                 )
         if origin is not None:
             result = self._physical_result(result, physical_problem, origin, trajectory_size)
+        if prefix_iterations:
+            result = replace(result, iterations=result.iterations + prefix_iterations)
         return self._plan_result(state, result, velocity_offset=trajectory_size, kind="sparse MPC")
 
 

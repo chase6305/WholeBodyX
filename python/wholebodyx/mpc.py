@@ -224,7 +224,7 @@ class _JointMPC:
         shifted[remaining:] = previous_velocities[-1]
         return shifted
 
-    def _plan_result(self, state, result, velocity_offset=0, kind="MPC"):
+    def _plan_result(self, state, result, velocity_offset=0, kind="MPC", *, integrated_positions=None):
         if not result.success:
             return PlanResult(result)
         joint_count = state.q.size
@@ -242,7 +242,10 @@ class _JointMPC:
         )
         positions = np.empty((self.horizon + 1, joint_count))
         positions[0] = state.q
-        _integrate_positions(state.q, velocities, self.dt, out=positions[1:])
+        if integrated_positions is None:
+            _integrate_positions(state.q, velocities, self.dt, out=positions[1:])
+        else:
+            positions[1:] = integrated_positions
         violation = _joint_plan_violation(self.limits, positions, velocities, state.v, self.dt)
         if violation > 1e-6:
             return PlanResult(

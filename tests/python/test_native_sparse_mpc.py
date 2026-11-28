@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from wholebodyx import (BackendRegistry, JointLimits, JointMPC, RobotState,
+from wholebodyx import (BackendRegistry, JointLimits, JointMPC, OSQPSolver, RobotState,
                         SparseJointMPC, VelocitySession)
 
 
@@ -101,6 +101,101 @@ def test_abrupt_unreachable_targets_do_not_inherit_bad_numerical_conditioning(na
         for result in results[:2]:
             np.testing.assert_allclose(result.plan.velocities, results[-1].plan.velocities, atol=3e-5, rtol=1e-5)
             assert result.solver.violation <= 1e-6
+
+
+def _full_sparse_planner(limits, horizon, dt, **weights):
+    size = limits.lower.size * horizon
+    solver = OSQPSolver(variable_scaling=np.r_[np.full(size, dt), np.ones(size)],
+                        adaptive_rho_interval=100)
+    return SparseJointMPC(limits, horizon=horizon, dt=dt, solver=solver, **weights)
+
+
+@pytest.mark.parametrize("slew", [False, True])
+@pytest.mark.parametrize("backend", ["sparse", "native-sparse"])
+def test_unconstrained_suffix_preserves_the_full_sparse_optimum(request, backend, slew):
+    limits = JointLimits([-1., -1.], [1., 1.], [.8, .7], [2., 1.8] if slew else None)
+    horizon, dt = 128, .05
+    weights = dict(tracking_weight=8., control_weight=.12, terminal_weight=18.)
+    state = RobotState([-.2, .23], [.03, -.02], 6.)
+    goal = [.28, -.25]
+    cls = SparseJointMPC if backend == "sparse" else request.getfixturevalue("native_sparse")
+    planner = cls(limits, horizon=horizon, dt=dt, **weights)
+    expected = _full_sparse_planner(limits, horizon, dt, **weights).solve(state, goal)
+    actual = planner.solve(state, goal)
+    assert actual.plan is not None and expected.plan is not None
+    assert actual.solver.detail == "unconstrained suffix"
+    np.testing.assert_allclose(actual.plan.positions, expected.plan.positions, atol=1e-6, rtol=0)
+    np.testing.assert_allclose(actual.plan.velocities, expected.plan.velocities, atol=1e-5, rtol=0)
+    problem = planner.formulate(state, goal)
+    values = problem.constraint @ actual.solver.x
+    assert max(0., np.max(problem.lower - values), np.max(values - problem.upper)) <= 1e-6
+    planner.reset()
+    replayed = planner.solve(state, goal)
+    np.testing.assert_array_equal(replayed.solver.x, actual.solver.x)
+
+
+@pytest.mark.parametrize("backend", ["sparse", "native-sparse"])
+def test_longer_prefix_handles_a_large_short_step_retarget(request, backend):
+    limits = JointLimits([-1.], [1.], [.8], [2.])
+    horizon, dt = 200, .02
+    cls = SparseJointMPC if backend == "sparse" else request.getfixturevalue("native_sparse")
+    planner = cls(limits, horizon=horizon, dt=dt)
+    reference = _full_sparse_planner(limits, horizon, dt)
+    for index, target in enumerate((.15, .9, .15)):
+        state, goal = RobotState([0.], [0.], index * dt), [target]
+        expected = reference.solve(state, goal)
+        actual = planner.solve(state, goal)
+        assert actual.plan is not None and expected.plan is not None
+        assert actual.solver.detail == "unconstrained suffix"
+        np.testing.assert_allclose(actual.plan.velocities, expected.plan.velocities, atol=1e-5, rtol=0)
+
+
+@pytest.mark.parametrize("backend", ["sparse", "native-sparse"])
+def test_slew_across_the_unconstrained_suffix_boundary_can_force_a_full_solve(request, backend):
+    horizon, dt = 128, .05
+    limits = JointLimits([-1.], [1.], [.8], [1.])
+    state, goal = RobotState([0.], [-.5]), [.32]
+    weights = dict(tracking_weight=3.)
+    cls = SparseJointMPC if backend == "sparse" else request.getfixturevalue("native_sparse")
+    planner = cls(limits, horizon=horizon, dt=dt, **weights)
+    expected = _full_sparse_planner(limits, horizon, dt, **weights).solve(state, goal)
+    actual = planner.solve(state, goal)
+    assert actual.plan is not None and expected.plan is not None
+    assert actual.solver.detail != "unconstrained suffix"
+    np.testing.assert_allclose(actual.plan.velocities, expected.plan.velocities, atol=2e-5, rtol=0)
+    slew = np.diff(np.r_[state.v[0], actual.plan.velocities[:, 0]])
+    assert np.abs(slew).max() <= dt * limits.acceleration[0] + 1e-6
+
+
+@pytest.mark.parametrize("backend", ["sparse", "native-sparse"])
+def test_feasible_full_unconstrained_response_avoids_iterations(request, backend):
+    cls = SparseJointMPC if backend == "sparse" else request.getfixturevalue("native_sparse")
+    limits = JointLimits([-1., -1.], [1., 1.], [.8, .8], [2., 2.])
+    state, goal = RobotState([.2, -.15], [0., 0.]), [.201, -.147]
+    horizon, dt = 20, .05
+    planner = cls(limits, horizon=horizon, dt=dt)
+    actual = planner.solve(state, goal)
+    expected = _full_sparse_planner(limits, horizon, dt).solve(state, goal)
+    assert actual.plan is not None and expected.plan is not None
+    assert actual.solver.iterations == 0 and actual.solver.detail == "unconstrained optimum"
+    np.testing.assert_allclose(actual.plan.positions, expected.plan.positions, atol=1e-7, rtol=0)
+    np.testing.assert_allclose(actual.plan.velocities, expected.plan.velocities, atol=1e-6, rtol=0)
+
+
+@pytest.mark.parametrize("backend", ["sparse", "native-sparse"])
+def test_unconstrained_response_checks_slew_after_the_first_interval(request, backend):
+    cls = SparseJointMPC if backend == "sparse" else request.getfixturevalue("native_sparse")
+    horizon, dt = 20, .1
+    goal = [.05]
+    free = _full_sparse_planner(JointLimits([-1.], [1.], [1.]), horizon, dt)
+    unconstrained = free.solve(RobotState([0.], [0.]), goal).plan
+    assert abs(unconstrained.velocities[1, 0] - unconstrained.velocities[0, 0]) > dt
+    state = RobotState([0.], unconstrained.velocities[0])
+    limits = JointLimits([-1.], [1.], [1.], [1.])
+    result = cls(limits, horizon=horizon, dt=dt).solve(state, goal)
+    assert result.plan is not None and result.solver.detail != "unconstrained optimum"
+    slew = np.diff(np.r_[state.v[0], result.plan.velocities[:, 0]])
+    assert np.abs(slew).max() <= dt + 1e-6
 
 
 @pytest.mark.parametrize("option", [{"horizon": True}, {"horizon": 0}, {"dt": 0},
