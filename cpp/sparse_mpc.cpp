@@ -101,40 +101,52 @@ struct SparseJointMPC::Impl {
     if (!center_positions) position_origin.resize(0);
     const bool slew = limits.acceleration.size() != 0;
     const auto rows = (slew ? 4 : 3) * trajectory_size;
-    std::vector<Eigen::Triplet<double>> hessian_entries, constraint_entries;
-    hessian_entries.reserve(2 * trajectory_size);
-    constraint_entries.reserve((slew ? 7 : 5) * trajectory_size);
     lower = Vector::Zero(rows);
     upper = Vector::Zero(rows);
     position_weights = Vector::Constant(trajectory_size, tracking_weight);
     position_weights.tail(joint_count).setConstant(terminal_weight);
     for (Eigen::Index i = 0; i < trajectory_size; ++i) {
       const auto joint = i % joint_count;
-      hessian_entries.emplace_back(i, i, position_weights[i]);
-      hessian_entries.emplace_back(trajectory_size + i, trajectory_size + i, control_weight);
-      constraint_entries.emplace_back(i, i, 1.);
-      if (i >= joint_count) constraint_entries.emplace_back(i, i - joint_count, -1.);
-      constraint_entries.emplace_back(i, trajectory_size + i, -dt);
-      constraint_entries.emplace_back(trajectory_size + i, i, 1.);
-      constraint_entries.emplace_back(2 * trajectory_size + i, trajectory_size + i, 1.);
       lower[trajectory_size + i] = limits.lower[joint];
       upper[trajectory_size + i] = limits.upper[joint];
       lower[2 * trajectory_size + i] = -limits.velocity[joint];
       upper[2 * trajectory_size + i] = limits.velocity[joint];
       if (slew) {
-        constraint_entries.emplace_back(3 * trajectory_size + i, trajectory_size + i, 1.);
-        if (i >= joint_count)
-          constraint_entries.emplace_back(3 * trajectory_size + i,
-                                          trajectory_size + i - joint_count, -1.);
         upper[3 * trajectory_size + i] = dt * limits.acceleration[joint];
         lower[3 * trajectory_size + i] = -upper[3 * trajectory_size + i];
       }
     }
     require(lower.allFinite() && upper.allFinite(), "nonfinite MPC bounds");
     hessian.resize(2 * trajectory_size, 2 * trajectory_size);
-    hessian.setFromTriplets(hessian_entries.begin(), hessian_entries.end());
+    hessian.reserve(2 * trajectory_size);
     constraint.resize(rows, 2 * trajectory_size);
-    constraint.setFromTriplets(constraint_entries.begin(), constraint_entries.end());
+    constraint.reserve((slew ? 7 : 5) * trajectory_size - (slew ? 2 : 1) * joint_count);
+    // Every column is already known in increasing row order. Append directly
+    // to compressed storage and reserve the exact number of entries.
+    for (Eigen::Index i = 0; i < trajectory_size; ++i) {
+      hessian.startVec(i);
+      hessian.insertBack(i, i) = position_weights[i];
+      constraint.startVec(i);
+      constraint.insertBack(i, i) = 1.;
+      if (i + joint_count < trajectory_size)
+        constraint.insertBack(i + joint_count, i) = -1.;
+      constraint.insertBack(trajectory_size + i, i) = 1.;
+    }
+    for (Eigen::Index i = 0; i < trajectory_size; ++i) {
+      const auto column = trajectory_size + i;
+      hessian.startVec(column);
+      hessian.insertBack(column, column) = control_weight;
+      constraint.startVec(column);
+      constraint.insertBack(i, column) = -dt;
+      constraint.insertBack(2 * trajectory_size + i, column) = 1.;
+      if (slew) {
+        constraint.insertBack(3 * trajectory_size + i, column) = 1.;
+        if (i + joint_count < trajectory_size)
+          constraint.insertBack(3 * trajectory_size + i + joint_count, column) = -1.;
+      }
+    }
+    hessian.finalize();
+    constraint.finalize();
     // Internal x = D*z conditioning; public diagnostics and results retain x.
     scaled_hessian = hessian;
     scaled_constraint = constraint;
@@ -149,13 +161,20 @@ struct SparseJointMPC::Impl {
       // decision per velocity difference and separate its box from dynamics.
       slew_hessian = scaled_hessian;
       slew_hessian.conservativeResize(3 * trajectory_size, 3 * trajectory_size);
-      slew_constraint = scaled_constraint;
-      slew_constraint.conservativeResize(5 * trajectory_size, 3 * trajectory_size);
-      for (Eigen::Index i = 0; i < trajectory_size; ++i) {
-        slew_constraint.insert(3 * trajectory_size + i, 2 * trajectory_size + i) = -slew_scale;
-        slew_constraint.insert(4 * trajectory_size + i, 2 * trajectory_size + i) = slew_scale;
+      slew_constraint.resize(5 * trajectory_size, 3 * trajectory_size);
+      slew_constraint.reserve(scaled_constraint.nonZeros() + 2 * trajectory_size);
+      for (Eigen::Index column = 0; column < scaled_constraint.cols(); ++column) {
+        slew_constraint.startVec(column);
+        for (Eigen::SparseMatrix<double>::InnerIterator it(scaled_constraint, column); it; ++it)
+          slew_constraint.insertBack(it.row(), column) = it.value();
       }
-      slew_constraint.makeCompressed();
+      for (Eigen::Index i = 0; i < trajectory_size; ++i) {
+        const auto column = 2 * trajectory_size + i;
+        slew_constraint.startVec(column);
+        slew_constraint.insertBack(3 * trajectory_size + i, column) = -slew_scale;
+        slew_constraint.insertBack(4 * trajectory_size + i, column) = slew_scale;
+      }
+      slew_constraint.finalize();
     }
     prepare_tail_feedback();
   }
