@@ -6,6 +6,7 @@
 
 #include <osqp/osqp.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -42,6 +43,13 @@ struct CscStorage {
 }  // namespace
 
 struct SparseJointMPC::Impl {
+  struct PrefixTrial {
+    int horizon = 0;
+    double terminal_weight = 0.;
+    Vector travel;
+    std::unique_ptr<SparseJointMPC> planner;
+  };
+
   JointLimits limits;
   int horizon;
   double dt, tracking_weight, control_weight, terminal_weight, position_scale;
@@ -51,12 +59,12 @@ struct SparseJointMPC::Impl {
   Eigen::SparseMatrix<double> slew_hessian, slew_constraint;
   Vector lower, upper, position_weights, position_origin;
   Vector tail_feedback;
-  double prefix_terminal_weight = 0.;
-  std::unique_ptr<SparseJointMPC> prefix;
+  std::array<PrefixTrial, 3> prefixes;
   std::optional<JointPlan> last_plan;
   OSQPWorkspace* workspace = nullptr;
   bool workspace_has_slew_variables = false;
   static constexpr double slew_scale = .1;
+  static constexpr int minimum_suffix_horizon = 96;
 
   Impl(JointLimits bounds, int count, double step, double tracking, double control, double terminal)
       : limits(std::move(bounds)),
@@ -153,9 +161,14 @@ struct SparseJointMPC::Impl {
   }
 
   void prepare_tail_feedback() {
-    if (horizon < 96 || position_origin.size()) return;
-    const int prefix_horizon = std::clamp(horizon / 4, 32, 64);
-    Vector feedback(horizon - prefix_horizon);
+    if (horizon < minimum_suffix_horizon || position_origin.size()) return;
+    const int shortest = 32;
+    std::array<PrefixTrial, 3> candidates;
+    candidates[0].horizon = shortest;
+    candidates[1].horizon = std::clamp(horizon / 5, 40, 64);
+    // Keep subsidiary solves below the threshold that creates their own prefix.
+    candidates[2].horizon = std::min(horizon / 2, minimum_suffix_horizon - 1);
+    Vector feedback(horizon - shortest);
     const long double step = dt, effort = control_weight;
     long double value = terminal_weight;
     // Eliminating one unconstrained interval leaves a scalar quadratic
@@ -168,9 +181,12 @@ struct SparseJointMPC::Impl {
       feedback[i] = static_cast<double>(gain);
       if (!(feedback[i] > 0. && dt * feedback[i] <= 1.)) return;
       value = tracking_weight + value * (effort / denominator);
+      if (!std::isfinite(value) || value > std::numeric_limits<double>::max()) return;
+      for (auto& trial : candidates)
+        if (i + shortest == trial.horizon) trial.terminal_weight = static_cast<double>(value);
     }
-    if (!std::isfinite(value) || value > std::numeric_limits<double>::max()) return;
-    prefix_terminal_weight = static_cast<double>(value);
+    for (auto& trial : candidates) trial.travel = travel_estimate(trial.horizon);
+    prefixes = std::move(candidates);
     tail_feedback = std::move(feedback);
   }
 
@@ -182,7 +198,8 @@ struct SparseJointMPC::Impl {
     if (workspace) osqp_cleanup(workspace);
     workspace = nullptr;
     last_plan.reset();
-    if (prefix) prefix->reset();
+    for (auto& prefix : prefixes)
+      if (prefix.planner) prefix.planner->reset();
   }
 
   void vectors(const RobotState& state, const Vector& goal, Vector& gradient, Vector& lower_bounds,
@@ -266,25 +283,43 @@ struct SparseJointMPC::Impl {
     return {std::move(result), std::move(plan)};
   }
 
+  Vector travel_estimate(int steps) const {
+    const long double duration = static_cast<long double>(dt) * steps;
+    Vector travel(joint_count);
+    for (Eigen::Index j = 0; j < joint_count; ++j) {
+      long double speed = limits.velocity[j], time = duration;
+      if (limits.acceleration.size()) {
+        const long double acceleration = limits.acceleration[j];
+        speed = std::min(speed, .5L * duration * acceleration);
+        time -= speed / acceleration;
+      }
+      const long double range = speed * time;
+      travel[j] = range <= std::numeric_limits<double>::max() ? static_cast<double>(range) : INFINITY;
+    }
+    return travel;
+  }
+
   std::optional<PlanResult> solve_prefix(const RobotState& state, const Vector& goal,
                                         const Vector& lower_bound, const Vector& upper_bound,
                                         int& iterations) {
     if (!tail_feedback.size()) return std::nullopt;
-    const int steps = horizon - tail_feedback.size();
-    const double duration = dt * steps;
-    const Vector distance = (goal - state.q).cwiseAbs();
-    // Screen candidates with a rest-to-rest travel estimate.
     if ((goal.array() < limits.lower.array()).any() ||
-        (goal.array() > limits.upper.array()).any() ||
-        !((prefix_terminal_weight * goal).allFinite()) ||
-        (distance.array() > duration * limits.velocity.array()).any() ||
-        (limits.acceleration.size() &&
-         (distance.array() > .25 * duration * duration * limits.acceleration.array()).any()))
+        (goal.array() > limits.upper.array()).any())
       return std::nullopt;
-    if (!prefix)
-      prefix = std::make_unique<SparseJointMPC>(limits, steps, dt, tracking_weight, control_weight,
-                                                prefix_terminal_weight);
-    auto first = prefix->solve(state, goal);
+    const Vector distance = (goal - state.q).cwiseAbs();
+    // Choose one speculative workspace using the distance that a
+    // rest-to-rest motion can cover at the speed and acceleration limits.
+    auto prefix = std::find_if(prefixes.begin(), prefixes.end(), [&](const PrefixTrial& trial) {
+      return (distance.array() <= trial.travel.array()).all() &&
+             (trial.terminal_weight * goal).allFinite();
+    });
+    if (prefix == prefixes.end())
+      return std::nullopt;
+    const int steps = prefix->horizon;
+    if (!prefix->planner)
+      prefix->planner = std::make_unique<SparseJointMPC>(limits, steps, dt, tracking_weight,
+                                                        control_weight, prefix->terminal_weight);
+    auto first = prefix->planner->solve(state, goal);
     iterations = first.solver.iterations;
     if (!first.solver.success()) return std::nullopt;
     const Eigen::Index prefix_size = steps * joint_count;
@@ -297,7 +332,7 @@ struct SparseJointMPC::Impl {
     for (int k = steps; k < horizon; ++k) {
       const auto row = k * joint_count;
       auto velocity = result.x.segment(trajectory_size + row, joint_count);
-      velocity = tail_feedback[k - steps] * (goal - position);
+      velocity = tail_feedback[k - prefixes.front().horizon] * (goal - position);
       position += dt * velocity;
       if (!(velocity.cwiseAbs().array() <= limits.velocity.array()).all() ||
           !(position.array() >= limits.lower.array()).all() ||
@@ -418,13 +453,15 @@ void SparseJointMPC::reset() { impl_->reset(); }
 
 std::size_t SparseJointMPC::fixed_matrix_bytes() const {
   const auto& planner = *impl_;
-  return detail::sparse_matrix_bytes(planner.hessian) +
+  std::size_t prefix_bytes = 0;
+  for (const auto& prefix : planner.prefixes)
+    if (prefix.planner) prefix_bytes += prefix.planner->fixed_matrix_bytes();
+  return prefix_bytes + detail::sparse_matrix_bytes(planner.hessian) +
          detail::sparse_matrix_bytes(planner.constraint) +
          detail::sparse_matrix_bytes(planner.scaled_hessian) +
          detail::sparse_matrix_bytes(planner.scaled_constraint) +
          detail::sparse_matrix_bytes(planner.slew_hessian) +
-         detail::sparse_matrix_bytes(planner.slew_constraint) +
-         (planner.prefix ? planner.prefix->fixed_matrix_bytes() : 0);
+         detail::sparse_matrix_bytes(planner.slew_constraint);
 }
 
 SparseMPCProblem SparseJointMPC::formulate(const RobotState& state, const Vector& goal) const {

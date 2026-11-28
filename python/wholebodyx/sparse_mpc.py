@@ -1,6 +1,6 @@
 """Uncondensed sparse integrator MPC, with the same JointPlan contract."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from math import isfinite
 
 import numpy as np
@@ -15,28 +15,55 @@ from .sparse_qp import _SparseFixedQP, _sparse_template_bytes
 from .types import array
 
 
-def _tail_cost(horizon, dt, tracking, effort, terminal):
-    if horizon < 96:
-        return None
-    steps = min(64, max(32, horizon // 4))
-    feedback = np.empty(horizon - steps)
+_MIN_SUFFIX_HORIZON = 96
+
+
+@dataclass
+class _PrefixTrial:
+    steps: int
+    terminal_weight: float
+    response: np.ndarray
+    travel: np.ndarray
+    planner: "SparseJointMPC | None" = None
+
+
+def _tail_costs(horizon, dt, tracking, effort, terminal, limits):
+    if horizon < _MIN_SUFFIX_HORIZON:
+        return ()
+    shortest = 32
+    choices = (
+        shortest, min(64, max(40, horizon // 5)), min(horizon // 2, _MIN_SUFFIX_HORIZON - 1),
+    )
+    feedback = np.empty(horizon - shortest)
+    weights = {}
     value = terminal
     for index in range(len(feedback) - 1, -1, -1):
         denominator = effort + dt * dt * value
         if not isfinite(denominator):
-            return None
+            return ()
         gain = dt * value / denominator
         if not (isfinite(gain) and 0. < gain and dt * gain <= 1.):
-            return None
+            return ()
         feedback[index] = gain
         value = tracking + value * (effort / denominator)
-    if not isfinite(value):
-        return None
-    # Turn the per-step feedback into a linear response to the position
-    # error at the beginning of the suffix.
-    with np.errstate(under="ignore"):
-        feedback[1:] *= np.cumprod(1. - dt * feedback[:-1])
-    return steps, value, _immutable(feedback)
+        if not isfinite(value):
+            return ()
+        if index + shortest in choices:
+            weights[index + shortest] = value
+    # Turn each suffix feedback into a response to its own initial error.
+    trials = []
+    with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+        for steps in choices:
+            response = feedback[steps - shortest:].copy()
+            response[1:] *= np.cumprod(1. - dt * response[:-1])
+            duration = steps * dt
+            if limits.acceleration is None:
+                travel = duration * limits.velocity
+            else:
+                speed = np.minimum(limits.velocity, .5 * duration * limits.acceleration)
+                travel = speed * (duration - speed / limits.acceleration)
+            trials.append(_PrefixTrial(steps, weights[steps], _immutable(response), _immutable(travel)))
+    return tuple(trials)
 
 
 class SparseJointMPC(_JointMPC):
@@ -86,12 +113,11 @@ class SparseJointMPC(_JointMPC):
             else None
         )
         self._last_plan = None
-        self._prefix = None
-        self._tail = (
-            _tail_cost(self.horizon, self.dt, self.tracking_weight, self.control_weight,
-                       self.terminal_weight)
+        self._prefixes = (
+            _tail_costs(self.horizon, self.dt, self.tracking_weight, self.control_weight,
+                        self.terminal_weight, limits)
             if self._default_solver is not None and self._position_origin is None
-            else None
+            else ()
         )
         self._prepare()
 
@@ -146,9 +172,9 @@ class SparseJointMPC(_JointMPC):
         slew_problem = getattr(self, "_slew_problem", None)
         if slew_problem is not None:
             total += _sparse_template_bytes(slew_problem[0])
-        prefix = getattr(self, "_prefix", None)
-        if prefix is not None:
-            total += prefix.fixed_matrix_bytes
+        for prefix in self._prefixes:
+            if prefix.planner is not None:
+                total += prefix.planner.fixed_matrix_bytes
         return total
 
     def _prepare_slew_problem(self, hessian, constraint, size):
@@ -169,8 +195,9 @@ class SparseJointMPC(_JointMPC):
         super().reset()
         if getattr(self, "_slew_problem", None) is not None:
             self._slew_problem[1].reset()
-        if getattr(self, "_prefix", None) is not None:
-            self._prefix.reset()
+        for prefix in self._prefixes:
+            if prefix.planner is not None:
+                prefix.planner.reset()
 
     def formulate(self, state, goal):
         return self._formulate(state, goal, position_origin=None)
@@ -263,25 +290,28 @@ class SparseJointMPC(_JointMPC):
             iterations=result.iterations, detail=result.detail,
         )
 
-    def _solve_prefix(self, state, goal, problem, size):
-        steps, terminal_weight, response = self._tail
-        limits, dt = self.limits, self.dt
-        duration = steps * dt
+    def _select_prefix(self, state, goal):
+        limits = self.limits
+        if (goal < limits.lower).any() or (goal > limits.upper).any():
+            return None
         with np.errstate(over="ignore", invalid="ignore", under="ignore"):
             distance = np.abs(goal - state.q)
-            if (
-                (goal < limits.lower).any() or (goal > limits.upper).any()
-                or not np.isfinite(terminal_weight * goal).all()
-                or (distance > duration * limits.velocity).any()
-                or (limits.acceleration is not None
-                    and (distance > .25 * duration * duration * limits.acceleration).any())
-            ):
-                return None, 0
-        if self._prefix is None:
-            self._prefix = SparseJointMPC(
-                limits, steps, dt, self.tracking_weight, self.control_weight, terminal_weight,
+            for trial in self._prefixes:
+                if (distance <= trial.travel).all() and np.isfinite(trial.terminal_weight * goal).all():
+                    return trial
+        return None
+
+    def _solve_prefix(self, state, goal, problem, size):
+        trial = self._select_prefix(state, goal)
+        if trial is None:
+            return None, 0
+        limits, dt = self.limits, self.dt
+        steps = trial.steps
+        if trial.planner is None:
+            trial.planner = SparseJointMPC(
+                limits, steps, dt, self.tracking_weight, self.control_weight, trial.terminal_weight,
             )
-        first = self._prefix.solve(state, goal).solver
+        first = trial.planner.solve(state, goal).solver
         if not first.success:
             return None, first.iterations
         joints = state.q.size
@@ -293,7 +323,7 @@ class SparseJointMPC(_JointMPC):
         velocities[:steps] = first.x[prefix_size:].reshape(steps, joints)
         tail_q, tail_v = positions[steps:], velocities[steps:]
         with np.errstate(over="ignore", invalid="ignore", under="ignore"):
-            np.multiply(response[:, None], goal - positions[steps - 1], out=tail_v)
+            np.multiply(trial.response[:, None], goal - positions[steps - 1], out=tail_v)
             _integrate_positions(positions[steps - 1], tail_v, dt, out=tail_q)
             feasible = (
                 (np.abs(tail_v) <= limits.velocity).all()
@@ -324,7 +354,7 @@ class SparseJointMPC(_JointMPC):
             and getattr(self.formulate, "__func__", None) is _SPARSE_MPC_FORMULATE
         )
         origin = getattr(self, "_position_origin", None)
-        try_prefix = default_problem and self._tail is not None
+        try_prefix = default_problem and bool(self._prefixes)
         if (origin is not None and default_problem) or try_prefix:
             goal = array(goal, 1, "goal")
         physical_problem = self.formulate(state, goal)

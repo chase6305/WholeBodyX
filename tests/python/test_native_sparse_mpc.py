@@ -135,6 +135,22 @@ def test_unconstrained_suffix_preserves_the_full_sparse_optimum(request, backend
 
 
 @pytest.mark.parametrize("backend", ["sparse", "native-sparse"])
+def test_longer_prefix_handles_a_large_short_step_retarget(request, backend):
+    limits = JointLimits([-1.], [1.], [.8], [2.])
+    horizon, dt = 200, .02
+    cls = SparseJointMPC if backend == "sparse" else request.getfixturevalue("native_sparse")
+    planner = cls(limits, horizon=horizon, dt=dt)
+    reference = _full_sparse_planner(limits, horizon, dt)
+    for index, target in enumerate((.15, .9, .15)):
+        state, goal = RobotState([0.], [0.], index * dt), [target]
+        expected = reference.solve(state, goal)
+        actual = planner.solve(state, goal)
+        assert actual.plan is not None and expected.plan is not None
+        assert actual.solver.detail == "unconstrained suffix"
+        np.testing.assert_allclose(actual.plan.velocities, expected.plan.velocities, atol=1e-5, rtol=0)
+
+
+@pytest.mark.parametrize("backend", ["sparse", "native-sparse"])
 def test_slew_across_the_unconstrained_suffix_boundary_can_force_a_full_solve(request, backend):
     horizon, dt = 128, .05
     limits = JointLimits([-1.], [1.], [.8], [.1])
