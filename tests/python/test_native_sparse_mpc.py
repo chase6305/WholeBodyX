@@ -153,11 +153,12 @@ def test_longer_prefix_handles_a_large_short_step_retarget(request, backend):
 @pytest.mark.parametrize("backend", ["sparse", "native-sparse"])
 def test_slew_across_the_unconstrained_suffix_boundary_can_force_a_full_solve(request, backend):
     horizon, dt = 128, .05
-    limits = JointLimits([-1.], [1.], [.8], [.1])
-    state, goal = RobotState([0.], [0.]), [.06]
+    limits = JointLimits([-1.], [1.], [.8], [1.])
+    state, goal = RobotState([0.], [-.5]), [.32]
+    weights = dict(tracking_weight=3.)
     cls = SparseJointMPC if backend == "sparse" else request.getfixturevalue("native_sparse")
-    planner = cls(limits, horizon=horizon, dt=dt)
-    expected = _full_sparse_planner(limits, horizon, dt).solve(state, goal)
+    planner = cls(limits, horizon=horizon, dt=dt, **weights)
+    expected = _full_sparse_planner(limits, horizon, dt, **weights).solve(state, goal)
     actual = planner.solve(state, goal)
     assert actual.plan is not None and expected.plan is not None
     assert actual.solver.detail != "unconstrained suffix"

@@ -16,6 +16,12 @@ from .types import array
 
 
 _MIN_SUFFIX_HORIZON = 96
+_PREFIX_ITERATIONS_LIMIT = 6000
+
+
+def _default_sparse_solver(scale, prefix_trial):
+    options = {"max_iter": _PREFIX_ITERATIONS_LIMIT} if prefix_trial else {}
+    return OSQPSolver(variable_scaling=scale, adaptive_rho_interval=100, **options)
 
 
 @dataclass
@@ -87,6 +93,8 @@ class SparseJointMPC(_JointMPC):
         control_weight=0.1,
         terminal_weight=30.0,
         solver=None,
+        *,
+        _prefix_trial=False,
     ):
         self._settings = _MPCSettings(
             limits, horizon, dt, tracking_weight, control_weight, terminal_weight
@@ -98,8 +106,9 @@ class SparseJointMPC(_JointMPC):
         scale = np.concatenate(
             (np.full(trajectory_size, np.clip(self.dt, 0.01, 1.0)), np.ones(trajectory_size))
         )
+        self._prefix_trial = _prefix_trial
         self.solver = (
-            OSQPSolver(variable_scaling=scale, adaptive_rho_interval=100)
+            _default_sparse_solver(scale, _prefix_trial)
             if solver is None
             else solver
         )
@@ -192,7 +201,7 @@ class SparseJointMPC(_JointMPC):
         expanded_hessian = sparse.block_diag((hessian, sparse.csc_matrix((size, size))), format="csc")
         template = _SparseFixedQP(expanded_hessian, expanded_constraint)
         scale = np.concatenate((self._default_solver.variable_scaling, np.full(size, .1)))
-        solver = OSQPSolver(variable_scaling=scale, adaptive_rho_interval=100)
+        solver = _default_sparse_solver(scale, self._prefix_trial)
         self._slew_problem = template, solver
 
     def reset(self):
@@ -274,7 +283,8 @@ class SparseJointMPC(_JointMPC):
         reused_workspace = solver._solver is not None
         result = solver.solve(expanded_problem, warm_start=warm)
         if (
-            reused_workspace
+            not self._prefix_trial
+            and reused_workspace
             and result.x is None
             and (result.status == "iteration_limit" or result.detail.lower() == "solved inaccurate")
         ):
@@ -314,9 +324,11 @@ class SparseJointMPC(_JointMPC):
         if trial.planner is None:
             trial.planner = SparseJointMPC(
                 limits, steps, dt, self.tracking_weight, self.control_weight, trial.terminal_weight,
+                _prefix_trial=True,
             )
         first = trial.planner.solve(state, goal).solver
         if not first.success:
+            trial.planner.reset()
             return None, first.iterations
         joints = state.q.size
         prefix_size = steps * joints
@@ -416,7 +428,7 @@ class SparseJointMPC(_JointMPC):
             if origin is not None:
                 first = self._physical_result(first, physical_problem, origin, trajectory_size)
             outcome = self._plan_result(state, first, velocity_offset=trajectory_size, kind="sparse MPC")
-            if outcome.plan is not None or first.status == "infeasible":
+            if outcome.plan is not None or first.status == "infeasible" or self._prefix_trial:
                 if prefix_iterations:
                     outcome = replace(outcome, solver=replace(
                         outcome.solver, iterations=outcome.solver.iterations + prefix_iterations,
@@ -430,7 +442,9 @@ class SparseJointMPC(_JointMPC):
                 fallback.violation, "retry after velocity-difference solve: " + fallback.detail,
             )
         else:
-            retryable_workspace = default_adapter and self.solver._solver is not None
+            retryable_workspace = (
+                default_adapter and not self._prefix_trial and self.solver._solver is not None
+            )
             result = self.solver.solve(problem, warm_start=warm)
             if (
                 retryable_workspace

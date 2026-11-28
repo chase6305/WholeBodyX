@@ -100,6 +100,20 @@ def test_sparse_solver_override_receives_the_complete_horizon(monkeypatch):
     assert calls[0].constraint.shape == (4 * horizon, 2 * horizon)
 
 
+def test_stalled_sparse_prefix_spends_one_iteration_budget_before_full_solve():
+    horizon, dt = 128, .05
+    limits = JointLimits([-1.], [1.], [.8], [.1])
+    state, goal = RobotState([0.], [0.]), [.06]
+    full = OSQPSolver(
+        variable_scaling=np.r_[np.full(horizon, dt), np.ones(horizon)], adaptive_rho_interval=100,
+    )
+    expected = SparseJointMPC(limits, horizon, dt, solver=full).solve(state, goal)
+    actual = SparseJointMPC(limits, horizon, dt).solve(state, goal)
+    assert actual.plan is not None and expected.plan is not None
+    assert actual.solver.iterations == expected.solver.iterations + 6000
+    np.testing.assert_array_equal(actual.solver.x, expected.solver.x)
+
+
 @pytest.mark.parametrize("offset", [0., 1000.])
 def test_short_step_slew_model_exports_the_original_sparse_decision(offset):
     n, horizon, dt = 6, 60, .004

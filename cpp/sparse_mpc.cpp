@@ -63,8 +63,10 @@ struct SparseJointMPC::Impl {
   std::optional<JointPlan> last_plan;
   OSQPWorkspace* workspace = nullptr;
   bool workspace_has_slew_variables = false;
+  bool prefix_trial = false;
   static constexpr double slew_scale = .1;
   static constexpr int minimum_suffix_horizon = 96;
+  static constexpr int prefix_iterations_limit = 6000;
 
   Impl(JointLimits bounds, int count, double step, double tracking, double control, double terminal)
       : limits(std::move(bounds)),
@@ -337,12 +339,17 @@ struct SparseJointMPC::Impl {
     if (prefix == prefixes.end())
       return std::nullopt;
     const int steps = prefix->horizon;
-    if (!prefix->planner)
+    if (!prefix->planner) {
       prefix->planner = std::make_unique<SparseJointMPC>(limits, steps, dt, tracking_weight,
                                                         control_weight, prefix->terminal_weight);
+      prefix->planner->impl_->prefix_trial = true;
+    }
     auto first = prefix->planner->solve(state, goal);
     iterations = first.solver.iterations;
-    if (!first.solver.success()) return std::nullopt;
+    if (!first.solver.success()) {
+      prefix->planner->reset();
+      return std::nullopt;
+    }
     const Eigen::Index prefix_size = steps * joint_count;
     QPResult result{"solved", Vector(2 * trajectory_size), iterations, INFINITY,
                     "unconstrained suffix"};
@@ -451,6 +458,7 @@ struct SparseJointMPC::Impl {
       data.u = upper_bounds.data();
       auto settings = detail::osqp_settings();
       settings.adaptive_rho_interval = 100;
+      if (prefix_trial) settings.max_iter = prefix_iterations_limit;
       error = osqp_setup(&workspace, &data, &settings);
       workspace_has_slew_variables = slew_variables;
     } else {
@@ -563,7 +571,7 @@ PlanResult SparseJointMPC::solve(const RobotState& state, const Vector& goal) {
   };
   bool retryable = false;
   auto result = solve(warm, slew_variables, &retryable);
-  if (reused_workspace && retryable) {
+  if (!planner.prefix_trial && reused_workspace && retryable) {
     // Keep the same formulation for the cold retry. A poor warm start
     // can fail even when the velocity-difference model converges cold.
     const auto first_iterations = result.iterations;
@@ -573,7 +581,8 @@ PlanResult SparseJointMPC::solve(const RobotState& state, const Vector& goal) {
     result.iterations += first_iterations;
     result.detail = "cold retry after " + first_status + "; " + result.detail;
   }
-  const bool retry_original = slew_variables && !result.success() && result.status != "infeasible";
+  const bool retry_original = !planner.prefix_trial && slew_variables &&
+                              !result.success() && result.status != "infeasible";
   if (retry_original) {
     const auto first_iterations = result.iterations;
     planner.reset();
