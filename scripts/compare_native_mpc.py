@@ -14,7 +14,9 @@ import os
 from pathlib import Path
 import platform
 
-from _comparison import case, invoke_worker, joint_mpc_workload, joint_plan_violation, rss_kib
+from _comparison import (
+    case, invoke_worker, joint_mpc_initial_sample, joint_mpc_workload, joint_plan_violation, rss_kib,
+)
 
 from _measurement import source_hashes, sources_unchanged
 
@@ -25,21 +27,13 @@ def worker(args):
     from time import perf_counter, thread_time_ns
     import numpy as np
     import wholebodyx_native
-    from wholebodyx import JointLimits, RobotState
     from wholebodyx.native import NativeMPC, NativeSparseMPC
 
     binary = Path(wholebodyx_native.__file__).resolve()
     if binary.parent != args.native_dir.resolve():
         raise RuntimeError(f"loaded {binary}, expected a build in {args.native_dir}")
     joints, horizon = args.case
-    if args.workload == "retarget":
-        limits = JointLimits([-1.] * joints, [1.] * joints, [.8] * joints, [2.] * joints)
-    else:
-        limits = JointLimits([-2.] * joints, [2.] * joints, [1.] * joints, [4.] * joints)
-    state = RobotState(np.zeros(joints), np.zeros(joints))
-    goal = np.full(joints, .02 if args.workload == "near" else .3)
-    if args.workload == "retarget":
-        goal = .55 * np.sin(np.arange(joints) * .37)
+    limits, state, goal = joint_mpc_initial_sample(joints, args.workload)
     report = dict(
         joints=joints,
         horizon=horizon,
@@ -68,7 +62,7 @@ def worker(args):
         cpu_ms = (thread_time_ns() - cpu_start) / 1e6
         if outcome.plan is None:
             raise RuntimeError(outcome.solver)
-        violation = joint_plan_violation(limits, outcome.plan, measurement.v)
+        violation = joint_plan_violation(limits, outcome.plan, measurement, horizon, args.dt)
         if violation > 1e-6:
             raise RuntimeError(f"invalid physical plan: {violation}")
         return elapsed, cpu_ms, outcome.solver, violation
@@ -79,7 +73,7 @@ def worker(args):
         solve(state, goal)
     times, cpu_times, iterations = [], [], []
     maximum, physical, shortened = 0.0, 0.0, 0
-    work = joint_mpc_workload(args.workload, state, goal, args.iterations, args.seed)
+    work = joint_mpc_workload(args.workload, state, goal, args.iterations, args.seed, args.dt)
     for measurement, target in work:
         elapsed, cpu_ms, result, violation = solve(measurement, target)
         times.append(elapsed)
@@ -102,6 +96,7 @@ def worker(args):
         max_constraint_violation=maximum,
         max_physical_violation=physical,
         after_updates_rss_kib=rss_kib(),
+        internal_fixed_matrix_bytes_after_updates=getattr(planner, "fixed_matrix_bytes", None),
     )
     print(json.dumps(report, allow_nan=False))
 

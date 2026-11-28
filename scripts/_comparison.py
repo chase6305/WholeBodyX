@@ -13,12 +13,24 @@ import sys
 from _measurement import SOURCE as MEASUREMENT_SOURCE, rss_kib as rss_kib
 
 
-def joint_plan_violation(limits, plan, initial_velocity):
-    """Independently check exported positions, velocities and first-step slew."""
+def joint_plan_violation(limits, plan, state, horizon, dt):
+    """Check the exported plan against its measurement and physical problem."""
     import numpy as np
 
-    if not np.isfinite(plan.positions).all() or not np.isfinite(plan.velocities).all():
+    if (
+        plan.stamp != state.stamp or plan.dt != dt
+        or plan.positions.shape != (horizon + 1, state.q.size)
+        or plan.velocities.shape != (horizon, state.q.size)
+        or not np.array_equal(plan.positions[0], state.q)
+        or not np.isfinite(plan.positions).all() or not np.isfinite(plan.velocities).all()
+    ):
         return float("inf")
+    with np.errstate(over="ignore", invalid="ignore"):
+        expected = dt * plan.velocities
+        if not np.isfinite(expected).all() or not np.allclose(
+            np.diff(plan.positions, axis=0), expected, atol=1e-8, rtol=1e-7,
+        ):
+            return float("inf")
     violation = max(
         float(np.max(limits.lower - plan.positions[1:])),
         float(np.max(plan.positions[1:] - limits.upper)),
@@ -26,12 +38,26 @@ def joint_plan_violation(limits, plan, initial_velocity):
         0.0,
     )
     if limits.acceleration is not None:
-        changes = np.diff(np.vstack((initial_velocity, plan.velocities)), axis=0)
+        changes = np.diff(np.vstack((state.v, plan.velocities)), axis=0)
         violation = max(violation, float(np.max(np.abs(changes) - plan.dt * limits.acceleration)))
     return violation
 
 
-def joint_mpc_workload(name, state, goal, iterations, seed):
+def joint_mpc_initial_sample(joints, workload):
+    import numpy as np
+    from wholebodyx import JointLimits, RobotState
+
+    state = RobotState(np.zeros(joints), np.zeros(joints))
+    if workload == "retarget":
+        limits = JointLimits([-1.] * joints, [1.] * joints, [.8] * joints, [2.] * joints)
+        goal = .55 * np.sin(np.arange(joints) * .37)
+    else:
+        limits = JointLimits([-2.] * joints, [2.] * joints, [1.] * joints, [4.] * joints)
+        goal = np.full(joints, .02 if workload == "near" else .3)
+    return limits, state, goal
+
+
+def joint_mpc_workload(name, state, goal, iterations, seed, dt):
     import numpy as np
     from wholebodyx import RobotState
 
@@ -57,7 +83,7 @@ def joint_mpc_workload(name, state, goal, iterations, seed):
             previous = .55 * np.sin(angles - 1.9)
             position = previous + min(1., tick / 4) * (target - previous)
             velocity = .02 * np.cos(angles + tick * .3)
-            measurement = RobotState(position, velocity, k * .05)
+            measurement = RobotState(position, velocity, k * dt)
         else:
             measurement = state
             target = goal + .01 * np.sin(k)

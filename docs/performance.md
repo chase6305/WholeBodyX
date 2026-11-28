@@ -89,8 +89,8 @@ Python 默认消元求解在未尝试稀疏模型且达到迭代上限时，也�
 
 48 次候选的完整 QP 和物理轨迹均通过验收。最大相对目标差为 `1.62e-9`，
 最大位置差为 `2.61e-8 rad`，最大速度差为 `2.07e-7 rad/s`。
-复现同类目标切换负载可使用 `compare_native_mpc.py --workload retarget --dt .05`，
-同时记录求解线程 CPU 和墙钟分位数。
+复现同类目标切换负载可给 `compare_native_mpc.py` 或 `compare_python_mpc.py` 传入
+`--workload retarget --dt .05`，同时记录求解线程 CPU 和墙钟分位数。
 
 在同样规模下，使用 `soak_async_mpc.py --backend native-sparse --joints 96 --horizon 200`
 与 `--control-dt .05 --lookahead .60 --seconds 90` 各运行一次闭环仿真。两个版本各有
