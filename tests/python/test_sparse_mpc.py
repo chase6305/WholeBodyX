@@ -84,6 +84,22 @@ def test_sparse_solver_override_receives_the_absolute_qp(monkeypatch):
     assert calls[0].lower[0] == 1000.
 
 
+def test_sparse_solver_override_receives_the_complete_horizon(monkeypatch):
+    horizon = 128
+    planner = SparseJointMPC(JointLimits([-1.], [1.], [.8], [2.]), horizon=horizon)
+    state, goal = RobotState([0.], [0.]), [.001]
+    calls = []
+
+    def solve(problem, warm_start=None):
+        calls.append(problem)
+        return QPResult("infeasible")
+
+    monkeypatch.setattr(planner.solver, "solve", solve)
+    assert planner.solve(state, goal).plan is None
+    assert len(calls) == 1 and calls[0].gradient.shape == (2 * horizon,)
+    assert calls[0].constraint.shape == (4 * horizon, 2 * horizon)
+
+
 @pytest.mark.parametrize("offset", [0., 1000.])
 def test_short_step_slew_model_exports_the_original_sparse_decision(offset):
     n, horizon, dt = 6, 60, .004

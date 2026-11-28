@@ -166,6 +166,37 @@ def test_slew_across_the_unconstrained_suffix_boundary_can_force_a_full_solve(re
     assert np.abs(slew).max() <= dt * limits.acceleration[0] + 1e-6
 
 
+@pytest.mark.parametrize("backend", ["sparse", "native-sparse"])
+def test_feasible_full_unconstrained_response_avoids_iterations(request, backend):
+    cls = SparseJointMPC if backend == "sparse" else request.getfixturevalue("native_sparse")
+    limits = JointLimits([-1., -1.], [1., 1.], [.8, .8], [2., 2.])
+    state, goal = RobotState([.2, -.15], [0., 0.]), [.201, -.147]
+    horizon, dt = 20, .05
+    planner = cls(limits, horizon=horizon, dt=dt)
+    actual = planner.solve(state, goal)
+    expected = _full_sparse_planner(limits, horizon, dt).solve(state, goal)
+    assert actual.plan is not None and expected.plan is not None
+    assert actual.solver.iterations == 0 and actual.solver.detail == "unconstrained optimum"
+    np.testing.assert_allclose(actual.plan.positions, expected.plan.positions, atol=1e-7, rtol=0)
+    np.testing.assert_allclose(actual.plan.velocities, expected.plan.velocities, atol=1e-6, rtol=0)
+
+
+@pytest.mark.parametrize("backend", ["sparse", "native-sparse"])
+def test_unconstrained_response_checks_slew_after_the_first_interval(request, backend):
+    cls = SparseJointMPC if backend == "sparse" else request.getfixturevalue("native_sparse")
+    horizon, dt = 20, .1
+    goal = [.05]
+    free = _full_sparse_planner(JointLimits([-1.], [1.], [1.]), horizon, dt)
+    unconstrained = free.solve(RobotState([0.], [0.]), goal).plan
+    assert abs(unconstrained.velocities[1, 0] - unconstrained.velocities[0, 0]) > dt
+    state = RobotState([0.], unconstrained.velocities[0])
+    limits = JointLimits([-1.], [1.], [1.], [1.])
+    result = cls(limits, horizon=horizon, dt=dt).solve(state, goal)
+    assert result.plan is not None and result.solver.detail != "unconstrained optimum"
+    slew = np.diff(np.r_[state.v[0], result.plan.velocities[:, 0]])
+    assert np.abs(slew).max() <= dt + 1e-6
+
+
 @pytest.mark.parametrize("option", [{"horizon": True}, {"horizon": 0}, {"dt": 0},
                                     {"tracking_weight": np.inf}, {"control_weight": -1}])
 def test_settings_reject_invalid_inputs(native_sparse, option):

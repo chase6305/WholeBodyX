@@ -58,7 +58,7 @@ struct SparseJointMPC::Impl {
   Eigen::SparseMatrix<double> scaled_hessian, scaled_constraint;
   Eigen::SparseMatrix<double> slew_hessian, slew_constraint;
   Vector lower, upper, position_weights, position_origin;
-  Vector tail_feedback;
+  Vector unconstrained_feedback;
   std::array<PrefixTrial, 3> prefixes;
   std::optional<JointPlan> last_plan;
   OSQPWorkspace* workspace = nullptr;
@@ -176,18 +176,19 @@ struct SparseJointMPC::Impl {
       }
       slew_constraint.finalize();
     }
-    prepare_tail_feedback();
+    prepare_unconstrained_feedback();
   }
 
-  void prepare_tail_feedback() {
-    if (horizon < minimum_suffix_horizon || position_origin.size()) return;
-    const int shortest = 32;
-    std::array<PrefixTrial, 3> candidates;
-    candidates[0].horizon = shortest;
-    candidates[1].horizon = std::clamp(horizon / 5, 40, 64);
-    // Keep subsidiary solves below the threshold that creates their own prefix.
-    candidates[2].horizon = std::min(horizon / 2, minimum_suffix_horizon - 1);
-    Vector feedback(horizon - shortest);
+  void prepare_unconstrained_feedback() {
+    if (position_origin.size()) return;
+    const bool use_prefix = horizon >= minimum_suffix_horizon;
+    if (use_prefix) {
+      prefixes[0].horizon = 32;
+      prefixes[1].horizon = std::clamp(horizon / 5, 40, 64);
+      // Keep subsidiary solves below the threshold that creates their own prefix.
+      prefixes[2].horizon = std::min(horizon / 2, minimum_suffix_horizon - 1);
+    }
+    Vector feedback(horizon);
     const long double step = dt, effort = control_weight;
     long double value = terminal_weight;
     // Eliminating one unconstrained interval leaves a scalar quadratic
@@ -201,12 +202,13 @@ struct SparseJointMPC::Impl {
       if (!(feedback[i] > 0. && dt * feedback[i] <= 1.)) return;
       value = tracking_weight + value * (effort / denominator);
       if (!std::isfinite(value) || value > std::numeric_limits<double>::max()) return;
-      for (auto& trial : candidates)
-        if (i + shortest == trial.horizon) trial.terminal_weight = static_cast<double>(value);
+      if (use_prefix)
+        for (auto& trial : prefixes)
+          if (i == trial.horizon) trial.terminal_weight = static_cast<double>(value);
     }
-    for (auto& trial : candidates) trial.travel = travel_estimate(trial.horizon);
-    prefixes = std::move(candidates);
-    tail_feedback = std::move(feedback);
+    if (use_prefix)
+      for (auto& trial : prefixes) trial.travel = travel_estimate(trial.horizon);
+    unconstrained_feedback = std::move(feedback);
   }
 
   ~Impl() {
@@ -321,7 +323,7 @@ struct SparseJointMPC::Impl {
   std::optional<PlanResult> solve_prefix(const RobotState& state, const Vector& goal,
                                         const Vector& lower_bound, const Vector& upper_bound,
                                         int& iterations) {
-    if (!tail_feedback.size()) return std::nullopt;
+    if (horizon < minimum_suffix_horizon || !unconstrained_feedback.size()) return std::nullopt;
     if ((goal.array() < limits.lower.array()).any() ||
         (goal.array() > limits.upper.array()).any())
       return std::nullopt;
@@ -346,12 +348,35 @@ struct SparseJointMPC::Impl {
                     "unconstrained suffix"};
     result.x.head(prefix_size) = first.solver.x.head(prefix_size);
     result.x.segment(trajectory_size, prefix_size) = first.solver.x.tail(prefix_size);
-    Vector position = first.solver.x.segment(prefix_size - joint_count, joint_count);
-    Vector previous_velocity = first.solver.x.tail(joint_count);
+    return complete_unconstrained(state, goal, lower_bound, upper_bound, std::move(result), steps);
+  }
+
+  std::optional<PlanResult> solve_unconstrained(const RobotState& state, const Vector& goal,
+                                               const Vector& lower_bound,
+                                               const Vector& upper_bound) {
+    if (!unconstrained_feedback.size()) return std::nullopt;
+    const Vector first = unconstrained_feedback[0] * (goal - state.q);
+    if (!(first.cwiseAbs().array() <= limits.velocity.array()).all() ||
+        (limits.acceleration.size() &&
+         !((first - state.v).cwiseAbs().array() <= dt * limits.acceleration.array()).all()))
+      return std::nullopt;
+    QPResult result{"solved", Vector(2 * trajectory_size), 0, INFINITY, "unconstrained optimum"};
+    return complete_unconstrained(state, goal, lower_bound, upper_bound, std::move(result), 0);
+  }
+
+  std::optional<PlanResult> complete_unconstrained(const RobotState& state, const Vector& goal,
+                                                  const Vector& lower_bound,
+                                                  const Vector& upper_bound,
+                                                  QPResult result, int steps) {
+    Vector position = state.q, previous_velocity = state.v;
+    if (steps) {
+      position = result.x.segment((steps - 1) * joint_count, joint_count);
+      previous_velocity = result.x.segment(trajectory_size + (steps - 1) * joint_count, joint_count);
+    }
     for (int k = steps; k < horizon; ++k) {
       const auto row = k * joint_count;
       auto velocity = result.x.segment(trajectory_size + row, joint_count);
-      velocity = tail_feedback[k - prefixes.front().horizon] * (goal - position);
+      velocity = unconstrained_feedback[k] * (goal - position);
       position += dt * velocity;
       if (!(velocity.cwiseAbs().array() <= limits.velocity.array()).all() ||
           !(position.array() >= limits.lower.array()).all() ||
@@ -494,6 +519,8 @@ PlanResult SparseJointMPC::solve(const RobotState& state, const Vector& goal) {
   auto& planner = *impl_;
   Vector gradient, lower_bounds, upper_bounds;
   planner.vectors(state, goal, gradient, lower_bounds, upper_bounds);
+  if (auto result = planner.solve_unconstrained(state, goal, lower_bounds, upper_bounds))
+    return std::move(*result);
   int prefix_iterations = 0;
   if (auto result = planner.solve_prefix(state, goal, lower_bounds, upper_bounds, prefix_iterations))
     return std::move(*result);

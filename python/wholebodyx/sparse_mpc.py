@@ -27,43 +27,47 @@ class _PrefixTrial:
     planner: "SparseJointMPC | None" = None
 
 
-def _tail_costs(horizon, dt, tracking, effort, terminal, limits):
-    if horizon < _MIN_SUFFIX_HORIZON:
-        return ()
-    shortest = 32
-    choices = (
-        shortest, min(64, max(40, horizon // 5)), min(horizon // 2, _MIN_SUFFIX_HORIZON - 1),
-    )
-    feedback = np.empty(horizon - shortest)
+def _unconstrained_response(feedback, dt):
+    """Map the initial position error to the open-loop velocity sequence."""
+    response = feedback.copy()
+    with np.errstate(under="ignore"):
+        response[1:] *= np.cumprod(1. - dt * feedback[:-1])
+    return _immutable(response)
+
+
+def _unconstrained_model(horizon, dt, tracking, effort, terminal, limits):
+    choices = ()
+    if horizon >= _MIN_SUFFIX_HORIZON:
+        choices = (32, min(64, max(40, horizon // 5)), min(horizon // 2, _MIN_SUFFIX_HORIZON - 1))
+    feedback = np.empty(horizon)
     weights = {}
     value = terminal
     for index in range(len(feedback) - 1, -1, -1):
         denominator = effort + dt * dt * value
         if not isfinite(denominator):
-            return ()
+            return None, ()
         gain = dt * value / denominator
         if not (isfinite(gain) and 0. < gain and dt * gain <= 1.):
-            return ()
+            return None, ()
         feedback[index] = gain
         value = tracking + value * (effort / denominator)
         if not isfinite(value):
-            return ()
-        if index + shortest in choices:
-            weights[index + shortest] = value
+            return None, ()
+        if index in choices:
+            weights[index] = value
     # Turn each suffix feedback into a response to its own initial error.
     trials = []
     with np.errstate(over="ignore", invalid="ignore", under="ignore"):
         for steps in choices:
-            response = feedback[steps - shortest:].copy()
-            response[1:] *= np.cumprod(1. - dt * response[:-1])
+            response = _unconstrained_response(feedback[steps:], dt)
             duration = steps * dt
             if limits.acceleration is None:
                 travel = duration * limits.velocity
             else:
                 speed = np.minimum(limits.velocity, .5 * duration * limits.acceleration)
                 travel = speed * (duration - speed / limits.acceleration)
-            trials.append(_PrefixTrial(steps, weights[steps], _immutable(response), _immutable(travel)))
-    return tuple(trials)
+            trials.append(_PrefixTrial(steps, weights[steps], response, _immutable(travel)))
+    return _unconstrained_response(feedback, dt), tuple(trials)
 
 
 class SparseJointMPC(_JointMPC):
@@ -113,11 +117,11 @@ class SparseJointMPC(_JointMPC):
             else None
         )
         self._last_plan = None
-        self._prefixes = (
-            _tail_costs(self.horizon, self.dt, self.tracking_weight, self.control_weight,
-                        self.terminal_weight, limits)
+        self._free_response, self._prefixes = (
+            _unconstrained_model(self.horizon, self.dt, self.tracking_weight, self.control_weight,
+                                 self.terminal_weight, limits)
             if self._default_solver is not None and self._position_origin is None
-            else ()
+            else (None, ())
         )
         self._prepare()
 
@@ -317,30 +321,54 @@ class SparseJointMPC(_JointMPC):
         joints = state.q.size
         prefix_size = steps * joints
         decision = np.empty(2 * size)
-        positions = decision[:size].reshape(self.horizon, joints)
-        velocities = decision[size:].reshape(self.horizon, joints)
-        positions[:steps] = first.x[:prefix_size].reshape(steps, joints)
-        velocities[:steps] = first.x[prefix_size:].reshape(steps, joints)
+        decision[:prefix_size] = first.x[:prefix_size]
+        decision[size:size + prefix_size] = first.x[prefix_size:]
+        outcome = self._complete_unconstrained(
+            state, goal, problem, decision, steps, trial.response, first.iterations, "unconstrained suffix",
+        )
+        return outcome, first.iterations
+
+    def _solve_unconstrained(self, state, goal, problem, size):
+        response, limits = self._free_response, self.limits
+        with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+            first = response[0] * (goal - state.q)
+            if not (np.abs(first) <= limits.velocity).all():
+                return None
+            if (limits.acceleration is not None
+                    and not (np.abs(first - state.v) <= self.dt * limits.acceleration).all()):
+                return None
+        return self._complete_unconstrained(
+            state, goal, problem, np.empty(2 * size), 0, response, 0, "unconstrained optimum",
+        )
+
+    def _complete_unconstrained(self, state, goal, problem, decision, steps, response,
+                                iterations, detail):
+        limits, dt = self.limits, self.dt
+        size = decision.size // 2
+        positions = decision[:size].reshape(self.horizon, state.q.size)
+        velocities = decision[size:].reshape(self.horizon, state.q.size)
+        position = positions[steps - 1] if steps else state.q
+        velocity = velocities[steps - 1] if steps else state.v
         tail_q, tail_v = positions[steps:], velocities[steps:]
         with np.errstate(over="ignore", invalid="ignore", under="ignore"):
-            np.multiply(trial.response[:, None], goal - positions[steps - 1], out=tail_v)
-            _integrate_positions(positions[steps - 1], tail_v, dt, out=tail_q)
+            np.multiply(response[:, None], goal - position, out=tail_v)
+            _integrate_positions(position, tail_v, dt, out=tail_q)
             feasible = (
                 (np.abs(tail_v) <= limits.velocity).all()
                 and (tail_q >= limits.lower).all() and (tail_q <= limits.upper).all()
             )
             if feasible and limits.acceleration is not None:
-                changes = _velocity_changes(tail_v, velocities[steps - 1])
+                changes = _velocity_changes(tail_v, velocity)
                 feasible = (np.abs(changes) <= dt * limits.acceleration).all()
         if not feasible:
-            return None, first.iterations
+            return None
         decision.setflags(write=False)
         result = _validated_qp_solution(
             decision, problem.constraint, problem.lower, problem.upper,
-            iterations=first.iterations, detail="unconstrained suffix",
+            iterations=iterations, detail=detail,
         )
         outcome = self._plan_result(state, result, velocity_offset=size, kind="sparse MPC")
-        return (outcome if outcome.plan is not None else None), first.iterations
+        return outcome if outcome.plan is not None else None
 
     def solve(self, state, goal):
         default_adapter = (
@@ -355,11 +383,16 @@ class SparseJointMPC(_JointMPC):
         )
         origin = getattr(self, "_position_origin", None)
         try_prefix = default_problem and bool(self._prefixes)
-        if (origin is not None and default_problem) or try_prefix:
+        try_free = default_problem and self._free_response is not None
+        if (origin is not None and default_problem) or try_free or try_prefix:
             goal = array(goal, 1, "goal")
         physical_problem = self.formulate(state, goal)
         joint_count = state.q.size
         trajectory_size = joint_count * self.horizon
+        if try_free:
+            outcome = self._solve_unconstrained(state, goal, physical_problem, trajectory_size)
+            if outcome is not None:
+                return outcome
         prefix_iterations = 0
         if try_prefix:
             outcome, prefix_iterations = self._solve_prefix(state, goal, physical_problem, trajectory_size)
