@@ -64,6 +64,7 @@ struct SparseJointMPC::Impl {
   OSQPWorkspace* workspace = nullptr;
   bool workspace_has_slew_variables = false;
   bool prefix_trial = false;
+  bool solver_matrices_ready = false;
   static constexpr double slew_scale = .1;
   static constexpr int minimum_suffix_horizon = 96;
   static constexpr int prefix_iterations_limit = 6000;
@@ -149,6 +150,11 @@ struct SparseJointMPC::Impl {
     }
     hessian.finalize();
     constraint.finalize();
+    prepare_unconstrained_feedback();
+  }
+
+  void prepare_solver_matrices() {
+    if (solver_matrices_ready) return;
     // Internal x = D*z conditioning; public diagnostics and results retain x.
     scaled_hessian = hessian;
     scaled_constraint = constraint;
@@ -178,7 +184,7 @@ struct SparseJointMPC::Impl {
       }
       slew_constraint.finalize();
     }
-    prepare_unconstrained_feedback();
+    solver_matrices_ready = true;
   }
 
   void prepare_unconstrained_feedback() {
@@ -532,6 +538,7 @@ PlanResult SparseJointMPC::solve(const RobotState& state, const Vector& goal) {
   int prefix_iterations = 0;
   if (auto result = planner.solve_prefix(state, goal, lower_bounds, upper_bounds, prefix_iterations))
     return std::move(*result);
+  planner.prepare_solver_matrices();
   const bool centered = planner.position_origin.size() != 0;
   Vector physical_lower, physical_upper;
   if (centered) {

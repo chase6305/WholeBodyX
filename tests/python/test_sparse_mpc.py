@@ -142,6 +142,19 @@ def test_short_step_slew_model_exports_the_original_sparse_decision(offset):
         assert max((problem.lower - values).max(), (values - problem.upper).max(), 0.) <= 1e-6
 
 
+def test_analytic_sparse_result_defers_the_expanded_matrices():
+    planner = SparseJointMPC(JointLimits([-1.], [1.], [.8], [2.]), horizon=128, dt=.02)
+    state = RobotState([0.], [0.])
+    before = planner.fixed_matrix_bytes
+    direct = planner.solve(state, [.001])
+    assert direct.plan is not None and direct.solver.iterations == 0
+    assert planner.fixed_matrix_bytes == before
+
+    active = planner.solve(state, [1.05])
+    assert active.plan is not None and active.solver.iterations > 0
+    assert planner.fixed_matrix_bytes > before
+
+
 def test_short_step_slew_refusal_retries_original_model(monkeypatch):
     planner = SparseJointMPC(JointLimits([-1.], [1.], [.8], [2.]), horizon=40, dt=.004)
     _, solver = planner._slew_problem

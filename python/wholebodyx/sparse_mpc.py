@@ -175,24 +175,33 @@ class SparseJointMPC(_JointMPC):
         constraint = sparse.vstack(rows, format="csc")
         self._template = _SparseFixedQP(hessian, constraint)
         self._lower, self._upper = np.concatenate(lower), np.concatenate(upper)
-        self._slew_problem = None
-        if self._default_solver is not None and _prefer_slew_variables(self.limits, self.dt, self.horizon):
-            self._prepare_slew_problem(hessian, constraint, trajectory_size)
+        self._slew_model = None
+        self._use_slew_variables = (
+            self._default_solver is not None
+            and _prefer_slew_variables(self.limits, self.dt, self.horizon)
+        )
 
     @property
     def fixed_matrix_bytes(self):
         total = _sparse_template_bytes(self._template)
-        slew_problem = getattr(self, "_slew_problem", None)
-        if slew_problem is not None:
-            total += _sparse_template_bytes(slew_problem[0])
+        if self._slew_model is not None:
+            total += _sparse_template_bytes(self._slew_model[0])
         for prefix in self._prefixes:
             if prefix.planner is not None:
                 total += prefix.planner.fixed_matrix_bytes
         return total
 
-    def _prepare_slew_problem(self, hessian, constraint, size):
+    @property
+    def _slew_problem(self):
+        if self._use_slew_variables and self._slew_model is None:
+            self._slew_model = self._build_slew_problem()
+        return self._slew_model
+
+    def _build_slew_problem(self):
         # Add one decision per velocity difference. The original slew rows
         # become equalities and the new decisions receive separate box rows.
+        hessian, constraint = self._template._hessian, self._template._constraint
+        size = hessian.shape[0] // 2
         identity = sparse.eye(size, format="csc")
         slew_columns = sparse.vstack((sparse.csc_matrix((3 * size, size)), -identity))
         equalities = sparse.hstack((constraint, slew_columns), format="csc")
@@ -202,12 +211,12 @@ class SparseJointMPC(_JointMPC):
         template = _SparseFixedQP(expanded_hessian, expanded_constraint)
         scale = np.concatenate((self._default_solver.variable_scaling, np.full(size, .1)))
         solver = _default_sparse_solver(scale, self._prefix_trial)
-        self._slew_problem = template, solver
+        return template, solver
 
     def reset(self):
         super().reset()
-        if getattr(self, "_slew_problem", None) is not None:
-            self._slew_problem[1].reset()
+        if self._slew_model is not None:
+            self._slew_model[1].reset()
         for prefix in self._prefixes:
             if prefix.planner is not None:
                 prefix.planner.reset()
@@ -423,7 +432,7 @@ class SparseJointMPC(_JointMPC):
             initial = state.q if origin is None else state.q - origin
             _integrate_positions(initial, velocities, self.dt, out=positions)
             warm[trajectory_size:] = velocities.ravel()
-        if default_problem and getattr(self, "_slew_problem", None) is not None:
+        if default_problem and self._use_slew_variables:
             first = self._solve_slew_problem(state, problem, warm, trajectory_size)
             if origin is not None:
                 first = self._physical_result(first, physical_problem, origin, trajectory_size)
