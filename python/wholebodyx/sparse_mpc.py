@@ -76,6 +76,35 @@ def _unconstrained_model(horizon, dt, tracking, effort, terminal, limits):
     return _unconstrained_response(feedback, dt), tuple(trials)
 
 
+def _integrator_constraint(size, joints, dt, slew):
+    """Write the integrator, box and slew rows in compressed column order."""
+    row = np.arange(size, dtype=np.int64)
+    has_next = row < size - joints
+    velocity_counts = 3 + has_next if slew else np.full(size, 2, dtype=np.int64)
+    offsets = np.empty(2 * size + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(np.concatenate((2 + has_next, velocity_counts)), out=offsets[1:])
+    rows = np.empty(offsets[-1], dtype=np.int64)
+    values = np.empty(offsets[-1])
+
+    position = offsets[:size]
+    rows[position], values[position] = row, 1.
+    successor = position[:size - joints] + 1
+    rows[successor], values[successor] = row[joints:], -1.
+    position_box = offsets[1:size + 1] - 1
+    rows[position_box], values[position_box] = size + row, 1.
+
+    velocity = offsets[size:-1]
+    rows[velocity], values[velocity] = row, -dt
+    rows[velocity + 1], values[velocity + 1] = 2 * size + row, 1.
+    if slew:
+        rows[velocity + 2], values[velocity + 2] = 3 * size + row, 1.
+        successor = velocity[:size - joints] + 3
+        rows[successor], values[successor] = 3 * size + row[joints:], -1.
+    shape = ((4 if slew else 3) * size, 2 * size)
+    return sparse.csc_matrix((values, rows, offsets), shape=shape)
+
+
 class SparseJointMPC(_JointMPC):
     """Optimize position nodes and interval velocities without dense prediction.
 
@@ -143,15 +172,9 @@ class SparseJointMPC(_JointMPC):
             (self._position_weights, np.full(trajectory_size, self.control_weight))
         )
         hessian = sparse.diags(diagonal, format="csc")
-        difference = sparse.eye(trajectory_size, format="csc") - sparse.diags(
-            np.ones(trajectory_size - joint_count),
-            -joint_count,
-            shape=(trajectory_size, trajectory_size),
-            format="csc",
-        )
-        dynamics = sparse.hstack((difference, -self.dt * sparse.eye(trajectory_size)), format="csc")
         # Rows: integrator equalities, position boxes, velocity boxes, then slew.
-        rows = [dynamics, sparse.eye(2 * trajectory_size, format="csc")]
+        slew = self.limits.acceleration is not None
+        constraint = _integrator_constraint(trajectory_size, joint_count, self.dt, slew)
         lower = [
             np.zeros(trajectory_size),
             np.tile(self.limits.lower, horizon),
@@ -162,17 +185,10 @@ class SparseJointMPC(_JointMPC):
             np.tile(self.limits.upper, horizon),
             np.tile(self.limits.velocity, horizon),
         ]
-        if self.limits.acceleration is not None:
-            rows.append(
-                sparse.hstack(
-                    (sparse.csc_matrix((trajectory_size, trajectory_size)), difference),
-                    format="csc",
-                )
-            )
+        if slew:
             bound = self.dt * np.tile(self.limits.acceleration, horizon)
             lower.append(-bound)
             upper.append(bound)
-        constraint = sparse.vstack(rows, format="csc")
         self._template = _SparseFixedQP(hessian, constraint)
         self._lower, self._upper = np.concatenate(lower), np.concatenate(upper)
         self._slew_model = None
